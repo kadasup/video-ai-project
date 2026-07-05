@@ -61,8 +61,9 @@ _load_env()
 sys.path.insert(0, str(Path(__file__).parent))
 from produce import (
     BASE, OUTPUT, TMP, MAIN_SEC, TTS_VOICES,
-    generate_script, generate_tts, write_ass,
-    rescale_subtitles, rescale_segments, _probe_duration,
+    generate_script, shorten_script, generate_tts, write_ass,
+    align_subtitles_to_boundaries, rescale_subtitles, rescale_segments,
+    _probe_duration,
     make_intro, make_main, make_main_plan, make_outro, concat,
 )
 from select_clip import select_clip, catalog_video, match_narration_to_clips
@@ -97,8 +98,10 @@ _analysis: dict = {
     'result': None,   # select_clip 回傳的 dict
 }
 
-STEPS = ['', '生成播報腳本', '生成旁白音訊', '寫字幕檔',
-         '分析影片內容', '旁白配對畫面',
+# 順序刻意「先分析素材、再寫腳本」（write to picture）：
+# 旁白要貼著現有畫面寫，配對才搭得起來
+STEPS = ['', '分析影片內容', '生成播報腳本', '生成旁白音訊', '寫字幕檔',
+         '旁白配對畫面',
          '組裝片頭', '組裝主畫面', '組裝片尾', '串接輸出']
 
 
@@ -140,31 +143,12 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         tts_path = TMP / "_narration.mp3"
         ass_path = TMP / "_subtitles.ass"
 
+        # ── 步驟1：先分析素材（write to picture 的前提：先知道有什麼畫面）────────
         p(1)
-        script, script_tokens = generate_script(article)
-        _add_tokens(script_tokens)
-        _job['title'] = script['title']
-
-        p(2)
-        generate_tts(script['narration'], tts_path, voice=voice)
-
-        # 量測旁白實際長度，主畫面/字幕/配對全部對齊它（不再假設剛好 MAIN_SEC）
-        tts_sec = _probe_duration(tts_path)
-        main_sec = round(min(max(tts_sec + 0.4, 15.0), 90.0), 1)
-        _job['main_sec'] = main_sec
-
-        p(3)
-        subtitles = rescale_subtitles(script['subtitles'], float(MAIN_SEC), main_sec)
-        segments  = rescale_segments(script.get('segments', []), float(MAIN_SEC), main_sec)
-        write_ass(subtitles, ass_path)
-
-        # ── 智慧配對：分析每支影片內容 → 旁白配畫面 ─────────────────────────────
-        plan = None
-        if videos and segments:
-            p(4)
-            catalogs = []
+        catalogs = []
+        if videos:
             for i, v in enumerate(videos):
-                _job['msg'] = f"{STEPS[4]}（{i+1}/{len(videos)}）"
+                _job['msg'] = f"{STEPS[1]}（{i+1}/{len(videos)}）"
                 try:
                     cat = catalog_video(Path(v['path']))
                     _add_tokens(cat.get('tokens', {}))
@@ -172,20 +156,74 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                 except Exception:
                     pass  # 單支分析失敗不擋整體流程
 
-            if catalogs:
-                p(5)
-                try:
-                    plan, match_tokens = match_narration_to_clips(
-                        segments, catalogs, main_sec)
-                    _add_tokens(match_tokens)
-                    _job['plan'] = [
-                        {'video': (Path(e['path']).name if e.get('path') else '（黑幕）'),
-                         'start': e.get('start', 0), 'dur': e['dur'],
-                         'why': e.get('why', '')}
-                        for e in plan
-                    ]
-                except Exception:
-                    plan = None  # 配對失敗退回依序銜接
+        # 素材畫面清單 → 給 GPT 貼著畫面寫稿
+        footage_notes = None
+        if catalogs:
+            lines = []
+            for vi, cat in enumerate(catalogs):
+                lines.append(f"影片V{vi+1}（{Path(cat['path']).name}，總長 {cat['duration']} 秒）：")
+                for seg in cat['segments']:
+                    lines.append(f"  {seg['start']}~{seg['end']}秒：{seg.get('description', '')}")
+            footage_notes = "\n".join(lines)
+
+        p(2)
+        script, script_tokens = generate_script(article, footage_notes)
+        _add_tokens(script_tokens)
+        _job['title'] = script['title']
+
+        # 長度保險 A：GPT 沒守字數上限就退件縮寫（多一次便宜的 GPT 呼叫）
+        max_chars = int(MAIN_SEC * 4.6)
+        if len(script['narration']) > max_chars:
+            _job['msg'] = f"{STEPS[2]}（旁白 {len(script['narration'])} 字超限，縮寫中）"
+            try:
+                script, sh_tokens = shorten_script(script, int(MAIN_SEC * 4.4))
+                _add_tokens(sh_tokens)
+                _job['title'] = script['title']
+            except Exception:
+                pass  # 縮寫失敗就用原稿，交給長度保險 B
+
+        p(3)
+        boundaries = generate_tts(script['narration'], tts_path, voice=voice)
+        tts_sec = _probe_duration(tts_path)
+
+        # 長度保險 B：唸完還是太長 → 按比例加快語速重唸一次（上限 +20%，太快會不自然）
+        if tts_sec > MAIN_SEC + 4:
+            base = 1.08  # 目前預設 +8%
+            need = base * tts_sec / (MAIN_SEC + 1)
+            pct = min(int(round((need - 1) * 100)), 20)
+            _job['msg'] = f"{STEPS[3]}（旁白 {tts_sec:.0f}s 過長，以 +{pct}% 語速重唸）"
+            boundaries = generate_tts(script['narration'], tts_path, voice=voice, rate=f"+{pct}%")
+            tts_sec = _probe_duration(tts_path)
+
+        # 量測旁白實際長度，主畫面/字幕/配對全部對齊它（不再假設剛好 MAIN_SEC）
+        main_sec = round(min(max(tts_sec + 0.4, 15.0), 90.0), 1)
+        _job['main_sec'] = main_sec
+
+        p(4)
+        # 優先用 TTS 逐字時間精確對齊字幕；拿不到（或字數差太多）才退回等比縮放
+        subtitles = align_subtitles_to_boundaries(script['subtitles'], boundaries) if boundaries else []
+        _job['sub_align'] = '逐字對齊' if subtitles else '等比縮放(fallback)'
+        if not subtitles:
+            subtitles = rescale_subtitles(script['subtitles'], float(MAIN_SEC), main_sec)
+        segments = rescale_segments(script.get('segments', []), float(MAIN_SEC), main_sec)
+        write_ass(subtitles, ass_path)
+
+        # ── 步驟5：旁白配畫面（腳本已貼素材寫，配對命中率高很多）──────────────────
+        plan = None
+        if catalogs and segments:
+            p(5)
+            try:
+                plan, match_tokens = match_narration_to_clips(
+                    segments, catalogs, main_sec)
+                _add_tokens(match_tokens)
+                _job['plan'] = [
+                    {'video': (Path(e['path']).name if e.get('path') else '（黑幕）'),
+                     'start': e.get('start', 0), 'dur': e['dur'],
+                     'why': e.get('why', '')}
+                    for e in plan
+                ]
+            except Exception:
+                plan = None  # 配對失敗退回依序銜接
 
         p(6)
         intro = make_intro(script)
@@ -254,6 +292,8 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             "total_tokens":       token_usage.get("total_tokens", 0),
             "frames_sent":        token_usage.get("frames_sent", 0),
             "matched":            bool(_job.get('plan')),
+            "sub_align":          _job.get('sub_align', ''),
+            "main_sec":           _job.get('main_sec', 0),
             "step_durations":     step_durations,
             "error":              err_msg,
         })
@@ -578,15 +618,28 @@ textarea{resize:vertical;min-height:210px}
 /* 步驟列表 */
 .steps{list-style:none}
 .steps li{
-  display:flex;align-items:center;gap:10px;
   padding:9px 0;border-bottom:1px solid #f5f5f5;
   font-size:.87rem;color:#ccc;transition:color .2s
 }
 .steps li:last-child{border-bottom:none}
 .steps li.active{color:#2563eb;font-weight:600}
 .steps li.done{color:#16a34a}
+.step-row{display:flex;align-items:center;gap:10px}
 .icon{width:20px;text-align:center;flex-shrink:0;font-size:.95rem}
-.step-time{margin-left:auto;font-size:.76rem;color:#999;font-family:monospace}
+.step-time{margin-left:auto;font-size:.76rem;color:#999;font-family:monospace;transition:color .2s}
+/* 執行中的秒數用紅色，跑完恢復灰色 */
+.step-time.running{color:#dc2626;font-weight:600}
+/* 每個步驟自己的細進度條 */
+.step-mini{
+  height:4px;border-radius:3px;background:#eef0f3;overflow:hidden;
+  margin-top:6px;margin-left:30px;display:none
+}
+.steps li.active .step-mini,.steps li.done .step-mini{display:block}
+.step-mini-bar{
+  height:100%;width:0%;border-radius:3px;
+  background:linear-gradient(90deg,#2563eb,#7c3aed);transition:width .3s ease
+}
+.steps li.done .step-mini-bar{width:100%!important;background:#16a34a}
 
 /* 進度條 */
 .progress-wrap{background:#eef0f3;border-radius:6px;height:9px;overflow:hidden;margin-bottom:8px}
@@ -616,18 +669,13 @@ textarea{resize:vertical;min-height:210px}
   word-break:break-all
 }
 
-/* 多影片清單 */
-.btn-add{
-  padding:9px 14px;background:#16a34a;color:#fff;border:none;
-  border-radius:6px;font-size:.83rem;font-weight:600;cursor:pointer;
-  transition:background .15s
-}
-.btn-add:hover{background:#15803d}
-.video-list{margin:4px 0 14px}
+/* 多影片清單（含每支的智慧分析結果） */
+.video-list{margin:10px 0 14px}
 .video-item{
-  display:flex;align-items:center;gap:8px;padding:8px 10px;
+  padding:8px 10px;
   background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;margin-bottom:6px
 }
+.video-item .vtop{display:flex;align-items:center;gap:8px}
 .video-item .vidx{
   flex-shrink:0;width:20px;height:20px;border-radius:50%;background:#374151;
   color:#fff;font-size:.72rem;font-weight:700;display:flex;
@@ -637,16 +685,17 @@ textarea{resize:vertical;min-height:210px}
   flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   font-family:monospace;font-size:.78rem;color:#374151
 }
-.video-item .vstart{color:#888;font-size:.76rem;white-space:nowrap}
 .video-item .btn-remove{
   background:none;border:none;color:#ef4444;cursor:pointer;
   font-size:1rem;padding:2px 6px;line-height:1
 }
 .video-item .btn-remove:hover{color:#b91c1c}
+.video-item .vanalysis{margin-top:6px;padding-left:28px;font-size:.78rem}
+.ana-loading{color:#7c3aed}
+.ana-err{color:#b91c1c}
+.ana-desc-inline{color:#555}
+.ana-dur{color:#374151;font-weight:600;font-family:monospace;font-size:.76rem}
 
-/* 智慧分析 */
-.ana-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.ana-row input{flex:1;min-width:160px}
 .btn-browse{
   padding:9px 14px;background:#374151;color:#fff;border:none;
   border-radius:6px;font-size:.83rem;font-weight:600;
@@ -678,7 +727,8 @@ textarea{resize:vertical;min-height:210px}
 .modal-body{overflow-y:auto;padding:6px 0;flex:1}
 .modal-item{
   display:flex;align-items:center;gap:10px;padding:8px 18px;
-  cursor:pointer;font-size:.85rem;color:#333
+  cursor:pointer;font-size:.85rem;color:#333;
+  user-select:none;-webkit-user-select:none
 }
 .modal-item:hover{background:#f3f4f6}
 .modal-item .ic{width:18px;text-align:center;flex-shrink:0}
@@ -702,37 +752,14 @@ textarea{resize:vertical;min-height:210px}
   font-size:.7rem;color:transparent
 }
 .modal-item.selected .chk{background:#2563eb;border-color:#2563eb;color:#fff}
-.btn-ana{
-  padding:9px 14px;background:#7c3aed;color:#fff;border:none;
-  border-radius:6px;font-size:.83rem;font-weight:600;
-  cursor:pointer;white-space:nowrap;transition:background .15s;flex-shrink:0
-}
-.btn-ana:hover{background:#6d28d9}
-.btn-ana:disabled{background:#c4b5fd;cursor:not-allowed}
-.ana-box{
-  margin-top:12px;padding:12px 14px;
-  background:#faf5ff;border:1px solid #ddd6fe;border-radius:8px;display:none
-}
-.ana-box .layer{font-size:.8rem;color:#7c3aed;margin-bottom:4px}
-.ana-box .msg{font-size:.82rem;color:#555;word-break:break-all}
-.ana-result{
-  margin-top:10px;padding:10px 12px;background:#fff;
-  border:1px solid #d1d5db;border-radius:6px;display:none
-}
 .cat-badge{
   display:inline-block;padding:2px 10px;border-radius:12px;
-  font-size:.78rem;font-weight:700;margin-bottom:6px
+  font-size:.78rem;font-weight:700
 }
 .cat-社會事件{background:#fef9c3;color:#713f12}
 .cat-車禍{background:#fee2e2;color:#991b1b}
 .cat-警匪槍戰{background:#fce7f3;color:#9d174d}
 .cat-其他{background:#f3f4f6;color:#374151}
-.ana-desc{font-size:.83rem;color:#374151;margin:4px 0 8px}
-.btn-apply{
-  padding:5px 14px;background:#2563eb;color:#fff;border:none;
-  border-radius:5px;font-size:.82rem;cursor:pointer
-}
-.btn-apply:hover{background:#1d4ed8}
 </style>
 </head>
 <body>
@@ -749,45 +776,17 @@ textarea{resize:vertical;min-height:210px}
     <label>新聞稿內容 <span style="color:#e00">*</span></label>
     <textarea id="article" placeholder="貼上新聞稿全文…"></textarea>
 
-    <label>影片路徑（可新增多支，依序銜接補滿主畫面秒數）</label>
-    <div class="ana-row">
-      <input type="text" id="video" placeholder="D:\\VideoAI\\input\\cctv.mp4">
-      <button class="btn-browse" onclick="openBrowse()">&#128193; 瀏覽</button>
-    </div>
-
-    <!-- 起始秒數已由智慧配對自動決定，欄位保留在 DOM 供 JS 讀值但不顯示 -->
-    <div style="display:none">
-      <input type="number" id="start" value="0" min="0" step="1">
-    </div>
-
-    <div style="display:flex;gap:8px;margin-top:10px">
-      <button class="btn-ana" id="btn-ana" onclick="analyzeClip()" style="flex:1">&#128269; 智慧分析</button>
-      <button class="btn-add" onclick="addVideoToList()" style="flex:1">&#10133; 加入清單</button>
-    </div>
-    <p class="hint">產製時清單裡每支影片都會自動分析＋配對旁白（分析過的有快取不重複收費）；「智慧分析」是選用的預先預覽，分析完會自動加入清單</p>
-
-    <!-- 分析進度與結果 -->
-    <div class="ana-box" id="ana-box">
-      <div class="layer" id="ana-layer">Layer 1 動態偵測中…</div>
-      <div class="msg" id="ana-msg"></div>
-      <div class="ana-result" id="ana-result">
-        <span class="cat-badge" id="ana-cat"></span>
-        <div class="ana-desc" id="ana-desc"></div>
-        <div style="font-size:.78rem;color:#16a34a">✓ 已自動加入產製清單（實際取用哪段由智慧配對決定）</div>
-        <strong id="ana-start" style="display:none"></strong>
-      </div>
-    </div>
+    <label>影片（可瀏覽選取多支，依序銜接補滿主畫面秒數）</label>
+    <button class="btn-browse" style="width:100%;padding:11px" onclick="openBrowse()">&#128193; 瀏覽並選取影片</button>
+    <p class="hint">選取後按「加入選取」，每支會自動跑智慧分析，結果顯示在檔名下方（分析過的有快取不重複收費）</p>
 
     <div id="video-list" class="video-list"></div>
-
-    <label>輸出檔名（選填，不用加 .mp4）</label>
-    <input type="text" id="fname" placeholder="留空則自動以標題命名">
 
     <label>旁白聲音</label>
     <select id="voice">
       <option value="hsiaochen">曉臻（女聲，預設）</option>
       <option value="hsiaoyu">曉雨（女聲）</option>
-      <option value="yunjhe">雲哲（男聲，較穩重）</option>
+      <option value="yunjhe" disabled>雲哲（男聲，Microsoft 服務端暫時故障）</option>
     </select>
 
     <button class="btn" id="btn" onclick="startJob()">開始產製</button>
@@ -804,15 +803,15 @@ textarea{resize:vertical;min-height:210px}
     </div>
 
     <ul class="steps">
-      <li id="s1"><span class="icon">○</span>生成播報腳本<span class="step-time" id="t1"></span></li>
-      <li id="s2"><span class="icon">○</span>生成旁白音訊<span class="step-time" id="t2"></span></li>
-      <li id="s3"><span class="icon">○</span>寫字幕檔<span class="step-time" id="t3"></span></li>
-      <li id="s4"><span class="icon">○</span><span id="s4label">分析影片內容</span><span class="step-time" id="t4"></span></li>
-      <li id="s5"><span class="icon">○</span>旁白配對畫面<span class="step-time" id="t5"></span></li>
-      <li id="s6"><span class="icon">○</span>組裝片頭（3 秒）<span class="step-time" id="t6"></span></li>
-      <li id="s7"><span class="icon">○</span>組裝主畫面（長度隨旁白）<span class="step-time" id="t7"></span></li>
-      <li id="s8"><span class="icon">○</span>組裝片尾（5 秒）<span class="step-time" id="t8"></span></li>
-      <li id="s9"><span class="icon">○</span>串接輸出<span class="step-time" id="t9"></span></li>
+      <li id="s1"><div class="step-row"><span class="icon">○</span><span id="s1label">分析影片內容</span><span class="step-time" id="t1"></span></div><div class="step-mini"><div class="step-mini-bar" id="m1"></div></div></li>
+      <li id="s2"><div class="step-row"><span class="icon">○</span>生成播報腳本（貼畫面寫）<span class="step-time" id="t2"></span></div><div class="step-mini"><div class="step-mini-bar" id="m2"></div></div></li>
+      <li id="s3"><div class="step-row"><span class="icon">○</span>生成旁白音訊<span class="step-time" id="t3"></span></div><div class="step-mini"><div class="step-mini-bar" id="m3"></div></div></li>
+      <li id="s4"><div class="step-row"><span class="icon">○</span>寫字幕檔<span class="step-time" id="t4"></span></div><div class="step-mini"><div class="step-mini-bar" id="m4"></div></div></li>
+      <li id="s5"><div class="step-row"><span class="icon">○</span>旁白配對畫面<span class="step-time" id="t5"></span></div><div class="step-mini"><div class="step-mini-bar" id="m5"></div></div></li>
+      <li id="s6"><div class="step-row"><span class="icon">○</span>組裝片頭（3 秒）<span class="step-time" id="t6"></span></div><div class="step-mini"><div class="step-mini-bar" id="m6"></div></div></li>
+      <li id="s7"><div class="step-row"><span class="icon">○</span>組裝主畫面（長度隨旁白）<span class="step-time" id="t7"></span></div><div class="step-mini"><div class="step-mini-bar" id="m7"></div></div></li>
+      <li id="s8"><div class="step-row"><span class="icon">○</span>組裝片尾（5 秒）<span class="step-time" id="t8"></span></div><div class="step-mini"><div class="step-mini-bar" id="m8"></div></div></li>
+      <li id="s9"><div class="step-row"><span class="icon">○</span>串接輸出<span class="step-time" id="t9"></span></div><div class="step-mini"><div class="step-mini-bar" id="m9"></div></div></li>
     </ul>
 
     <div class="result" id="result">
@@ -837,6 +836,9 @@ textarea{resize:vertical;min-height:210px}
       <input type="text" id="browse-path" placeholder="D:\\VideoAI\\input">
       <button onclick="browseGo()">前往</button>
     </div>
+    <div style="padding:6px 16px;font-size:.74rem;color:#999;border-bottom:1px solid #f3f4f6">
+      點擊勾選；先點第一個，再按住 Shift 點最後一個，可一次全選中間所有檔案
+    </div>
     <div class="modal-body" id="browse-list"></div>
     <div class="modal-foot">
       <button class="btn-cancel" onclick="closeBrowse()">取消</button>
@@ -856,12 +858,7 @@ async function startJob() {
   resetUI();
   document.getElementById('btn').disabled = true;
 
-  // 清單有東西就用清單；清單空但staging欄位有填，當成單支處理（相容舊流程）
-  let videos = videoList.slice();
-  if (videos.length === 0) {
-    const staged = document.getElementById('video').value.trim();
-    if (staged) videos = [{path: staged, start: parseFloat(document.getElementById('start').value) || 0}];
-  }
+  const videos = videoList.map(v => ({path: v.path, start: v.start}));
 
   try {
     const r = await fetch('/api/generate', {
@@ -870,7 +867,6 @@ async function startJob() {
       body: JSON.stringify({
         article: art,
         videos:  videos,
-        fname:   document.getElementById('fname').value.trim() || null,
         voice:   document.getElementById('voice').value,
       })
     });
@@ -883,8 +879,8 @@ async function startJob() {
   }
 }
 
-const STEP_NAMES = ['', '生成播報腳本', '生成旁白音訊', '寫字幕檔',
-                     '分析影片內容', '旁白配對畫面',
+const STEP_NAMES = ['', '分析影片內容', '生成播報腳本', '生成旁白音訊', '寫字幕檔',
+                     '旁白配對畫面',
                      '組裝片頭', '組裝主畫面', '組裝片尾', '串接輸出'];
 const N_STEPS = 9;
 
@@ -895,49 +891,89 @@ async function poll() {
     if (d.done) {
       clearInterval(timer);
       document.getElementById('btn').disabled = false;
-      if (d.error) {
-        showErr(d.error);
-      } else {
-        showResult(d.filename, d.title, d.warning, d.plan);
-        // 產製成功 → 清空影片清單與路徑欄，準備下一支
-        videoList = [];
-        renderVideoList();
-        document.getElementById('video').value = '';
-        document.getElementById('start').value = '0';
-        localStorage.removeItem('videoai_last_video_path');
-        localStorage.setItem('videoai_video_list', '[]');
-      }
+      handleJobDone(d);
     }
   } catch(_) {}
 }
 
+function handleJobDone(d) {
+  // 記下這支工作「已經看過結果了」，避免下次開網頁又跳出同一支的完成畫面
+  if (d.started_at) localStorage.setItem('videoai_last_seen_job', String(d.started_at));
+  if (d.error) {
+    showErr(d.error);
+  } else if (d.filename) {
+    showResult(d.filename, d.title, d.warning, d.plan);
+    // 產製成功 → 清空影片清單，準備下一支
+    videoList = [];
+    renderVideoList();
+    localStorage.setItem('videoai_video_list', '[]');
+  }
+}
+
+// 換分頁/視窗、或重新整理頁面後，自動接上仍在跑（或剛跑完還沒看過結果）的工作；
+// 已經看過結果的舊工作不會重複跳出來
+async function resumeIfRunning() {
+  try {
+    const d = await (await fetch('/api/status')).json();
+    if (!d.done) {
+      document.getElementById('btn').disabled = true;
+      renderSteps(d);
+      timer = setInterval(poll, 1000);
+    } else if ((d.filename || d.error) && d.started_at &&
+               String(d.started_at) !== localStorage.getItem('videoai_last_seen_job')) {
+      renderSteps(d);
+      handleJobDone(d);
+    }
+  } catch(_) {}
+}
+
+// 各步驟的「典型耗時」(秒)，用來把進行中步驟的細進度條推到接近滿（但不到 100%）
+const STEP_TYPICAL = {1:15, 2:14, 3:5, 4:0.5, 5:7, 6:1, 7:25, 8:1, 9:0.5};
+
 function renderSteps(d) {
-  // 步驟 4 執行中會帶「（1/3）」這種進度，動態顯示
-  if (d.step === 4 && d.msg && d.msg.indexOf(STEP_NAMES[4]) === 0) {
-    document.getElementById('s4label').textContent = d.msg;
+  // 步驟 1 執行中會帶「（1/3）」這種進度，動態顯示
+  if (d.step === 1 && d.msg && d.msg.indexOf(STEP_NAMES[1]) === 0) {
+    document.getElementById('s1label').textContent = d.msg;
   } else {
-    document.getElementById('s4label').textContent = STEP_NAMES[4];
+    document.getElementById('s1label').textContent = STEP_NAMES[1];
   }
 
   for (let i = 1; i <= N_STEPS; i++) {
     const el = document.getElementById('s' + i);
     const icon = el.querySelector('.icon');
     const timeEl = document.getElementById('t' + i);
+    const miniBar = document.getElementById('m' + i);
     const dur = d.step_durations && d.step_durations[STEP_NAMES[i]];
 
     if (i < d.step) {
+      // 已完成的步驟
       el.className = 'done'; icon.textContent = '✅';
       timeEl.textContent = dur != null ? dur.toFixed(1) + 's' : '';
+      timeEl.classList.remove('running');
+      miniBar.style.width = '100%';
     } else if (i === d.step) {
       const finished = d.done && !d.error;
       el.className = finished ? 'done' : 'active';
       icon.textContent = finished ? '✅' : '⏳';
-      timeEl.textContent = finished
-        ? (dur != null ? dur.toFixed(1) + 's' : '')
-        : (d.step_elapsed_sec != null ? d.step_elapsed_sec.toFixed(1) : '0.0') + 's';
+      if (finished) {
+        timeEl.textContent = dur != null ? dur.toFixed(1) + 's' : '';
+        timeEl.classList.remove('running');
+        miniBar.style.width = '100%';
+      } else {
+        // 執行中：秒數紅色，細進度條依「已耗時 / 典型耗時」推進（上限 92%，避免假裝跑完）
+        const elapsed = d.step_elapsed_sec != null ? d.step_elapsed_sec : 0;
+        timeEl.textContent = elapsed.toFixed(1) + 's';
+        timeEl.classList.add('running');
+        const typical = STEP_TYPICAL[i] || 10;
+        const pct = Math.min(92, (elapsed / typical) * 100);
+        miniBar.style.width = pct + '%';
+      }
     } else {
+      // 還沒到的步驟
       el.className = ''; icon.textContent = '○';
       timeEl.textContent = '';
+      timeEl.classList.remove('running');
+      miniBar.style.width = '0%';
     }
   }
   renderProgress(d);
@@ -1010,104 +1046,15 @@ function resetUI() {
     const el = document.getElementById('s' + i);
     el.className = '';
     el.querySelector('.icon').textContent = '○';
-    document.getElementById('t' + i).textContent = '';
+    const timeEl = document.getElementById('t' + i);
+    timeEl.textContent = '';
+    timeEl.classList.remove('running');
+    document.getElementById('m' + i).style.width = '0%';
   }
 }
 
-// ─── 智慧分析 ──────────────────────────────────────────────────────────────
-let anaTimer = null;
-let _anaResult = null;
-
-async function analyzeClip() {
-  const video = document.getElementById('video').value.trim();
-  if (!video) { alert('請先填入影片路徑'); return; }
-
-  document.getElementById('btn-ana').disabled = true;
-  document.getElementById('ana-box').style.display = 'block';
-  document.getElementById('ana-result').style.display = 'none';
-  document.getElementById('ana-layer').textContent = 'Layer 1 動態偵測中…';
-  document.getElementById('ana-msg').textContent = '';
-  _anaResult = null;
-
-  try {
-    const r = await fetch('/api/analyze', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({video})
-    });
-    const d = await r.json();
-    if (d.error) {
-      document.getElementById('ana-layer').textContent = '驗證失敗';
-      document.getElementById('ana-msg').textContent = d.error;
-      document.getElementById('btn-ana').disabled = false;
-      return;
-    }
-    anaTimer = setInterval(pollAnalysis, 1500);
-  } catch(e) {
-    document.getElementById('ana-msg').textContent = e.message;
-    document.getElementById('btn-ana').disabled = false;
-  }
-}
-
-async function pollAnalysis() {
-  try {
-    const d = await (await fetch('/api/analyze_status')).json();
-    const layerNames = ['', 'Layer 1 動態偵測', 'Layer 2 規則分類', 'Layer 3 AI 視覺分析'];
-    document.getElementById('ana-layer').textContent =
-      (layerNames[d.layer] || 'Layer 1') + (d.done ? (d.error ? ' 失敗' : ' 完成') : '…');
-    document.getElementById('ana-msg').textContent = d.msg || '';
-
-    if (d.done) {
-      clearInterval(anaTimer);
-      document.getElementById('btn-ana').disabled = false;
-      if (d.error) {
-        document.getElementById('ana-msg').textContent = '錯誤：' + d.error;
-        return;
-      }
-      if (d.result) {
-        _anaResult = d.result;
-        showAnalysisResult(d.result);
-        // 分析完成 → 這支影片自動加入產製清單（重複的不會加兩次）
-        const analyzedPath = document.getElementById('video').value.trim();
-        if (analyzedPath && !videoList.some(v => v.path === analyzedPath)) {
-          videoList.push({path: analyzedPath, start: 0});
-          renderVideoList();
-          saveLastSettings();
-        }
-      }
-    }
-  } catch(_) {}
-}
-
-function showAnalysisResult(r) {
-  const cat = r.category || '其他';
-  const badge = document.getElementById('ana-cat');
-  badge.textContent = cat;
-  badge.className = 'cat-badge cat-' + (cat === '車禍或槍戰' ? '車禍' : cat);
-  document.getElementById('ana-desc').textContent = r.description || '';
-  document.getElementById('ana-start').textContent = r.start_sec != null ? r.start_sec : '0';
-  document.getElementById('ana-result').style.display = 'block';
-}
-
-function applyAnalysis() {
-  if (!_anaResult) return;
-  if (_anaResult.start_sec != null)
-    document.getElementById('start').value = _anaResult.start_sec;
-}
-
-// ─── 多影片清單 ────────────────────────────────────────────────────────────
-let videoList = [];
-
-function addVideoToList() {
-  const path = document.getElementById('video').value.trim();
-  if (!path) { alert('請先填入或瀏覽選擇影片路徑'); return; }
-  const start = parseFloat(document.getElementById('start').value) || 0;
-  videoList.push({path, start});
-  document.getElementById('video').value = '';
-  document.getElementById('start').value = '0';
-  renderVideoList();
-  saveLastSettings();
-}
+// ─── 多影片清單（含每支自動智慧分析）─────────────────────────────────────────
+let videoList = [];  // {path, start, analyzing, analysis:{category,description,error}}
 
 function removeVideoFromList(index) {
   videoList.splice(index, 1);
@@ -1121,6 +1068,9 @@ function renderVideoList() {
   videoList.forEach((v, i) => {
     const row = document.createElement('div');
     row.className = 'video-item';
+
+    const top = document.createElement('div');
+    top.className = 'vtop';
 
     const idx = document.createElement('span');
     idx.className = 'vidx';
@@ -1136,29 +1086,98 @@ function renderVideoList() {
     btn.textContent = '✕';
     btn.onclick = () => removeVideoFromList(i);
 
-    row.appendChild(idx);
-    row.appendChild(name);
-    row.appendChild(btn);
+    top.appendChild(idx);
+    top.appendChild(name);
+    top.appendChild(btn);
+    row.appendChild(top);
+
+    const sub = document.createElement('div');
+    sub.className = 'vanalysis';
+    if (v.analyzing) {
+      sub.innerHTML = '<span class="ana-loading">🔄 智慧分析中…</span>';
+    } else if (v.analysis && v.analysis.error) {
+      sub.innerHTML = '<span class="ana-err">⚠ 分析失敗：' + escapeHtml(v.analysis.error) + '</span>';
+    } else if (v.analysis) {
+      const cat = v.analysis.category || '其他';
+      const catClass = cat === '車禍或槍戰' ? '車禍' : cat;
+      const durTxt = v.analysis.duration != null
+        ? '<span class="ana-dur">⏱ ' + v.analysis.duration + ' 秒</span> '
+        : '';
+      sub.innerHTML =
+        '<span class="cat-badge cat-' + catClass + '">' + escapeHtml(cat) + '</span> ' +
+        durTxt +
+        '<span class="ana-desc-inline">' + escapeHtml(v.analysis.description || '') + '</span>';
+    }
+    if (sub.innerHTML) row.appendChild(sub);
+
     container.appendChild(row);
   });
 }
 
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// 依序（後端一次只能跑一個分析工作）對清單裡的影片跑智慧分析
+async function analyzeQueued(items) {
+  for (const item of items) {
+    item.analyzing = true;
+    renderVideoList();
+    try {
+      const r = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({video: item.path})
+      });
+      const d = await r.json();
+      if (d.error) {
+        item.analyzing = false;
+        item.analysis = {error: d.error};
+        renderVideoList();
+        saveLastSettings();
+        continue;
+      }
+      await new Promise(resolve => {
+        const timer = setInterval(async () => {
+          try {
+            const sd = await (await fetch('/api/analyze_status')).json();
+            if (sd.done) {
+              clearInterval(timer);
+              item.analyzing = false;
+              item.analysis = sd.error ? {error: sd.error} : sd.result;
+              renderVideoList();
+              saveLastSettings();
+              resolve();
+            }
+          } catch(_) {}
+        }, 1200);
+      });
+    } catch(e) {
+      item.analyzing = false;
+      item.analysis = {error: e.message};
+      renderVideoList();
+      saveLastSettings();
+    }
+  }
+}
+
 // ─── 記住上次設定 ──────────────────────────────────────────────────────────
 function saveLastSettings() {
-  const video = document.getElementById('video').value.trim();
-  const start = document.getElementById('start').value;
-  if (video) localStorage.setItem('videoai_last_video_path', video);
-  localStorage.setItem('videoai_last_start', start);
-  localStorage.setItem('videoai_video_list', JSON.stringify(videoList));
+  // 分析結果只存分類/描述（不含 error 物件裡可能的大型內容），避免 localStorage 爆量
+  const slim = videoList.map(v => ({
+    path: v.path, start: v.start,
+    analysis: v.analysis ? {category: v.analysis.category, description: v.analysis.description,
+                             duration: v.analysis.duration, error: v.analysis.error} : null
+  }));
+  localStorage.setItem('videoai_video_list', JSON.stringify(slim));
+  localStorage.setItem('videoai_last_browse_dir', localStorage.getItem('videoai_last_browse_dir') || '');
   localStorage.setItem('videoai_voice', document.getElementById('voice').value);
 }
 
 function restoreLastSettings() {
-  const video = localStorage.getItem('videoai_last_video_path');
-  const start = localStorage.getItem('videoai_last_start');
   const voice = localStorage.getItem('videoai_voice');
-  if (video) document.getElementById('video').value = video;
-  if (start) document.getElementById('start').value = start;
   if (voice) document.getElementById('voice').value = voice;
   try {
     const saved = JSON.parse(localStorage.getItem('videoai_video_list') || '[]');
@@ -1168,15 +1187,14 @@ function restoreLastSettings() {
 }
 
 restoreLastSettings();
-document.getElementById('video').addEventListener('change', saveLastSettings);
-document.getElementById('start').addEventListener('change', saveLastSettings);
+resumeIfRunning();
 document.getElementById('voice').addEventListener('change', saveLastSettings);
 
 // ─── 資料夾瀏覽 modal ──────────────────────────────────────────────────────
 let browseSelected = new Set();  // 已勾選的檔案路徑（跨資料夾保留）
 
 function openBrowse() {
-  const startPath = document.getElementById('video').value.trim() || '';
+  const startPath = localStorage.getItem('videoai_last_browse_dir') || '';
   browseSelected.clear();
   updateAddSelBtn();
   document.getElementById('browse-modal').classList.add('show');
@@ -1194,15 +1212,23 @@ function updateAddSelBtn() {
 }
 
 function addSelectedToList() {
+  const currentDir = document.getElementById('browse-path').value.trim();
+  if (currentDir) localStorage.setItem('videoai_last_browse_dir', currentDir);
+
+  const newItems = [];
   browseSelected.forEach(path => {
     if (!videoList.some(v => v.path === path)) {
-      videoList.push({path, start: 0});
+      const item = {path, start: 0, analyzing: false, analysis: null};
+      videoList.push(item);
+      newItems.push(item);
     }
   });
   browseSelected.clear();
   renderVideoList();
   saveLastSettings();
   closeBrowse();
+
+  if (newItems.length) analyzeQueued(newItems);
 }
 
 function browseGo() {
@@ -1229,20 +1255,26 @@ async function loadBrowseDir(path) {
   }
 }
 
+let browseFilePaths = [];   // 目前這個資料夾的檔案路徑（依畫面順序），供 Shift 範圍選取用
+let browseLastIdx = -1;     // 上次點擊的檔案索引
+
 function renderBrowseList(d) {
   const list = document.getElementById('browse-list');
   list.innerHTML = '';
-  if (d.parent) list.appendChild(browseItem('&#128193;', '.. 上一層', d.parent, true));
-  d.dirs.forEach(item => list.appendChild(browseItem('&#128193;', item.name, item.path, true)));
-  d.files.forEach(item => list.appendChild(browseItem('&#127916;', item.name, item.path, false)));
+  browseFilePaths = d.files.map(f => f.path);
+  browseLastIdx = -1;
+  if (d.parent) list.appendChild(browseItem('&#128193;', '.. 上一層', d.parent, true, -1));
+  d.dirs.forEach(item => list.appendChild(browseItem('&#128193;', item.name, item.path, true, -1)));
+  d.files.forEach((item, i) => list.appendChild(browseItem('&#127916;', item.name, item.path, false, i)));
   if (!d.dirs.length && !d.files.length) {
     list.appendChild(browseMsg('（空資料夾，沒有找到影片檔）'));
   }
 }
 
-function browseItem(iconHtml, label, path, isDir) {
+function browseItem(iconHtml, label, path, isDir, fileIdx) {
   const div = document.createElement('div');
   div.className = 'modal-item';
+  div.dataset.path = path;
   const ic = document.createElement('span');
   ic.className = 'ic';
   ic.innerHTML = iconHtml;
@@ -1252,24 +1284,43 @@ function browseItem(iconHtml, label, path, isDir) {
   if (isDir) {
     div.onclick = () => loadBrowseDir(path);
   } else {
-    // 檔案：點擊 = 勾選/取消（可多選）
+    // 點列（打勾）= 多選；按住 Shift 點另一列 = 範圍全選
     const chk = document.createElement('span');
     chk.className = 'chk';
     chk.textContent = '✓';
     div.appendChild(chk);
     if (browseSelected.has(path)) div.classList.add('selected');
-    div.onclick = () => {
-      if (browseSelected.has(path)) {
-        browseSelected.delete(path);
-        div.classList.remove('selected');
+    div.onclick = (e) => {
+      if (e.shiftKey && browseLastIdx >= 0 && fileIdx >= 0) {
+        // Shift：把上次點的到這次點的整個範圍設成「選取」
+        const lo = Math.min(browseLastIdx, fileIdx);
+        const hi = Math.max(browseLastIdx, fileIdx);
+        for (let i = lo; i <= hi; i++) browseSelected.add(browseFilePaths[i]);
+        syncBrowseSelectedClasses();
       } else {
-        browseSelected.add(path);
-        div.classList.add('selected');
+        // 一般點擊：切換這一列
+        if (browseSelected.has(path)) {
+          browseSelected.delete(path);
+          div.classList.remove('selected');
+        } else {
+          browseSelected.add(path);
+          div.classList.add('selected');
+        }
       }
+      browseLastIdx = fileIdx;
       updateAddSelBtn();
     };
   }
   return div;
+}
+
+// 依 browseSelected 重新套用每一列的 selected 樣式（Shift 範圍選取後同步畫面）
+function syncBrowseSelectedClasses() {
+  document.querySelectorAll('#browse-list .modal-item').forEach(el => {
+    if (el.dataset.path && browseSelected.has(el.dataset.path)) {
+      el.classList.add('selected');
+    }
+  });
 }
 
 function browseMsg(text) {

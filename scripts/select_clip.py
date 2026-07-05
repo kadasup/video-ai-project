@@ -451,7 +451,7 @@ def _extract_frame_at(video: Path, t: float, tag: str) -> Path | None:
     return out if out.exists() else None
 
 
-def catalog_video(video: Path, max_segments: int = 6) -> dict:
+def catalog_video(video: Path, max_segments: int = 10) -> dict:
     """
     幫一支影片建「內容目錄」：動態偵測切段，每段抽 2 張影格，
     一次 GPT 呼叫描述所有段落的畫面內容。
@@ -463,12 +463,13 @@ def catalog_video(video: Path, max_segments: int = 6) -> dict:
     """
     video = Path(video)
 
-    cached = _cache_get("catalog", video)
+    # namespace 帶版本：切段粒度改過（catalog→catalog2），舊粗粒度快取自動失效
+    cached = _cache_get("catalog2", video)
     if cached:
         return {**cached, "tokens": {}}   # 快取命中 → 零 API 花費
 
     duration = _duration(video)
-    raw_segments = get_motion_segments(video)[:max_segments]
+    raw_segments = get_motion_segments(video)
 
     # 靜態監視器（無場景變化）→ 均分成 2~3 段各自描述
     if len(raw_segments) == 1 and raw_segments[0].get("is_static") and duration > 20:
@@ -478,6 +479,21 @@ def catalog_video(video: Path, max_segments: int = 6) -> dict:
             {"start": third, "end": third * 2},
             {"start": third * 2, "end": duration},
         ]
+
+    # 細分：記者手持連續拍攝常常沒有場景切點，整支只切出一大段，
+    # 描述粒度太粗配對就不準。超過 6 秒的段落一律再切成 ~4.5 秒的小段各自描述。
+    fine: list[dict] = []
+    for s in raw_segments:
+        seg_len = s["end"] - s["start"]
+        if seg_len <= 6.0:
+            fine.append(s)
+        else:
+            n = max(2, math.ceil(seg_len / 4.5))
+            step = seg_len / n
+            for k in range(n):
+                fine.append({"start": s["start"] + k * step,
+                             "end":   s["start"] + (k + 1) * step})
+    raw_segments = fine[:max_segments]
 
     segments = [{"start": round(max(0.0, s["start"]), 1),
                  "end":   round(min(duration, s["end"]), 1)}
@@ -546,7 +562,7 @@ def catalog_video(video: Path, max_segments: int = 6) -> dict:
 
     result = {"path": str(video), "duration": round(duration, 1),
               "segments": segments}
-    _cache_put("catalog", video, result)
+    _cache_put("catalog2", video, result)
     return {**result, "tokens": tokens}
 
 
@@ -579,15 +595,21 @@ def match_narration_to_clips(
     ]
 
     prompt = (
-        "你是新聞影音剪輯師。請把旁白各段配上最合適的影片畫面，輸出一條完整時間軸。\n\n"
+        "你是新聞影音剪輯師。請把旁白各段配上最合適的影片畫面，輸出一條完整時間軸。\n"
+        "旁白是照著這批素材寫的（write to picture），若旁白段落的描述有註明建議影片段落"
+        "（如「配V1的0~5秒」），優先照建議採用。\n\n"
         f"旁白分段（成片主畫面共 {total_sec} 秒）：\n" + "\n".join(nar_lines) + "\n\n"
         "可用素材片段：\n" + "\n".join(vid_lines) + "\n\n"
         "規則：\n"
         f"1. 時間軸總長必須正好 {total_sec} 秒，依序排列\n"
         "2. 每個片段標明用哪支影片、從第幾秒取、取多長\n"
         "3. 畫面內容要呼應該時間點的旁白內容；同一素材區段可重複使用，但盡量少重複\n"
-        "4. 完全找不到相關畫面的旁白段落，用 \"black\" 補黑幕\n"
-        "5. 單一片段至少 3 秒，避免跳切過碎\n\n"
+        "4. 完全找不到相關畫面的旁白段落，用 \"black\" 補黑幕；"
+        "但「畫面相關性普通」優於黑幕——寧可放大致相關的現場畫面，也不要黑\n"
+        "5. 單一片段 5~15 秒為佳（少於 4 秒太碎、超過 20 秒太拖）\n"
+        "6. 選畫面的優先序：有人物動作/事件發生的段落 > 靜態現場 > 空景；"
+        "描述裡有具體人事物（如「消防員救援」「車輛翻覆」）的段落優先配給講到相同人事物的旁白\n"
+        "7. 盡量避免從影片最開頭 0 秒取（常有黑幀/晃動），可從段落起點往後 1~2 秒取\n\n"
         "只回傳 JSON（不含說明）：\n"
         '{"timeline": [\n'
         '  {"video": "V1", "from": 12.0, "dur": 8.0, "why": "嫌犯亮刀對應旁白案發"},\n'
@@ -687,6 +709,8 @@ def select_clip(
     if cached and use_vision:
         if progress_cb:
             progress_cb(3, "使用快取結果（此影片先前分析過，零 API 花費）")
+        if "duration" not in cached:  # 舊版快取沒存片長，補量一次（本地 ffprobe，免費）
+            cached = {**cached, "duration": round(_duration(video), 1)}
         return {**cached, "tokens": {}}
 
     def _progress(layer: int, msg: str):
@@ -696,6 +720,7 @@ def select_clip(
             print(f"[Layer {layer}] {msg}")
 
     _progress(1, f"動態偵測：{video.name}")
+    video_dur = round(_duration(video), 1)
     segments = get_motion_segments(video)
     audio = analyze_audio(video)
     is_cctv = _is_cctv_style(video, audio)
@@ -713,6 +738,7 @@ def select_clip(
             "start_sec": 0.0, "category": "其他",
             "description": "無法偵測動態區段",
             "confidence": "low", "method": "heuristic",
+            "duration": video_dur,
             "all_candidates": [],
         }
 
@@ -729,12 +755,14 @@ def select_clip(
             "description": "",
             "confidence": top["preliminary_confidence"],
             "method": "heuristic",
+            "duration": video_dur,
             "all_candidates": candidates,
         }
 
     _progress(3, f"GPT-4o Vision 分析（從第 {top['start']:.0f}s 抽 5 張影格）...")
     result = classify_with_vision(video, top, top["preliminary_category"])
     result["method"] = "vision"
+    result["duration"] = video_dur
     result["all_candidates"] = candidates
     # tokens 已內嵌在 result["tokens"]，由呼叫端讀取
     _cache_put("select", video, {k: v for k, v in result.items() if k != "tokens"})

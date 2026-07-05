@@ -69,6 +69,26 @@ TTS_VOICES = {
 # ── Windows fallback 字型（沒有 font.ttf 時用）────────────────────────────────
 SYSTEM_FONT = r"C:/Windows/Fonts/msjh.ttc"  # 微軟正黑體
 
+# ── 發音替換表 ────────────────────────────────────────────────────────────────
+# edge-tts 不支援音標標記，專有名詞唸錯時用「換個寫法」讓它唸對：
+# 送 TTS 的文字會先替換，但字幕上仍顯示原詞。
+# 編輯 D:\VideoAI\pronounce_map.json 即可，格式：{"Oka": "歐卡", "AI": "A I"}
+# （底線開頭的 key 當註解用，會被略過；改完存檔即生效，不用重啟）
+PRONOUNCE_MAP_FILE = BASE / "pronounce_map.json"
+
+def _load_pronounce_map() -> dict:
+    try:
+        m = json.loads(PRONOUNCE_MAP_FILE.read_text(encoding="utf-8-sig"))
+        return {k: v for k, v in m.items() if not k.startswith("_")}
+    except Exception:
+        return {}
+
+def apply_pronounce(text: str) -> str:
+    """把容易唸錯的詞換成會唸對的寫法（只影響 TTS 發音，不影響字幕顯示）"""
+    for k, v in _load_pronounce_map().items():
+        text = text.replace(k, v)
+    return text
+
 def _client() -> AzureOpenAI:
     """延遲建立 AzureOpenAI client，讀 D:\\VideoAI\\.env 的設定"""
     return AzureOpenAI(
@@ -81,9 +101,29 @@ def _client() -> AzureOpenAI:
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 1：生成腳本
 # ─────────────────────────────────────────────────────────────────────────────
-def generate_script(article: str) -> dict:
-    """新聞稿 → JSON 腳本（標題、地點、旁白、字幕、語意分段）"""
+def generate_script(article: str, footage_notes: str | None = None) -> dict:
+    """
+    新聞稿 → JSON 腳本（標題、地點、旁白、字幕、語意分段）。
+    footage_notes: 素材畫面清單（catalog_video 的結果彙整）。有給的話，
+    旁白會「貼著畫面寫」（write to picture）——只講畫面裡看得到的事優先，
+    這是旁白跟畫面搭得起來的關鍵。
+    """
+    footage_block = ""
+    if footage_notes:
+        footage_block = f"""
+可用畫面素材清單（這批就是成片會用的畫面）：
+{footage_notes}
+
+⚠️ 貼著畫面寫稿（write to picture）——最重要的規則：
+- 旁白優先講「畫面裡真的看得到的事」：素材有消防救援，就把救援過程講細一點；
+  素材沒拍到的情節（案發瞬間、嫌犯特徵），一句帶過就好，不要展開
+- 段落順序盡量跟著素材能提供的畫面走，讓每段旁白都有對應畫面可配
+- 新聞稿裡畫面拍不到的背景資訊（警方說法、後續處理）集中放最後一段
+- segments 的 desc 直接註明建議配哪支影片的哪個時段（如「配V1的0~5秒消防救援」）
+"""
+
     prompt = f"""你是台灣電視新聞影音編輯。根據以下新聞稿，產出一支 {MAIN_SEC} 秒短影音的播報腳本。
+{footage_block}
 
 輸出 JSON（嚴格依此格式，不要加任何說明）：
 {{
@@ -102,13 +142,26 @@ def generate_script(article: str) -> dict:
 }}
 
 旁白播報文體規則（台灣電視新聞播報腔）：
-- 字數 {int(MAIN_SEC * 4.3)}~{int(MAIN_SEC * 4.7)} 字（新聞播報語速約每秒 4.5 字，唸完剛好 {MAIN_SEC} 秒，過短會有無聲空檔）
-- 第一句先破題：時間＋地點＋發生什麼事，一句話講完（如「台南安平一間超商昨天下午遭搶」）
-- 結構：破題 → 經過細節 → 傷亡損失 → 警方處置 → 收尾（後續發展或呼籲）
-- 全部用口語短句，每句不超過 20 字，避免書面語（「肇事」可以，「肇因於」不行）
+- ⚠️ 字數硬規定：{int(MAIN_SEC * 4.2)}~{int(MAIN_SEC * 4.5)} 字（含標點），寫完務必數一次。
+  低於 {int(MAIN_SEC * 4.2)} 字結尾會有長段無聲空景、高於 {int(MAIN_SEC * 4.5)} 字會被截斷，
+  兩種都算不合格；寫完若不在區間內，自行增刪到符合再輸出
+- 第一句先破題：時間＋地點＋發生什麼事，一句話講完
+- 結構：破題 → 經過細節 → 傷亡損失 → 警方處置 → 收尾（後續發展）
+- 句子要短，一句 8~16 字就斷句（用句號），像主播唸稿的氣口；主詞能省就省，
+  用逗號帶節奏（「一名男子走進店裡，突然亮出水果刀，逼店員打開收銀機。」）
 - 數字用口語唸法：「三萬元」不寫「30,000元」、「七十歲」不寫「70歲」
-- 平鋪直敘、不帶評論、不煽情，但語句要有播報的節奏感
+- 平鋪直敘、不帶評論、不煽情
 - 匿名原則：嫌疑人用「王姓男子」「張姓嫌犯」，不寫全名
+
+語感範例（模仿這種台灣電視新聞口白的節奏，不要照抄內容）：
+「台南安平一間超商，昨天下午驚傳搶案。一名王姓男子戴著口罩走進店裡，突然亮出水果刀，
+逼店員打開收銀機。得手三萬元後，往港濱公園方向逃逸。店員嚇得直發抖，趕緊按下警鈴。
+警方調閱監視器，鎖定嫌犯特徵，正全力追緝。」
+
+❌ 禁用的 AI 腔（出現任何一個就重寫）：
+「值得注意的是」「引發外界關注」「造成社會震驚」「相關單位」「進行了…」「展開了…」
+「…作業」（如「救援作業」直接寫「救援」）「此外」「同時」「隨後」開頭、
+「目前」一篇超過一次、連續兩句以上用相同句式開頭
 
 字幕規則：
 - 每句 8~12 字（嚴格上限 12 字，超過會爆出畫面）
@@ -139,96 +192,80 @@ segments 規則（給後續自動選片配畫面用）：
     return json.loads(resp.choices[0].message.content), usage
 
 
+def shorten_script(script: dict, max_chars: int) -> tuple[dict, dict]:
+    """旁白超過字數上限時的保險：請 GPT 縮寫旁白並同步重排字幕/分段"""
+    prompt = f"""以下短影音腳本的旁白太長（{len(script['narration'])} 字），會超過播出秒數。
+請縮短旁白到 {max_chars} 字以內（保留關鍵資訊，刪次要細節），並同步重寫 subtitles 與 segments。
+
+規則不變：
+- 字幕每句 8~12 字、與旁白一字不差、時間戳 0 到 {MAIN_SEC} 秒
+- segments 3~5 段連續涵蓋 0~{MAIN_SEC} 秒
+- 句子短、口語、句號斷句
+
+原腳本：
+{json.dumps(script, ensure_ascii=False)}
+
+輸出相同格式的完整 JSON（title、location、narration、subtitles、segments）。"""
+
+    deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2")
+    resp = _client().chat.completions.create(
+        model=deployment,
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        max_completion_tokens=4096,
+    )
+    usage = {}
+    if resp.usage:
+        usage = {
+            "prompt_tokens":     resp.usage.prompt_tokens,
+            "completion_tokens": resp.usage.completion_tokens,
+            "total_tokens":      resp.usage.total_tokens,
+        }
+    return json.loads(resp.choices[0].message.content), usage
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 2：TTS（逐句合成＋句間停頓，播報節奏更像真人）
+# Step 2：TTS
 # ─────────────────────────────────────────────────────────────────────────────
-PAUSE_SENTENCE_MS = 280   # 句號/驚嘆/問號後追加的停頓（edge-tts 本身已有小停頓，這是額外的）
-
-async def _tts_async(text: str, path: Path, voice: str, rate: str, pitch: str):
-    comm = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-    await comm.save(str(path))
-
-
-def _split_sentences(text: str) -> list[str]:
-    """依句末標點切句（。！？；），標點跟著前句；
-    過濾掉沒有實質文字內容的片段（純標點/引號會讓 edge-tts 回 No audio）"""
-    parts = re.split(r"(?<=[。！？；])", text.replace("\n", ""))
-    return [p.strip() for p in parts
-            if p.strip() and re.search(r"[一-鿿A-Za-z0-9]", p)]
-
-
-async def _tts_sentences_async(sentences: list[str], voice: str,
-                                rate: str, pitch: str) -> list[Path]:
-    """句子並行合成（最多 4 條同時，避免服務拒絕），單句失敗自動重試一次"""
-    TMP.mkdir(parents=True, exist_ok=True)
-    paths = [TMP / f"_tts_sent_{i}.mp3" for i in range(len(sentences))]
-    sem = asyncio.Semaphore(4)
-
-    async def one(s: str, p: Path):
-        async with sem:
-            for attempt in (1, 2):
-                try:
-                    comm = edge_tts.Communicate(s, voice, rate=rate, pitch=pitch)
-                    await comm.save(str(p))
-                    return
-                except Exception:
-                    if attempt == 2:
-                        raise
-                    await asyncio.sleep(0.8)
-
-    await asyncio.gather(*(one(s, p) for s, p in zip(sentences, paths)))
-    return paths
+# 曾試過逐句合成＋句間插靜音，做出來旁白會因為每句各自獨立合成而語氣不連貫，
+# 且插入的靜音沒有反映在字幕時間戳上，導致字幕跟語音對不上。改回整段一次合成，
+# 讓 edge-tts 自己處理語氣連貫與自然停頓；旁白/字幕的長度對齊改在 rescale_* 處理。
+async def _tts_async(text: str, path: Path, voice: str, rate: str, pitch: str) -> list[dict]:
+    """
+    用 stream 模式合成：一邊寫音訊、一邊收集 WordBoundary（每個字/詞的精確發音時間），
+    回傳 boundaries 供字幕逐字對齊。offset/duration 單位是 100ns ticks。
+    edge-tts 免費服務偶爾會暫時性失敗（如 'No audio was received'），重試 3 次再放棄。
+    """
+    tts_text = apply_pronounce(text)   # 專有名詞發音修正（字幕不受影響）
+    last_err = None
+    for attempt in range(3):
+        boundaries: list[dict] = []
+        try:
+            comm = edge_tts.Communicate(tts_text, voice, rate=rate, pitch=pitch,
+                                         boundary="WordBoundary")
+            with open(path, "wb") as f:
+                async for chunk in comm.stream():
+                    if chunk["type"] == "audio":
+                        f.write(chunk["data"])
+                    elif chunk["type"] == "WordBoundary":
+                        boundaries.append({
+                            "start": chunk["offset"] / 1e7,
+                            "end":   (chunk["offset"] + chunk["duration"]) / 1e7,
+                            "text":  chunk["text"],
+                        })
+            if path.exists() and path.stat().st_size > 0:
+                return boundaries
+            last_err = RuntimeError("TTS 產出空檔案")
+        except Exception as e:
+            last_err = e
+        await asyncio.sleep(1.5 * (attempt + 1))
+    raise last_err
 
 
 def generate_tts(text: str, path: Path, voice: str = TTS_VOICE,
-                  rate: str = TTS_RATE, pitch: str = TTS_PITCH):
-    """
-    逐句合成＋句間插入 PAUSE_SENTENCE_MS 靜音再串接。
-    句子只有一句、切句失敗、或逐句合成出錯時，一律退回整段單次合成（確保不炸流程）。
-    """
-    sentences = _split_sentences(text)
-    if len(sentences) <= 1:
-        asyncio.run(_tts_async(text, path, voice, rate, pitch))
-        return
-
-    try:
-        pieces = asyncio.run(_tts_sentences_async(sentences, voice, rate, pitch))
-        pieces = [p for p in pieces if p.exists() and p.stat().st_size > 0]
-    except Exception:
-        pieces = []
-    if not pieces:
-        asyncio.run(_tts_async(text, path, voice, rate, pitch))
-        return
-
-    silence = TMP / "_tts_silence.mp3"
-    try:
-        # 句間靜音檔（產生一次重複使用）
-        ff("-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=24000",
-           "-t", f"{PAUSE_SENTENCE_MS / 1000:.3f}", "-c:a", "libmp3lame", "-q:a", "9", silence)
-
-        # 交錯串接：句1 靜音 句2 靜音 ... 句N
-        inputs: list = []
-        for i, p in enumerate(pieces):
-            if i > 0:
-                inputs.append(silence)
-            inputs.append(p)
-
-        args: list = []
-        for p in inputs:
-            args += ["-i", str(p)]
-        ff(*args,
-           "-filter_complex",
-           "".join(f"[{i}:a]" for i in range(len(inputs))) + f"concat=n={len(inputs)}:v=0:a=1[a]",
-           "-map", "[a]", "-c:a", "libmp3lame", "-q:a", "4", path)
-    except Exception:
-        # 串接失敗 → 退回整段單次合成，不讓產製流程掛掉
-        asyncio.run(_tts_async(text, path, voice, rate, pitch))
-    finally:
-        for p in pieces + [silence]:
-            try:
-                p.unlink()
-            except Exception:
-                pass
+                  rate: str = TTS_RATE, pitch: str = TTS_PITCH) -> list[dict]:
+    """合成旁白音訊，回傳逐字時間資料（給字幕對齊用；拿不到時回空 list）"""
+    return asyncio.run(_tts_async(text, path, voice, rate, pitch))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,6 +286,62 @@ def _sec_to_ts(sec: float) -> str:
     s = int(sec % 60)
     ms = int(round((sec - int(sec)) * 1000))
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def align_subtitles_to_boundaries(subtitles: list, boundaries: list) -> list:
+    """
+    用 TTS 回傳的逐字發音時間（WordBoundary）精確對齊字幕。
+    原理：字幕文字與旁白一字不差，TTS boundary 的 text 又是原文片段，
+    所以把每句字幕的字數依序「消耗」boundary，就能拿到該句真實的起訖時間。
+    比「GPT 猜時間戳再等比縮放」準確得多（那個只有總長對、中間每句會漂）。
+    """
+    def _clean(s: str) -> str:
+        return re.sub(r"[^0-9A-Za-z一-鿿]", "", s)
+
+    # 字幕總字數 vs boundary 總字數若有輕微出入（GPT 字幕偶爾漏字/多字），
+    # 按比例縮放每句的消耗量來吸收，而不是整批放棄退回縮放法
+    total_sub = sum(len(_clean(apply_pronounce(s["text"]))) for s in subtitles)
+    total_bnd = sum(len(_clean(b["text"])) for b in boundaries)
+    if total_sub == 0 or total_bnd == 0:
+        return []
+    ratio = total_bnd / total_sub
+
+    aligned: list = []
+    bi = 0
+    for sub in subtitles:
+        # boundary 回傳的是「發音替換後」的文本，字數計算要跟它一致（顯示仍用原字）
+        need = max(1, round(len(_clean(apply_pronounce(sub["text"]))) * ratio))
+        if need == 0:
+            continue
+        got = 0
+        s_start = None
+        s_end = None
+        while bi < len(boundaries) and got < need:
+            b = boundaries[bi]
+            btxt = _clean(b["text"])
+            if btxt:
+                if s_start is None:
+                    s_start = b["start"]
+                got += len(btxt)
+                s_end = b["end"]
+            bi += 1
+        if s_start is None:
+            break  # boundary 用完了，剩下的句子交給呼叫端 fallback
+        aligned.append({**sub, "_start_sec": s_start, "_end_sec": s_end})
+
+    if len(aligned) < len([s for s in subtitles if _clean(s["text"])]):
+        return []  # 對齊不完整（字數對不上），回空讓呼叫端 fallback 回縮放法
+
+    # 每句尾端留 0.2s 緩衝，但不能蓋到下一句的開頭
+    out = []
+    for i, sub in enumerate(aligned):
+        end = sub["_end_sec"] + 0.2
+        if i + 1 < len(aligned):
+            end = min(end, aligned[i + 1]["_start_sec"] - 0.01)
+        out.append({k: v for k, v in sub.items() if not k.startswith("_")} |
+                   {"start": _sec_to_ts(sub["_start_sec"]),
+                    "end":   _sec_to_ts(max(end, sub["_end_sec"]))})
+    return out
 
 
 def rescale_subtitles(subtitles: list, from_total: float, to_total: float) -> list:
@@ -685,10 +778,13 @@ def main():
     srt_path = TMP / "subtitles.ass"
 
     print("② 生成旁白音訊 (edge-tts)...")
-    generate_tts(script["narration"], tts_path, voice=TTS_VOICES[args.voice])
+    boundaries = generate_tts(script["narration"], tts_path, voice=TTS_VOICES[args.voice])
 
-    print("③ 寫字幕檔...")
-    write_ass(script["subtitles"], srt_path)
+    print("③ 寫字幕檔（逐字對齊旁白）...")
+    subs = align_subtitles_to_boundaries(script["subtitles"], boundaries) if boundaries else []
+    if not subs:
+        subs = script["subtitles"]  # 對齊失敗退回 GPT 原時間戳
+    write_ass(subs, srt_path)
 
     print("④ 組裝片頭 (3秒)...")
     intro = make_intro(script)
