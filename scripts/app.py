@@ -170,6 +170,8 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         script, script_tokens = generate_script(article, footage_notes)
         _add_tokens(script_tokens)
         _job['title'] = script['title']
+        _job['hook'] = script.get('hook', '')
+        _job['hashtags'] = script.get('hashtags', [])
 
         # 長度保險 A：GPT 沒守字數上限就退件縮寫（多一次便宜的 GPT 呼叫）
         max_chars = int(MAIN_SEC * 4.6)
@@ -179,6 +181,8 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                 script, sh_tokens = shorten_script(script, int(MAIN_SEC * 4.4))
                 _add_tokens(sh_tokens)
                 _job['title'] = script['title']
+                _job['hook'] = script.get('hook', _job.get('hook', ''))
+                _job['hashtags'] = script.get('hashtags', _job.get('hashtags', []))
             except Exception:
                 pass  # 縮寫失敗就用原稿，交給長度保險 B
 
@@ -229,10 +233,11 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         intro = make_intro(script)
 
         p(7)
+        hook = script.get('hook')
         if plan:
-            main_clip, length_info = make_main_plan(tts_path, ass_path, plan, main_sec)
+            main_clip, length_info = make_main_plan(tts_path, ass_path, plan, main_sec, hook=hook)
         else:
-            main_clip, length_info = make_main(tts_path, ass_path, videos, main_sec)
+            main_clip, length_info = make_main(tts_path, ass_path, videos, main_sec, hook=hook)
         if length_info.get("insufficient"):
             _job['warning'] = (
                 f"來源畫面只涵蓋 {length_info['covered_sec']} 秒，"
@@ -777,17 +782,13 @@ textarea{resize:vertical;min-height:210px}
     <textarea id="article" placeholder="貼上新聞稿全文…"></textarea>
 
     <label>影片（可瀏覽選取多支，依序銜接補滿主畫面秒數）</label>
-    <button class="btn-browse" style="width:100%;padding:11px" onclick="openBrowse()">&#128193; 瀏覽並選取影片</button>
-    <p class="hint">選取後按「加入選取」，每支會自動跑智慧分析，結果顯示在檔名下方（分析過的有快取不重複收費）</p>
+    <div style="display:flex;gap:8px">
+      <button class="btn-browse" style="flex:1;padding:11px" onclick="openBrowse()">&#128193; 瀏覽並選取影片</button>
+      <button class="btn-browse" style="padding:11px 14px" onclick="clearVideoList()" title="清空目前的影片清單">&#128465; 重整</button>
+    </div>
+    <p class="hint">選取後按「加入選取」，每支會自動跑智慧分析，結果顯示在檔名下方（分析過的有快取不重複收費）；產製完成後清單會保留，要換下一則新聞才按「重整」清空</p>
 
     <div id="video-list" class="video-list"></div>
-
-    <label>旁白聲音</label>
-    <select id="voice">
-      <option value="hsiaochen">曉臻（女聲，預設）</option>
-      <option value="hsiaoyu">曉雨（女聲）</option>
-      <option value="yunjhe" disabled>雲哲（男聲，Microsoft 服務端暫時故障）</option>
-    </select>
 
     <button class="btn" id="btn" onclick="startJob()">開始產製</button>
   </div>
@@ -820,6 +821,11 @@ textarea{resize:vertical;min-height:210px}
       <div id="plan-box" style="display:none;margin-bottom:10px">
         <p style="font-size:.8rem;color:#374151;font-weight:600;margin-bottom:6px">🎞 旁白配對畫面明細</p>
         <div id="plan-rows" style="font-size:.76rem;color:#555;font-family:monospace;line-height:1.7"></div>
+      </div>
+      <div id="hashtag-box" style="display:none;margin-bottom:10px">
+        <p style="font-size:.8rem;color:#374151;font-weight:600;margin-bottom:6px">🏷 上架標籤（點擊複製）</p>
+        <div id="hashtag-text" onclick="copyHashtags()"
+             style="font-size:.82rem;color:#2563eb;cursor:pointer;padding:8px 10px;background:#f3f4f6;border-radius:6px;word-break:break-all"></div>
       </div>
       <a class="dl" id="dl" href="#">⬇ 下載成片</a>
     </div>
@@ -867,7 +873,6 @@ async function startJob() {
       body: JSON.stringify({
         article: art,
         videos:  videos,
-        voice:   document.getElementById('voice').value,
       })
     });
     const d = await r.json();
@@ -902,11 +907,8 @@ function handleJobDone(d) {
   if (d.error) {
     showErr(d.error);
   } else if (d.filename) {
-    showResult(d.filename, d.title, d.warning, d.plan);
-    // 產製成功 → 清空影片清單，準備下一支
-    videoList = [];
-    renderVideoList();
-    localStorage.setItem('videoai_video_list', '[]');
+    showResult(d.filename, d.title, d.warning, d.plan, d.hashtags);
+    // 影片清單保留（方便核對這次用了哪些素材），要換下一則新聞才手動按「重整」清空
   }
 }
 
@@ -989,7 +991,7 @@ function renderProgress(d) {
   else        timeEl.textContent = '已執行 ' + t + ' 秒';
 }
 
-function showResult(fname, title, warning, plan) {
+function showResult(fname, title, warning, plan, hashtags) {
   document.getElementById('titleText').textContent = title || '';
   const dlUrl = '/api/download/' + encodeURIComponent(fname);
   document.getElementById('dl').href = dlUrl;
@@ -1025,6 +1027,24 @@ function showResult(fname, title, warning, plan) {
   } else {
     warnEl.style.display = 'none';
   }
+
+  const hashtagBox = document.getElementById('hashtag-box');
+  if (hashtags && hashtags.length) {
+    document.getElementById('hashtag-text').textContent = hashtags.join(' ');
+    hashtagBox.style.display = 'block';
+  } else {
+    hashtagBox.style.display = 'none';
+  }
+}
+
+function copyHashtags() {
+  const text = document.getElementById('hashtag-text').textContent;
+  navigator.clipboard.writeText(text).then(() => {
+    const el = document.getElementById('hashtag-text');
+    const orig = el.textContent;
+    el.textContent = '已複製 ✓ ' + orig;
+    setTimeout(() => { el.textContent = orig; }, 1200);
+  });
 }
 
 function showErr(msg) {
@@ -1058,6 +1078,13 @@ let videoList = [];  // {path, start, analyzing, analysis:{category,description,
 
 function removeVideoFromList(index) {
   videoList.splice(index, 1);
+  renderVideoList();
+  saveLastSettings();
+}
+
+function clearVideoList() {
+  if (videoList.length && !confirm('確定要清空目前的影片清單嗎？')) return;
+  videoList = [];
   renderVideoList();
   saveLastSettings();
 }
@@ -1173,12 +1200,10 @@ function saveLastSettings() {
   }));
   localStorage.setItem('videoai_video_list', JSON.stringify(slim));
   localStorage.setItem('videoai_last_browse_dir', localStorage.getItem('videoai_last_browse_dir') || '');
-  localStorage.setItem('videoai_voice', document.getElementById('voice').value);
 }
 
 function restoreLastSettings() {
-  const voice = localStorage.getItem('videoai_voice');
-  if (voice) document.getElementById('voice').value = voice;
+  localStorage.removeItem('videoai_voice');  // 舊版留下的設定，聲音已固定預設不再需要
   try {
     const saved = JSON.parse(localStorage.getItem('videoai_video_list') || '[]');
     if (Array.isArray(saved)) videoList = saved;
@@ -1188,7 +1213,6 @@ function restoreLastSettings() {
 
 restoreLastSettings();
 resumeIfRunning();
-document.getElementById('voice').addEventListener('change', saveLastSettings);
 
 // ─── 資料夾瀏覽 modal ──────────────────────────────────────────────────────
 let browseSelected = new Set();  // 已勾選的檔案路徑（跨資料夾保留）

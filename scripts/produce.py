@@ -36,7 +36,8 @@ OUTPUT    = BASE / "output"
 TMP       = BASE / "tmp"
 
 INTRO_PNG = TEMPLATES / "intro.png"    # 片頭圖卡（設計師提供）
-OUTRO_PNG = TEMPLATES / "outro.png"    # 片尾圖卡（設計師提供）
+OUTRO_PNG = TEMPLATES / "outro.png"    # 片尾圖卡（設計師提供，靜態圖，次要備援）
+OUTRO_MP4 = TEMPLATES / "shorts片尾.mp4"  # 設計師提供的 shorts 專用動態片尾（已是 1080x1920，優先使用）
 LOGO_PNG  = TEMPLATES / "logo.png"     # 角標（標準命名，找不到時退回下方實際素材）
 BGM_MP3   = TEMPLATES / "bgm.mp3"     # 背景音樂
 FONT_TTF  = TEMPLATES / "font.ttf"    # 字幕字型
@@ -54,6 +55,7 @@ LOGO_CANDIDATES = [
 W, H       = 1080, 1920
 INTRO_SEC  = 3
 OUTRO_SEC  = 5
+HOOK_SEC   = 2    # hook 文字疊加在主畫面最前幾秒，純畫面文字，不唸出來
 MAIN_SEC   = 60   # 主畫面目標秒數；來源影片不足時後段補黑幕並提醒
 TTS_VOICE  = "zh-TW-HsiaoChenNeural"
 TTS_RATE   = "+8%"    # 新聞播報語速略快於預設，貼近主播腔
@@ -99,6 +101,44 @@ def _client() -> AzureOpenAI:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 字幕：不讓 GPT 寫字幕文字（實測 GPT 會把字幕寫成「摘要版」而不是逐字節錄，
+# 導致跟旁白對不上、逐字對齊演算法失效），改成直接從旁白原文切段，保證一字不差。
+# ─────────────────────────────────────────────────────────────────────────────
+def _chunk_narration(text: str, lo: int = 8, hi: int = 12) -> list[str]:
+    """把旁白原文切成 8~12 字一句，優先在標點處斷句；純切字串，不改寫內容"""
+    punct = set("，。！？、；：,.!?;:")
+    chunks: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        remaining = n - i
+        if remaining <= hi:
+            chunks.append(text[i:])
+            break
+        cut = -1
+        for j in range(min(hi, remaining) - 1, lo - 2, -1):
+            if text[i + j] in punct:
+                cut = j + 1
+                break
+        if cut == -1:
+            cut = hi
+        chunks.append(text[i:i + cut])
+        i += cut
+    # 尾段太短（<4字）併回前一句，避免出現孤零零一兩個字的字幕
+    if len(chunks) >= 2 and len(chunks[-1]) < 4:
+        chunks[-2] += chunks[-1]
+        chunks.pop()
+    return chunks
+
+
+def _build_subtitles(narration: str) -> list[dict]:
+    """時間戳先給佔位值，實際起訖交給 align_subtitles_to_boundaries 用逐字時間算"""
+    return [
+        {"index": i, "start": "00:00:00,000", "end": "00:00:00,000", "text": c}
+        for i, c in enumerate(_chunk_narration(narration), 1)
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step 1：生成腳本
 # ─────────────────────────────────────────────────────────────────────────────
 def generate_script(article: str, footage_notes: str | None = None) -> dict:
@@ -127,13 +167,11 @@ def generate_script(article: str, footage_notes: str | None = None) -> dict:
 
 輸出 JSON（嚴格依此格式，不要加任何說明）：
 {{
-  "title": "片頭標題（20 字內，吸睛但不煽情）",
+  "title": "片頭標題（20 字內，吸睛但不煽情，放在片頭卡）",
+  "hook": "開頭鉤子（10~14 字內，比 title 更聳動抓眼球，疊在主畫面最前 2 秒的畫面上，不會被旁白唸出來，純文字看的）",
+  "hashtags": ["#關鍵字1", "#關鍵字2", "#關鍵字3", "#關鍵字4"],
   "location": "地點（縣市＋路段，10 字內）",
   "narration": "旁白全文（繁體中文，約 {int(MAIN_SEC * 4.5)} 字）",
-  "subtitles": [
-    {{"index": 1, "start": "00:00:00,000", "end": "00:00:03,500", "text": "第一句"}},
-    {{"index": 2, "start": "00:00:03,500", "end": "00:00:07,000", "text": "第二句"}}
-  ],
   "segments": [
     {{"start": 0, "end": 18, "desc": "這段旁白在講什麼（例：案發經過，嫌犯持刀進入超商）"}},
     {{"start": 18, "end": 40, "desc": "嫌犯特徵與逃逸方向"}},
@@ -141,21 +179,30 @@ def generate_script(article: str, footage_notes: str | None = None) -> dict:
   ]
 }}
 
+hook／hashtag 規則：
+- hook 是給演算法用的「前 2 秒留人」鉤子，跟 title（片頭卡的正式標題）分開寫、語氣可以比 title 更直白聳動，
+  但仍要符合事實、不能誇大到失真（例：新聞是「監視器拍到行搶」，hook 可以寫「這幕全被拍下來了」，
+  不要寫「全台瘋傳」這種無中生有的浮誇語）
+- hashtags 4~6 個，繁體中文、含 # 號，跟地點/案件類型/關鍵字相關（例：#社會新聞 #台南 #監視器 #超商搶案），
+  不要塞空泛跟內容無關的熱門標籤
+
 旁白播報文體規則（台灣電視新聞播報腔）：
 - ⚠️ 字數硬規定：{int(MAIN_SEC * 4.2)}~{int(MAIN_SEC * 4.5)} 字（含標點），寫完務必數一次。
   低於 {int(MAIN_SEC * 4.2)} 字結尾會有長段無聲空景、高於 {int(MAIN_SEC * 4.5)} 字會被截斷，
   兩種都算不合格；寫完若不在區間內，自行增刪到符合再輸出
 - 第一句先破題：時間＋地點＋發生什麼事，一句話講完
 - 結構：破題 → 經過細節 → 傷亡損失 → 警方處置 → 收尾（後續發展）
-- 句子要短，一句 8~16 字就斷句（用句號），像主播唸稿的氣口；主詞能省就省，
-  用逗號帶節奏（「一名男子走進店裡，突然亮出水果刀，逼店員打開收銀機。」）
+- ⚠️ 句號要省著用：實測 TTS 在句號／驚嘆號／問號後會停頓約 0.85 秒，逗號只停頓約 0.3 秒，
+  句號斷太密旁白會一直卡頓、很不自然。每個句號之間要有 25~40 字，
+  中間用逗號串 2~3 個 8~16 字的短分句帶節奏，意思完整講完才用句號收尾，
+  主詞能省就省（範例：「一名男子走進店裡，突然亮出水果刀，逼店員打開收銀機。」是一句，不是三句）
 - 數字用口語唸法：「三萬元」不寫「30,000元」、「七十歲」不寫「70歲」
 - 平鋪直敘、不帶評論、不煽情
 - 匿名原則：嫌疑人用「王姓男子」「張姓嫌犯」，不寫全名
 
-語感範例（模仿這種台灣電視新聞口白的節奏，不要照抄內容）：
-「台南安平一間超商，昨天下午驚傳搶案。一名王姓男子戴著口罩走進店裡，突然亮出水果刀，
-逼店員打開收銀機。得手三萬元後，往港濱公園方向逃逸。店員嚇得直發抖，趕緊按下警鈴。
+語感範例（模仿這種台灣電視新聞口白的節奏，不要照抄內容；注意句號很省，都是用逗號把短分句串成一句）：
+「台南安平一間超商，昨天下午驚傳搶案，一名王姓男子戴著口罩走進店裡，突然亮出水果刀，
+逼店員打開收銀機。得手三萬元後往港濱公園方向逃逸，店員嚇得直發抖，趕緊按下警鈴。
 警方調閱監視器，鎖定嫌犯特徵，正全力追緝。」
 
 ❌ 禁用的 AI 腔（出現任何一個就重寫）：
@@ -163,10 +210,7 @@ def generate_script(article: str, footage_notes: str | None = None) -> dict:
 「…作業」（如「救援作業」直接寫「救援」）「此外」「同時」「隨後」開頭、
 「目前」一篇超過一次、連續兩句以上用相同句式開頭
 
-字幕規則：
-- 每句 8~12 字（嚴格上限 12 字，超過會爆出畫面）
-- 時間戳從 00:00:00,000 到 {MAIN_SEC} 秒，涵蓋整段旁白
-- 文字與旁白一字不差
+（字幕不用你寫，程式會直接從旁白原文切段，不用在這裡管字幕格式）
 
 segments 規則（給後續自動選片配畫面用）：
 - 把旁白依內容切成 3~5 個語意段落，start/end 為秒數，必須從 0 連續涵蓋到 {MAIN_SEC}
@@ -189,23 +233,25 @@ segments 規則（給後續自動選片配畫面用）：
             "completion_tokens": resp.usage.completion_tokens,
             "total_tokens":      resp.usage.total_tokens,
         }
-    return json.loads(resp.choices[0].message.content), usage
+    data = json.loads(resp.choices[0].message.content)
+    data["subtitles"] = _build_subtitles(data["narration"])
+    return data, usage
 
 
 def shorten_script(script: dict, max_chars: int) -> tuple[dict, dict]:
-    """旁白超過字數上限時的保險：請 GPT 縮寫旁白並同步重排字幕/分段"""
+    """旁白超過字數上限時的保險：請 GPT 縮寫旁白並同步重排 segments"""
     prompt = f"""以下短影音腳本的旁白太長（{len(script['narration'])} 字），會超過播出秒數。
-請縮短旁白到 {max_chars} 字以內（保留關鍵資訊，刪次要細節），並同步重寫 subtitles 與 segments。
+請縮短旁白到 {max_chars} 字以內（保留關鍵資訊，刪次要細節），並同步重寫 segments。
 
 規則不變：
-- 字幕每句 8~12 字、與旁白一字不差、時間戳 0 到 {MAIN_SEC} 秒
 - segments 3~5 段連續涵蓋 0~{MAIN_SEC} 秒
-- 句子短、口語、句號斷句
+- 句號要省著用（每句號間隔 25~40 字，中間用逗號串短分句），句號斷太密 TTS 停頓會很卡
 
 原腳本：
 {json.dumps(script, ensure_ascii=False)}
 
-輸出相同格式的完整 JSON（title、location、narration、subtitles、segments）。"""
+輸出相同格式的完整 JSON（title、hook、hashtags、location、narration、segments，不用輸出 subtitles），
+hook 跟 hashtags 原樣保留不用重寫。"""
 
     deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2")
     resp = _client().chat.completions.create(
@@ -221,7 +267,9 @@ def shorten_script(script: dict, max_chars: int) -> tuple[dict, dict]:
             "completion_tokens": resp.usage.completion_tokens,
             "total_tokens":      resp.usage.total_tokens,
         }
-    return json.loads(resp.choices[0].message.content), usage
+    data = json.loads(resp.choices[0].message.content)
+    data["subtitles"] = _build_subtitles(data["narration"])
+    return data, usage
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,46 +336,57 @@ def _sec_to_ts(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _flatten_boundaries_to_chars(boundaries: list) -> list[tuple[str, float, float]]:
+    """把每個 WordBoundary（可能含多字）拆成逐字時間戳，一個 word 內用等分近似"""
+    chars: list[tuple[str, float, float]] = []
+    for b in boundaries:
+        text = re.sub(r"[^0-9A-Za-z一-鿿]", "", b["text"])
+        if not text:
+            continue
+        n = len(text)
+        step = (b["end"] - b["start"]) / n
+        for k, ch in enumerate(text):
+            chars.append((ch, b["start"] + k * step, b["start"] + (k + 1) * step))
+    return chars
+
+
 def align_subtitles_to_boundaries(subtitles: list, boundaries: list) -> list:
     """
     用 TTS 回傳的逐字發音時間（WordBoundary）精確對齊字幕。
-    原理：字幕文字與旁白一字不差，TTS boundary 的 text 又是原文片段，
-    所以把每句字幕的字數依序「消耗」boundary，就能拿到該句真實的起訖時間。
+    原理：字幕文字與旁白一字不差，把 boundary 攤平成逐字時間戳後，
+    依序切出每句字幕該佔的字元段，就能拿到該句真實的起訖時間。
     比「GPT 猜時間戳再等比縮放」準確得多（那個只有總長對、中間每句會漂）。
+
+    切字用「累計消耗量」而非「每句各自 round」：每句需要的字數若剛好卡在
+    boundary word 中間，各自 round 一定會偏向多吃（無條件進位），21 句下來
+    累積誤差會讓最後一兩句連 boundary 都吃不到；改成對累計消耗量取整數，
+    捨入誤差會前後抵銷，不會愈積愈多。
     """
     def _clean(s: str) -> str:
         return re.sub(r"[^0-9A-Za-z一-鿿]", "", s)
 
-    # 字幕總字數 vs boundary 總字數若有輕微出入（GPT 字幕偶爾漏字/多字），
-    # 按比例縮放每句的消耗量來吸收，而不是整批放棄退回縮放法
+    chars = _flatten_boundaries_to_chars(boundaries)
+    total_bnd = len(chars)
     total_sub = sum(len(_clean(apply_pronounce(s["text"]))) for s in subtitles)
-    total_bnd = sum(len(_clean(b["text"])) for b in boundaries)
     if total_sub == 0 or total_bnd == 0:
         return []
     ratio = total_bnd / total_sub
 
     aligned: list = []
-    bi = 0
+    ci = 0.0        # 累計「應該」消耗到第幾個字元（浮點，不提前 round）
+    consumed = 0
     for sub in subtitles:
-        # boundary 回傳的是「發音替換後」的文本，字數計算要跟它一致（顯示仍用原字）
-        need = max(1, round(len(_clean(apply_pronounce(sub["text"]))) * ratio))
-        if need == 0:
+        need_len = len(_clean(apply_pronounce(sub["text"])))
+        if need_len == 0:
             continue
-        got = 0
-        s_start = None
-        s_end = None
-        while bi < len(boundaries) and got < need:
-            b = boundaries[bi]
-            btxt = _clean(b["text"])
-            if btxt:
-                if s_start is None:
-                    s_start = b["start"]
-                got += len(btxt)
-                s_end = b["end"]
-            bi += 1
-        if s_start is None:
-            break  # boundary 用完了，剩下的句子交給呼叫端 fallback
-        aligned.append({**sub, "_start_sec": s_start, "_end_sec": s_end})
+        ci += need_len * ratio
+        target = min(total_bnd, round(ci))
+        take = max(1, target - consumed)
+        seg = chars[consumed: consumed + take]
+        if not seg:
+            break  # 字元用完了，剩下的句子交給呼叫端 fallback
+        aligned.append({**sub, "_start_sec": seg[0][1], "_end_sec": seg[-1][2]})
+        consumed += len(seg)
 
     if len(aligned) < len([s for s in subtitles if _clean(s["text"])]):
         return []  # 對齊不完整（字數對不上），回空讓呼叫端 fallback 回縮放法
@@ -537,6 +596,21 @@ def make_intro(script: dict) -> Path:
     return out
 
 
+def _hook_filter(hook: str | None) -> str:
+    """hook 純文字疊加在主畫面最前 HOOK_SEC 秒，不唸出來；沒有 hook 就回空字串"""
+    if not hook:
+        return ""
+    text = hook.replace("'", "\\'").replace(":", "\\:")
+    fp = font_path()
+    font_arg = f":fontfile='{fp}'" if fp else ""
+    return (
+        f"drawtext=text='{text}'{font_arg}:fontsize=56:fontcolor=white"
+        f":x=(w-text_w)/2:y=280:shadowcolor=black:shadowx=2:shadowy=2"
+        f":box=1:boxcolor=black@0.45:boxborderw=20"
+        f":enable='between(t,0,{HOOK_SEC})'"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 4b：主畫面
 # ─────────────────────────────────────────────────────────────────────────────
@@ -569,11 +643,12 @@ def _mix_audio(tts: Path, audio_out: Path, main_sec: float):
 
 
 def make_main(tts: Path, srt: Path, sources: list[dict] | None = None,
-              main_sec: float = MAIN_SEC) -> tuple[Path, dict]:
+              main_sec: float = MAIN_SEC, hook: str | None = None) -> tuple[Path, dict]:
     """
     sources: [{"path": "...", "start": 12.0}, ...] 依序使用，不足 main_sec 秒的部分自動補黑幕。
              傳 None 或空 list = 全黑幕（測試流程）。
     main_sec: 主畫面實際長度（依旁白 TTS 實際長度動態決定，預設 MAIN_SEC）。
+    hook: 疊在最前 HOOK_SEC 秒畫面上的純文字鉤子，不影響旁白/字幕。
 
     回傳 (輸出路徑, 長度資訊 dict)：
       length_info = {
@@ -614,16 +689,17 @@ def make_main(tts: Path, srt: Path, sources: list[dict] | None = None,
         plan.append({"path": None, "start": 0, "dur": remaining})
 
     length_info = _plan_length_info(plan, main_sec)
-    _assemble_main(plan, audio_out, sub_f, out, main_sec)
+    _assemble_main(plan, audio_out, sub_f, out, main_sec, hook=hook)
     return out, length_info
 
 
 def make_main_plan(tts: Path, srt: Path, plan: list[dict],
-                   main_sec: float = MAIN_SEC) -> tuple[Path, dict]:
+                   main_sec: float = MAIN_SEC, hook: str | None = None) -> tuple[Path, dict]:
     """
     依智慧配對產生的時間軸組裝主畫面。
     plan: [{"path": str|None, "start": float, "dur": float}, ...]
           path=None 代表該段配不到畫面、用黑幕；黑幕可以出現在任何位置。
+    hook: 疊在最前 HOOK_SEC 秒畫面上的純文字鉤子，不影響旁白/字幕。
     """
     out       = TMP / "main.mp4"
     audio_out = TMP / "audio.aac"
@@ -637,7 +713,7 @@ def make_main_plan(tts: Path, srt: Path, plan: list[dict],
         for e in plan if float(e.get("dur", 0)) > 0.05
     ]
     length_info = _plan_length_info(norm_plan, main_sec)
-    _assemble_main(norm_plan, audio_out, sub_f, out, main_sec)
+    _assemble_main(norm_plan, audio_out, sub_f, out, main_sec, hook=hook)
     return out, length_info
 
 
@@ -654,8 +730,8 @@ def _plan_length_info(plan: list[dict], target_sec: float = MAIN_SEC) -> dict:
 
 
 def _assemble_main(plan: list[dict], audio_out: Path, sub_f: str, out: Path,
-                   main_sec: float = MAIN_SEC):
-    """把 plan 的片段（影片/黑幕交錯皆可）串接 → 上字幕 → 疊角標 → 混音輸出"""
+                   main_sec: float = MAIN_SEC, hook: str | None = None):
+    """把 plan 的片段（影片/黑幕交錯皆可）串接 → 疊 hook → 上字幕 → 疊角標 → 混音輸出"""
     logo_path = resolve_logo_path()
     has_logo  = logo_path is not None
     crop_scale = f"crop=ih*9/16:ih,scale={W}:{H}"
@@ -684,14 +760,20 @@ def _assemble_main(plan: list[dict], audio_out: Path, sub_f: str, out: Path,
 
     filter_parts.append("".join(seg_labels) + f"concat=n={len(seg_labels)}:v=1:a=0[vraw]")
 
+    base_label = "vraw"
+    hook_f = _hook_filter(hook)
+    if hook_f:
+        filter_parts.append(f"[vraw]{hook_f}[vhk]")
+        base_label = "vhk"
+
     if has_logo:
         logo_idx = idx
         args += ["-i", str(logo_path)]
         idx += 1
-        filter_parts.append(f"[vraw]{sub_f}[vs]")
+        filter_parts.append(f"[{base_label}]{sub_f}[vs]")
         filter_parts.append(f"[vs][{logo_idx}:v]overlay=main_w-overlay_w-30:60[vout]")
     else:
-        filter_parts.append(f"[vraw]{sub_f}[vout]")
+        filter_parts.append(f"[{base_label}]{sub_f}[vout]")
 
     ff(
         *args,
@@ -707,8 +789,23 @@ def _assemble_main(plan: list[dict], audio_out: Path, sub_f: str, out: Path,
 # Step 4c：片尾
 # ─────────────────────────────────────────────────────────────────────────────
 def make_outro() -> Path:
+    """
+    片尾優先序：shorts片尾.mp4（設計師提供的動態片尾，已是 1080x1920）
+    → outro.png（靜態圖備援）→ 黑底暫代。
+    動態片尾一律重新編碼成跟片頭/主畫面一致的規格（30fps/yuv420p/44100Hz），
+    確保最後 concat（stream copy）不會因規格不一致而出錯或音畫不同步。
+    """
     out = TMP / "outro.mp4"
-    if OUTRO_PNG.exists():
+    if OUTRO_MP4.exists():
+        dur = _probe_duration(OUTRO_MP4)
+        ff(
+            "-i", OUTRO_MP4,
+            "-vf", f"scale={W}:{H},setsar=1",
+            "-t", dur, "-r", "30", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-c:a", "aac", "-ar", "44100",
+            out
+        )
+    elif OUTRO_PNG.exists():
         ff(
             "-loop", "1", "-i", OUTRO_PNG,
             "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
@@ -771,6 +868,8 @@ def main():
     print("① 生成播報腳本 (GPT-4o mini)...")
     script, _ = generate_script(article)
     print(f"   標題：{script['title']}")
+    print(f"   Hook：{script.get('hook', '')}")
+    print(f"   Hashtags：{' '.join(script.get('hashtags', []))}")
     print(f"   地點：{script['location']}")
     print(f"   旁白字數：{len(script['narration'])} 字")
 
@@ -790,7 +889,7 @@ def main():
     intro = make_intro(script)
 
     print(f"⑤ 組裝主畫面 ({MAIN_SEC}秒)...")
-    main_clip, length_info = make_main(tts_path, srt_path, sources)
+    main_clip, length_info = make_main(tts_path, srt_path, sources, hook=script.get("hook"))
     if length_info["insufficient"]:
         print(f"   ⚠️ 來源影片總長度只有 {length_info['covered_sec']} 秒，"
               f"不足 {MAIN_SEC} 秒，其餘 {length_info['shortfall_sec']} 秒為黑幕空景")
