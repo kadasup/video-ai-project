@@ -62,7 +62,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from produce import (
     BASE, OUTPUT, TMP, MAIN_SEC, TTS_VOICES,
     generate_script, shorten_script, generate_tts, write_ass,
-    align_subtitles_to_boundaries, rescale_subtitles, rescale_segments,
+    align_subtitles_to_boundaries, rescale_subtitles,
+    align_segments_to_boundaries, rescale_segments,
     _probe_duration,
     make_intro, make_main, make_main_plan, make_outro, concat,
 )
@@ -118,6 +119,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
     err_msg: str | None = None
     length_info: dict = {}
     step_durations: dict = {}
+    script: dict = {}
     _last_step_t = [t0]
 
     def p(step: int):
@@ -209,7 +211,12 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         _job['sub_align'] = '逐字對齊' if subtitles else '等比縮放(fallback)'
         if not subtitles:
             subtitles = rescale_subtitles(script['subtitles'], float(MAIN_SEC), main_sec)
-        segments = rescale_segments(script.get('segments', []), float(MAIN_SEC), main_sec)
+
+        # segments（配畫面用）比照字幕做法：優先用 TTS 逐字時間精算，拿不到才退回文字量比例分配
+        segments = align_segments_to_boundaries(script['narration'], script.get('segments', []), boundaries) if boundaries else []
+        _job['seg_align'] = '逐字精算' if segments else '文字比例(fallback)'
+        if not segments:
+            segments = rescale_segments(script['narration'], script.get('segments', []), main_sec)
         write_ass(subtitles, ass_path)
 
         # ── 步驟5：旁白配畫面（腳本已貼素材寫，配對命中率高很多）──────────────────
@@ -233,7 +240,10 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         intro = make_intro(script)
 
         p(7)
-        hook = script.get('hook')
+        # 用 _job['hook']（不是 script.get('hook')）：長度保險 A 觸發縮寫時，
+        # GPT 縮寫後的 JSON 偶爾會漏帶 hook 欄位，_job['hook'] 有防呆保留舊值，
+        # 兩處讀不同來源會導致「/logs 顯示有 hook、但實際影片沒燒進去」的落差
+        hook = _job.get('hook')
         if plan:
             main_clip, length_info = make_main_plan(tts_path, ass_path, plan, main_sec, hook=hook)
         else:
@@ -298,9 +308,17 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             "frames_sent":        token_usage.get("frames_sent", 0),
             "matched":            bool(_job.get('plan')),
             "sub_align":          _job.get('sub_align', ''),
+            "seg_align":          _job.get('seg_align', ''),
             "main_sec":           _job.get('main_sec', 0),
             "step_durations":     step_durations,
             "error":              err_msg,
+            # 產製歷史回溯用：旁白全文、標題/hook/hashtag、配對明細、原始新聞稿
+            "article":            article,
+            "title":              script.get('title', ''),
+            "hook":               script.get('hook', ''),
+            "hashtags":           script.get('hashtags', []),
+            "narration":          script.get('narration', ''),
+            "plan":               _job.get('plan', []),
         })
 
 
@@ -452,6 +470,7 @@ tr:hover td{background:#fafafa}
       <th>分類</th>
       <th>輸出檔</th>
       <th>狀態</th>
+      <th>詳情</th>
     </tr>
   </thead>
   <tbody id="tbody"></tbody>
@@ -508,7 +527,7 @@ function render() {
   });
 
   const tbody = document.getElementById('tbody');
-  tbody.innerHTML = rows.map(r => {
+  tbody.innerHTML = rows.map((r, i) => {
     const cost = ((r.prompt_tokens||0)/1e6*pp + (r.completion_tokens||0)/1e6*cp);
     const ts = r.timestamp.replace('T',' ');
     const typeBadge = r.type === 'produce'
@@ -518,6 +537,10 @@ function render() {
       ? `<span class="badge badge-err" title="${r.error}">失敗</span>`
       : '<span class="badge badge-ok">成功</span>';
     const na = '<span class="na">—</span>';
+    const hasDetail = r.type === 'produce' && (r.narration || r.output_file);
+    const detailBtn = hasDetail
+      ? `<button class="btn-export" style="padding:3px 10px;font-size:.76rem" onclick="toggleDetail(${i})">🔍 詳情</button>`
+      : na;
     return `<tr>
       <td class="mono">${ts}</td>
       <td>${typeBadge}</td>
@@ -532,10 +555,53 @@ function render() {
       <td>${r.category||na}</td>
       <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.output_file||''}">${r.output_file||na}</td>
       <td>${statusBadge}</td>
-    </tr>`;
+      <td>${detailBtn}</td>
+    </tr>` + (hasDetail ? `<tr id="det-${i}" style="display:none"><td colspan="14" style="background:#fafafa">${detailHtml(r)}</td></tr>` : '');
   }).join('');
 
   renderStats(rows);
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function toggleDetail(i) {
+  const el = document.getElementById('det-' + i);
+  if (el) el.style.display = el.style.display === 'none' ? '' : 'none';
+}
+
+function detailHtml(r) {
+  const blocks = [];
+  if (r.title || r.hook) {
+    blocks.push(`<div style="margin-bottom:8px">
+      <b>標題：</b>${escapeHtml(r.title)} &nbsp; <b>Hook：</b>${escapeHtml(r.hook)}
+      ${r.hashtags && r.hashtags.length ? '<br><b>Hashtags：</b>' + escapeHtml(r.hashtags.join(' ')) : ''}
+    </div>`);
+  }
+  if (r.narration) {
+    blocks.push(`<div style="margin-bottom:8px"><b>旁白全文：</b><div style="white-space:pre-wrap;line-height:1.6;margin-top:4px">${escapeHtml(r.narration)}</div></div>`);
+  }
+  if (r.plan && r.plan.length) {
+    let at = 0;
+    const rows = r.plan.map(e => {
+      const from = at.toFixed(0); at += (e.dur||0); const to = at.toFixed(0);
+      const src = e.video === '（黑幕）' ? '<span style="color:#999">（黑幕）</span>' : `${escapeHtml(e.video)} ${e.start}s起`;
+      return `${from}-${to}s ← ${src}${e.why ? ' — <span style="color:#999">'+escapeHtml(e.why)+'</span>' : ''}`;
+    }).join('<br>');
+    blocks.push(`<div style="margin-bottom:8px"><b>旁白配對畫面明細：</b><div style="font-family:monospace;font-size:.78rem;margin-top:4px">${rows}</div></div>`);
+  }
+  if (r.video_path) {
+    blocks.push(`<div style="margin-bottom:8px"><b>使用的影片：</b>${escapeHtml(r.video_path)}</div>`);
+  }
+  if (r.article) {
+    blocks.push(`<div style="margin-bottom:8px"><b>原始新聞稿：</b><div style="white-space:pre-wrap;line-height:1.6;margin-top:4px;color:#555">${escapeHtml(r.article)}</div></div>`);
+  }
+  if (r.output_file) {
+    const dlUrl = '/api/download/' + encodeURIComponent(r.output_file);
+    blocks.push(`<div><video controls style="width:280px;border-radius:8px;background:#000" src="${dlUrl}"></video> <a href="${dlUrl}" download style="margin-left:8px">⬇ 下載</a></div>`);
+  }
+  return blocks.join('') || '<span class="na">沒有可顯示的詳情</span>';
 }
 
 function videoLenCell(r) {

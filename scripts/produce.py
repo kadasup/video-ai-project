@@ -104,30 +104,42 @@ def _client() -> AzureOpenAI:
 # 字幕：不讓 GPT 寫字幕文字（實測 GPT 會把字幕寫成「摘要版」而不是逐字節錄，
 # 導致跟旁白對不上、逐字對齊演算法失效），改成直接從旁白原文切段，保證一字不差。
 # ─────────────────────────────────────────────────────────────────────────────
-def _chunk_narration(text: str, lo: int = 8, hi: int = 12) -> list[str]:
-    """把旁白原文切成 8~12 字一句，優先在標點處斷句；純切字串，不改寫內容"""
+def _chunk_narration(text: str, max_len: int = 16) -> list[str]:
+    """
+    把旁白原文切成字幕片段：優先照旁白本來就有的標點（逗號/句號等）分句，
+    因為每個標點本來就是 TTS 停頓的自然單位（見句號/逗號停頓規則），
+    照標點切出來的字幕變化時機會剛好貼合語音實際停頓，比固定字數切更自然，
+    也不會像「固定 8~12 字硬切」那樣常常把一個詞從中間切開
+    （例如「報案」被切成上一句尾「報」、下一句頭「案」）。
+    只有極少數單一分句本身就超長（GPT 沒照規則斷句）才退回字數硬切。
+    """
     punct = set("，。！？、；：,.!?;:")
+    clauses: list[str] = []
+    start = 0
+    for idx, ch in enumerate(text):
+        if ch in punct:
+            clauses.append(text[start:idx + 1])
+            start = idx + 1
+    if start < len(text):
+        clauses.append(text[start:])
+
     chunks: list[str] = []
-    i, n = 0, len(text)
-    while i < n:
-        remaining = n - i
-        if remaining <= hi:
-            chunks.append(text[i:])
-            break
-        cut = -1
-        for j in range(min(hi, remaining) - 1, lo - 2, -1):
-            if text[i + j] in punct:
-                cut = j + 1
-                break
-        if cut == -1:
-            cut = hi
-        chunks.append(text[i:i + cut])
-        i += cut
-    # 尾段太短（<4字）併回前一句，避免出現孤零零一兩個字的字幕
-    if len(chunks) >= 2 and len(chunks[-1]) < 4:
-        chunks[-2] += chunks[-1]
-        chunks.pop()
-    return chunks
+    for clause in clauses:
+        if not clause:
+            continue
+        if len(clause) <= max_len:
+            chunks.append(clause)
+        else:
+            chunks.extend(clause[i:i + max_len] for i in range(0, len(clause), max_len))
+
+    # 太短的片段（<4字）併回前一句，避免出現孤零零一兩個字的字幕
+    merged: list[str] = []
+    for c in chunks:
+        if merged and len(c) < 4:
+            merged[-1] += c
+        else:
+            merged.append(c)
+    return merged
 
 
 def _build_subtitles(narration: str) -> list[dict]:
@@ -145,8 +157,9 @@ def generate_script(article: str, footage_notes: str | None = None) -> dict:
     """
     新聞稿 → JSON 腳本（標題、地點、旁白、字幕、語意分段）。
     footage_notes: 素材畫面清單（catalog_video 的結果彙整）。有給的話，
-    旁白會「貼著畫面寫」（write to picture）——只講畫面裡看得到的事優先，
-    這是旁白跟畫面搭得起來的關鍵。
+    旁白會在「新聞稿內容為主」的前提下貼著畫面寫（write to picture）——
+    新聞稿寫了什麼、篇幅怎麼分配就照樣寫，畫面只用來決定「怎麼描述細節」，
+    不能反過來讓畫面有無去裁剪或打亂新聞稿本身的內容。
     """
     footage_block = ""
     if footage_notes:
@@ -154,12 +167,18 @@ def generate_script(article: str, footage_notes: str | None = None) -> dict:
 可用畫面素材清單（這批就是成片會用的畫面）：
 {footage_notes}
 
-⚠️ 貼著畫面寫稿（write to picture）——最重要的規則：
-- 旁白優先講「畫面裡真的看得到的事」：素材有消防救援，就把救援過程講細一點；
-  素材沒拍到的情節（案發瞬間、嫌犯特徵），一句帶過就好，不要展開
-- 段落順序盡量跟著素材能提供的畫面走，讓每段旁白都有對應畫面可配
-- 新聞稿裡畫面拍不到的背景資訊（警方說法、後續處理）集中放最後一段
-- segments 的 desc 直接註明建議配哪支影片的哪個時段（如「配V1的0~5秒消防救援」）
+⚠️ 貼著畫面寫稿（write to picture）——但新聞稿的事實跟敘事比重才是主體，畫面只是輔助：
+- ⚠️ 最優先：新聞稿寫了什麼、用多少篇幅講，旁白就照樣講、照樣分配篇幅。
+  不能因為某段情節沒有對應畫面就刪減、簡化或一句帶過——沒畫面就配黑幕，
+  新聞內容本身不能因此縮水；也不能為了配合畫面把新聞稿原本的敘事順序打亂重排
+- 在「新聞稿原本就會提到」的情節裡，如果素材剛好拍到對應畫面，用字可以貼近畫面
+  的具體細節（例如新聞稿寫「消防救援」，素材有救援畫面，就可以多描述救援動作）；
+  但這只是「錦上添花」，不是新增內容的理由，新聞稿沒寫的事不要因為有畫面就加進去
+- segments 的 desc 直接註明建議配哪支影片的哪個時段（如「配V1的0~5秒消防救援」），
+  這欄純粹給後續配對用，不影響旁白正文的取捨
+- ⚠️ 這是給你內部規劃用的畫面清單，旁白正文絕對不能提到「畫面中」「這段影像」
+  「另一段影像可以看到」「可以看到」這種講述影片本身的解說詞——旁白要像主播播報
+  事件本身，不是在講解你看到的素材
 """
 
     prompt = f"""你是台灣電視新聞影音編輯。根據以下新聞稿，產出一支 {MAIN_SEC} 秒短影音的播報腳本。
@@ -173,9 +192,9 @@ def generate_script(article: str, footage_notes: str | None = None) -> dict:
   "location": "地點（縣市＋路段，10 字內）",
   "narration": "旁白全文（繁體中文，約 {int(MAIN_SEC * 4.5)} 字）",
   "segments": [
-    {{"start": 0, "end": 18, "desc": "這段旁白在講什麼（例：案發經過，嫌犯持刀進入超商）"}},
-    {{"start": 18, "end": 40, "desc": "嫌犯特徵與逃逸方向"}},
-    {{"start": 40, "end": {MAIN_SEC}, "desc": "警方調閱監視器追查"}}
+    {{"sentences": 2, "desc": "這段涵蓋的頭 2 句在講什麼（例：案發經過，嫌犯持刀進入超商）"}},
+    {{"sentences": 1, "desc": "嫌犯特徵與逃逸方向"}},
+    {{"sentences": 2, "desc": "警方調閱監視器追查"}}
   ]
 }}
 
@@ -210,10 +229,14 @@ hook／hashtag 規則：
 「…作業」（如「救援作業」直接寫「救援」）「此外」「同時」「隨後」開頭、
 「目前」一篇超過一次、連續兩句以上用相同句式開頭
 
+❌ 禁止解說詞（旁白正文絕對不能出現，這是在講事件不是在講影片）：
+「畫面中」「畫面顯示」「這段影像」「另一段影像」「可以看到」「可見」開頭句
+
 （字幕不用你寫，程式會直接從旁白原文切段，不用在這裡管字幕格式）
 
 segments 規則（給後續自動選片配畫面用）：
-- 把旁白依內容切成 3~5 個語意段落，start/end 為秒數，必須從 0 連續涵蓋到 {MAIN_SEC}
+- 把旁白依「句號／驚嘆號／問號」切出的句子分組成 3~5 段，"sentences" 是這段涵蓋幾句
+  （正整數，依序消耗，不用給 start/end 秒數，程式會自動用 TTS 逐字時間精算）
 - desc 描述該段旁白的畫面需求，具體寫出人事物與動作（如「嫌犯亮刀威脅店員」而非「案發」）
 
 新聞稿：
@@ -244,8 +267,9 @@ def shorten_script(script: dict, max_chars: int) -> tuple[dict, dict]:
 請縮短旁白到 {max_chars} 字以內（保留關鍵資訊，刪次要細節），並同步重寫 segments。
 
 規則不變：
-- segments 3~5 段連續涵蓋 0~{MAIN_SEC} 秒
+- segments 3~5 段，"sentences" 是該段涵蓋幾句（依句號/驚嘆號/問號切句），不用給秒數
 - 句號要省著用（每句號間隔 25~40 字，中間用逗號串短分句），句號斷太密 TTS 停頓會很卡
+- 旁白正文不能出現「畫面中」「這段影像」「另一段影像可以看到」這種解說詞
 
 原腳本：
 {json.dumps(script, ensure_ascii=False)}
@@ -416,13 +440,113 @@ def rescale_subtitles(subtitles: list, from_total: float, to_total: float) -> li
     return out
 
 
-def rescale_segments(segments: list, from_total: float, to_total: float) -> list:
-    """把語意分段（數字秒）等比縮放"""
-    if from_total <= 0 or abs(from_total - to_total) < 0.3:
-        return segments
-    k = to_total / from_total
-    return [{**seg, "start": round(seg["start"] * k, 1),
-             "end": round(min(seg["end"] * k, to_total), 1)} for seg in segments]
+def _split_sentences(text: str) -> list[str]:
+    """依句號/驚嘆號/問號切句，標點保留在句尾；沒有句尾標點的殘餘文字併成最後一句"""
+    parts = re.findall(r"[^。！？]*[。！？]|[^。！？]+$", text)
+    return [p for p in parts if p]
+
+
+def align_segments_to_boundaries(narration: str, segments: list, boundaries: list) -> list:
+    """
+    比照字幕對齊的做法：segments 不再用 GPT 猜的秒數，改用「這段涵蓋幾句」
+    （sentences 計數）+ TTS 逐字時間表精算實際起訖秒數，跟 align_subtitles_to_boundaries
+    共用同一套「累計消耗量統一取整數」演算法，避免捨入誤差累積。
+    """
+    def _clean(s: str) -> str:
+        return re.sub(r"[^0-9A-Za-z一-鿿]", "", s)
+
+    sentences = _split_sentences(narration)
+    if not sentences or not boundaries or not segments:
+        return []
+
+    chars = _flatten_boundaries_to_chars(boundaries)
+    total_bnd = len(chars)
+    total_text = sum(len(_clean(apply_pronounce(s))) for s in sentences)
+    if total_bnd == 0 or total_text == 0:
+        return []
+    ratio = total_bnd / total_text
+
+    # GPT 給的 sentences 加總常常跟實際句數對不上（多算/少算一句很常見），
+    # 先按比例normalize 到剛好等於實際句數，誤差平均分攤，不要整段被吃掉或整段多出來
+    declared = [max(1, int(seg.get("sentences", 1))) for seg in segments]
+    declared_total = sum(declared)
+    if declared_total != len(sentences):
+        scaled = [max(1, round(d * len(sentences) / declared_total)) for d in declared]
+        diff = len(sentences) - sum(scaled)
+        scaled[-1] = max(1, scaled[-1] + diff)
+        declared = scaled
+
+    aligned: list = []
+    si = 0
+    consumed = 0
+    running = 0.0
+    for seg, n in zip(segments, declared):
+        remaining = len(sentences) - si
+        if remaining <= 0:
+            break
+        n = min(n, remaining)
+        chunk = sentences[si: si + n]
+        si += n
+        seg_len = sum(len(_clean(apply_pronounce(s))) for s in chunk)
+        running += seg_len * ratio
+        target = min(total_bnd, round(running))
+        take = max(1, target - consumed)
+        seg_chars = chars[consumed: consumed + take]
+        if not seg_chars:
+            break
+        aligned.append({"start": round(seg_chars[0][1], 1),
+                         "end": round(seg_chars[-1][2], 1),
+                         "desc": seg.get("desc", "")})
+        consumed += len(seg_chars)
+
+    if not aligned:
+        return []
+
+    # GPT 給的 segments 涵蓋句數加總若少於實際句數，剩下的句子併給最後一段
+    if si < len(sentences):
+        remaining_chars = chars[consumed:]
+        if remaining_chars:
+            aligned[-1]["end"] = round(remaining_chars[-1][2], 1)
+
+    aligned[0]["start"] = 0.0
+    for i in range(len(aligned) - 1):
+        aligned[i]["end"] = aligned[i + 1]["start"]
+    return aligned
+
+
+def rescale_segments(narration: str, segments: list, total_sec: float) -> list:
+    """
+    沒有 TTS 逐字時間可用時的備援：依每段涵蓋句子的字數比例分配秒數
+    （比 GPT 直接猜秒數可靠，好歹跟實際文字量成正比）。
+    """
+    sentences = _split_sentences(narration)
+    if not sentences or not segments or total_sec <= 0:
+        return []
+
+    si = 0
+    parts: list[tuple[str, int]] = []
+    for seg in segments:
+        remaining = len(sentences) - si
+        if remaining <= 0:
+            break
+        n = max(1, min(int(seg.get("sentences", 1)), remaining))
+        chunk = sentences[si: si + n]
+        si += n
+        parts.append((seg.get("desc", ""), sum(len(s) for s in chunk)))
+    if si < len(sentences) and parts:
+        parts[-1] = (parts[-1][0], parts[-1][1] + sum(len(s) for s in sentences[si:]))
+    if not parts:
+        return []
+
+    total_chars = sum(c for _, c in parts) or 1
+    out = []
+    t = 0.0
+    for desc, clen in parts:
+        dur = total_sec * clen / total_chars
+        out.append({"start": round(t, 1), "end": round(min(t + dur, total_sec), 1), "desc": desc})
+        t += dur
+    out[-1]["end"] = round(total_sec, 1)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
