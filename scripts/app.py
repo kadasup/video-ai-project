@@ -62,14 +62,20 @@ _load_env()
 sys.path.insert(0, str(Path(__file__).parent))
 from produce import (
     BASE, OUTPUT, TMP, MAIN_SEC, TTS_VOICES,
-    generate_script, shorten_script, generate_tts, write_ass,
+    generate_script, shorten_script, factcheck_narration, generate_tts, write_ass,
     align_subtitles_to_boundaries, rescale_subtitles,
     align_segments_to_boundaries, rescale_segments,
-    _probe_duration,
+    _probe_duration, _split_sentences, _build_subtitles,
+    shift_subtitles, build_sot_subtitles, extract_audio_clip, concat_audio,
     make_intro, make_main, make_main_plan, make_outro, concat,
 )
-from select_clip import select_clip, catalog_video, match_narration_to_clips
+from select_clip import (
+    select_clip, catalog_video, match_narration_to_clips,
+    video_fingerprint, near_duplicate, seg_line,
+)
 import ltn_api
+import speech
+import translit
 
 app = Flask(__name__)
 
@@ -136,7 +142,9 @@ def _photo_thumb_b64(photo_path: str) -> str | None:
             pass
 
 
-def _build_preview(script: dict, subtitles: list, plan_rows: list) -> dict:
+def _build_preview(script: dict, subtitles: list, plan_rows: list,
+                   factcheck: list | None = None,
+                   translit_results: list | None = None) -> dict:
     """組裝分鏡預覽 payload：旁白、Hook、hashtags、字幕分段、每段配對＋代表縮圖"""
     segs = []
     for e in (plan_rows or []):
@@ -163,7 +171,100 @@ def _build_preview(script: dict, subtitles: list, plan_rows: list) -> dict:
         'narration': script.get('narration', ''),
         'subtitles': [s.get('text', '') for s in (subtitles or [])],
         'segments': segs,
+        'factcheck': factcheck or [],
+        'translit': translit_results or [],
     }
+
+def _split_gpt_segments(segs: list, k: int) -> tuple[list, list]:
+    """把 GPT 的 segments（含 sentences 計數）在第 k 句處切成前後兩批（SOT 插入用）"""
+    a, b, acc = [], [], 0
+    for s in segs:
+        n = max(1, int(s.get('sentences', 1) or 1))
+        if acc >= k:
+            b.append(s)
+        elif acc + n <= k:
+            a.append(s)
+        else:
+            a.append({**s, 'sentences': k - acc})
+            b.append({**s, 'sentences': acc + n - k})
+        acc += n
+    return a, b
+
+
+def _merge_tiny_plan_entries(plan: list) -> list:
+    """
+    SOT 切點會把片段切出 <2 秒的碎片，觀眾來不及看，併給相鄰段。
+    SOT 段（why 以 🎤 開頭）的時長跟音軌鎖死，絕不能被增減，只當「跳過」處理。
+    """
+    def is_sot(e):
+        return str(e.get('why', '')).startswith('🎤')
+
+    out = list(plan)
+    changed = True
+    while changed:
+        changed = False
+        for i, e in enumerate(out):
+            if is_sot(e) or float(e.get('dur', 0)) >= 2.0:
+                continue
+            d = float(e.get('dur', 0))
+            nxt = out[i + 1] if i + 1 < len(out) else None
+            prv = out[i - 1] if i > 0 else None
+            if nxt is not None and not is_sot(nxt):
+                nxt['dur'] = round(float(nxt['dur']) + d, 2)
+                if nxt.get('path'):
+                    nxt['start'] = round(max(0.0, float(nxt.get('start', 0)) - d), 2)
+            elif prv is not None and not is_sot(prv):
+                prv['dur'] = round(float(prv['dur']) + d, 2)
+            else:
+                continue   # 兩邊都是 SOT（幾乎不可能），放著
+            out.pop(i)
+            changed = True
+            break
+    return out
+
+
+def _enrich_subject_pos(plan: list, catalogs: list) -> None:
+    """
+    給每個影片片段查它取用的區間主體在畫面哪一側（左/中/右），
+    寫進 entry['subject_pos'] 供直式裁切偏移。就地修改 plan。
+    """
+    seg_map = {}   # path -> [(start, end, subject_pos)]
+    for cat in catalogs:
+        seg_map[str(cat['path'])] = [
+            (s['start'], s['end'], s.get('subject_pos', '滿版')) for s in cat['segments']]
+    for e in plan:
+        if not e.get('path'):
+            continue
+        segs = seg_map.get(str(e['path']))
+        if not segs:
+            continue
+        mid = float(e.get('start', 0) or 0) + float(e.get('dur', 0) or 0) / 2
+        # 取涵蓋中點的段落；找不到就取最接近的
+        pos = next((sp for st, en, sp in segs if st <= mid <= en), None)
+        if pos is None and segs:
+            pos = min(segs, key=lambda x: abs((x[0] + x[1]) / 2 - mid))[2]
+        e['subject_pos'] = pos or '滿版'
+
+
+def _split_plan_at(plan: list, t: float) -> tuple[list, list]:
+    """把配對時間軸在第 t 秒處切開（跨界的片段拆成兩半），供插入 SOT 段"""
+    a, b, acc = [], [], 0.0
+    for e in plan:
+        d = float(e.get('dur', 0) or 0)
+        if acc >= t - 0.01:
+            b.append(e)
+        elif acc + d <= t + 0.01:
+            a.append(e)
+        else:
+            take = round(t - acc, 2)
+            e2 = {**e, 'dur': round(d - take, 2)}
+            if e.get('path'):
+                e2['start'] = round(float(e.get('start', 0) or 0) + take, 2)
+            a.append({**e, 'dur': take})
+            b.append(e2)
+        acc += d
+    return a, b
+
 
 _TALK_KEYWORDS = ('受訪', '說話', '發言', '講話', '對鏡頭', '口型', '受访')
 
@@ -173,10 +274,13 @@ def _coverage_warning(plan: list, catalogs: list) -> str | None:
     佔比過高就回警告字串——讓「素材撐不起旁白」在確認分鏡時就被看見，
     而不是整支渲染完才發現畫面空洞。
     """
-    desc_map = {}   # path -> [(start, end, desc)]
+    desc_map = {}   # path -> [(start, end, is_talk)]
     for cat in catalogs:
         desc_map[str(cat['path'])] = [
-            (s['start'], s['end'], s.get('description', '')) for s in cat['segments']]
+            (s['start'], s['end'],
+             bool(s.get('has_speech')) or any(k in s.get('description', '')
+                                              for k in _TALK_KEYWORDS))
+            for s in cat['segments']]
 
     total = talk = photo = black = 0.0
     for e in plan:
@@ -192,8 +296,7 @@ def _coverage_warning(plan: list, catalogs: list) -> str | None:
             s1 = s0 + dur
             talk_overlap = sum(
                 max(0.0, min(s1, seg_end) - max(s0, seg_start))
-                for seg_start, seg_end, desc in segs
-                if any(k in desc for k in _TALK_KEYWORDS))
+                for seg_start, seg_end, is_talk in segs if is_talk)
             talk += talk_overlap
     if total <= 0:
         return None
@@ -265,45 +368,124 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         TMP.mkdir(parents=True, exist_ok=True)
         OUTPUT.mkdir(parents=True, exist_ok=True)
 
-        tts_path = TMP / "_narration.mp3"
+        tts_path = TMP / "_narration_full.m4a"   # 旁白（+SOT 原音）合併後的完整音軌
         ass_path = TMP / "_subtitles.ass"
 
-        # ── 步驟1：先分析素材（write to picture 的前提：先知道有什麼畫面）────────
+        # ── 步驟1：先分析素材（近重複偵測→畫面目錄→受訪原音轉譯）─────────────────
         p(1)
+
+        # 近重複偵測：記者常同場景連拍多支，dHash 指紋聚類後同組只留最長的一支
+        # （省 API 分析錢，也避免配對重複選到同畫面）。長度差 >20% 不視為重複
+        # ——受訪 take1/take2 畫面像但內容不同，要保守。
+        dedup_skipped = []
+        if len(videos) > 1:
+            _job['msg'] = f"{STEPS[1]}（近重複素材偵測中）"
+            metas = []
+            for v in videos:
+                try:
+                    d = _probe_duration(Path(v['path']))
+                    fp = video_fingerprint(Path(v['path']), d)
+                except Exception:
+                    d, fp = 0, [None, None, None]
+                metas.append({'v': v, 'dur': d, 'fp': fp})
+            kept: list[dict] = []
+            for m in sorted(metas, key=lambda x: -x['dur']):   # 長的優先留
+                if any(near_duplicate(m['fp'], k['fp'], m['dur'], k['dur']) for k in kept):
+                    dedup_skipped.append(Path(m['v']['path']).name)
+                else:
+                    kept.append(m)
+            if dedup_skipped:
+                keep_paths = {id(k['v']) for k in kept}
+                videos = [v for v in videos if id(v) in keep_paths]   # 保留原相對順序
+                _job['warning'] = (f"已略過 {len(dedup_skipped)} 支近重複素材："
+                                   + "、".join(dedup_skipped))
+
         catalogs = []
+        transcripts = []   # 與 catalogs 同 index：該支影片的受訪逐字稿（無人聲為空）
         if videos:
             for i, v in enumerate(videos):
                 _job['msg'] = f"{STEPS[1]}（{i+1}/{len(videos)}）"
                 try:
                     cat = catalog_video(Path(v['path']))
                     _add_tokens(cat.get('tokens', {}))
+                    _job['msg'] = f"{STEPS[1]}（{i+1}/{len(videos)}，原音轉譯中）"
+                    try:
+                        tr = speech.transcribe(Path(v['path']))
+                    except Exception:
+                        tr = {"segments": [], "full_text": ""}
                     catalogs.append(cat)
+                    transcripts.append(tr)
                 except Exception:
                     pass  # 單支分析失敗不擋整體流程
 
-        # 素材畫面清單 → 給 GPT 貼著畫面寫稿
+        # 用實際轉譯結果標註每個畫面段落「有沒有原音人聲」（給配對與涵蓋度判斷用，
+        # 比靠描述文字猜「受訪」可靠）
+        for cat, tr in zip(catalogs, transcripts):
+            spans = [(s['start'], s['end']) for s in tr.get('segments', [])]
+            for seg in cat['segments']:
+                ov = sum(max(0.0, min(seg['end'], e) - max(seg['start'], st))
+                         for st, e in spans)
+                seg['has_speech'] = ov > (seg['end'] - seg['start']) * 0.5
+
+        # 素材畫面清單 → 給 GPT 貼著畫面寫稿（含結構化標記）
         footage_notes = None
         if catalogs:
             lines = []
             for vi, cat in enumerate(catalogs):
                 lines.append(f"影片V{vi+1}（{Path(cat['path']).name}，總長 {cat['duration']} 秒）：")
                 for seg in cat['segments']:
-                    lines.append(f"  {seg['start']}~{seg['end']}秒：{seg.get('description', '')}")
+                    lines.append(f"  {seg_line(seg)}")
             footage_notes = "\n".join(lines)
 
+        # 受訪逐字稿 → 給 GPT 安排 SOT（受訪原音段）
+        interview_notes = None
+        iv_lines = []
+        for vi, tr in enumerate(transcripts):
+            if not tr.get('segments'):
+                continue
+            iv_lines.append(f"影片V{vi+1} 的原音逐字稿：")
+            for s in tr['segments']:
+                iv_lines.append(f"  [{s['start']}s~{s['end']}s] {s['text']}")
+        if iv_lines:
+            interview_notes = "\n".join(iv_lines)
+
         p(2)
-        script, script_tokens = generate_script(article, footage_notes)
+        script, script_tokens = generate_script(article, footage_notes, interview_notes)
         _add_tokens(script_tokens)
         _job['title'] = script['title']
         _job['hook'] = script.get('hook', '')
         _job['hashtags'] = script.get('hashtags', [])
 
-        # 長度保險 A：GPT 沒守字數上限就退件縮寫（多一次便宜的 GPT 呼叫）
-        max_chars = int(MAIN_SEC * 4.6)
-        if len(script['narration']) > max_chars:
+        # ── SOT 解析：把 GPT 選的原音引句對回逐字稿時間軸 ─────────────────────────
+        sot = None
+        for s0 in (script.get('sots') or [])[:1]:   # 最多一段，寧缺勿濫
+            try:
+                vi = int(str(s0.get('video', '')).strip().upper().lstrip('V')) - 1
+                if not (0 <= vi < len(transcripts)):
+                    continue
+                span = speech.resolve_quote_span(transcripts[vi], s0.get('quote', ''))
+                if not span:
+                    continue
+                st, en, _spansegs = span
+                dur_s = round(en - st, 2)
+                if dur_s > 16.0:
+                    continue   # 超過 16 秒的 SOT 太拖，寧缺勿濫（規則要求 5~15 秒）
+                if dur_s >= 3.0:
+                    sot = {'path': catalogs[vi]['path'], 'start': st, 'dur': dur_s,
+                           'display': (s0.get('display') or s0.get('quote') or '').strip(),
+                           'after_sentence': int(s0.get('after_sentence', 0) or 0),
+                           'label': f"V{vi+1}"}
+            except Exception:
+                continue
+        _job['sot'] = ({'label': sot['label'], 'dur': sot['dur'],
+                        'display': sot['display']} if sot else None)
+
+        # 長度保險 A：GPT 沒守字數上限就退件縮寫（有 SOT 時額度要扣掉原音秒數）
+        nar_budget_sec = MAIN_SEC - (sot['dur'] if sot else 0)
+        if len(script['narration']) > int(nar_budget_sec * 4.6):
             _job['msg'] = f"{STEPS[2]}（旁白 {len(script['narration'])} 字超限，縮寫中）"
             try:
-                script, sh_tokens = shorten_script(script, int(MAIN_SEC * 4.4))
+                script, sh_tokens = shorten_script(script, int(nar_budget_sec * 4.4))
                 _add_tokens(sh_tokens)
                 _job['title'] = script['title']
                 _job['hook'] = script.get('hook', _job.get('hook', ''))
@@ -311,50 +493,168 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             except Exception:
                 pass  # 縮寫失敗就用原稿，交給長度保險 B
 
+        # ── 查核 Agent：旁白（AI 改寫版）逐項比對記者原稿的硬事實，抓改錯的數字/
+        #    人名/地名/罪名等。新聞命脈，有出入在分鏡確認時標紅，讓人在渲染前就看到。
+        #    同一次呼叫順便抽出外國譯名 → 比對報社音譯總表（譯名核實，表唯讀）──
+        _job['msg'] = f"{STEPS[2]}（事實查核中）"
+        try:
+            fc_issues, fc_translits, fc_tokens = factcheck_narration(article, script['narration'])
+            _add_tokens(fc_tokens)
+        except Exception:
+            fc_issues, fc_translits = [], []
+        _job['factcheck'] = fc_issues
+        if fc_issues:
+            highs = [i for i in fc_issues if i.get('severity') == 'high']
+            fc_msg = (f"⚠️ 事實查核發現 {len(fc_issues)} 處與原稿不符"
+                      + (f"（其中 {len(highs)} 處為數字/人名/地名等硬事實）" if highs else "")
+                      + "，請在分鏡確認時核對旁白")
+            _job['warning'] = ((_job.get('warning') + '\n' + fc_msg)
+                               if _job.get('warning') else fc_msg)
+
+        # 譯名核實：旁白裡的外國譯名 vs 報社音譯總表（同事維護的 4600 筆 Google Sheet）
+        translit_results = []
+        if fc_translits:
+            try:
+                translit_results = translit.check_names(fc_translits)
+            except Exception:
+                translit_results = []
+        _job['translit'] = translit_results
+        mismatches = [t for t in translit_results if t.get('status') == 'mismatch']
+        if mismatches:
+            tr_msg = ("⚠️ 譯名核實：" + "；".join(
+                f"「{t['chinese']}」報社標準譯名是「{t['expected']}」" for t in mismatches))
+            _job['warning'] = ((_job.get('warning') + '\n' + tr_msg)
+                               if _job.get('warning') else tr_msg)
+
+        # ── 依 SOT 插入點把旁白拆成前後兩塊（無 SOT 就是單塊，流程與過去一致）────
+        sentences = _split_sentences(script['narration'])
+        if sot:
+            k = min(max(sot['after_sentence'], 1), len(sentences))
+            nar_parts = ["".join(sentences[:k]), "".join(sentences[k:])]
+            nar_parts = [t for t in nar_parts if t] or [script['narration']]
+            if len(nar_parts) == 1 and sot['after_sentence'] >= len(sentences):
+                pass   # SOT 收尾：nar_parts=[全文]，SOT 排最後
+        else:
+            k = None
+            nar_parts = [script['narration']]
+
         p(3)
-        boundaries = generate_tts(script['narration'], tts_path, voice=voice)
-        tts_sec = _probe_duration(tts_path)
+        part_paths, part_bounds, part_secs = [], [], []
+        for pi, text in enumerate(nar_parts):
+            pp = TMP / f"_narration_p{pi}.mp3"
+            b = generate_tts(text, pp, voice=voice)
+            part_paths.append(pp); part_bounds.append(b)
+            part_secs.append(_probe_duration(pp))
+        nar_total = sum(part_secs)
 
-        # 長度保險 B：唸完還是太長 → 按比例加快語速重唸一次（上限 +20%，太快會不自然）
-        if tts_sec > MAIN_SEC + 4:
-            base = 1.08  # 目前預設 +8%
-            need = base * tts_sec / (MAIN_SEC + 1)
+        # 長度保險 B：唸完還是太長 → 按比例加快語速重唸（上限 +20%）
+        nar_limit = nar_budget_sec + 4
+        if nar_total > nar_limit:
+            need = 1.08 * nar_total / (nar_budget_sec + 1)
             pct = min(int(round((need - 1) * 100)), 20)
-            _job['msg'] = f"{STEPS[3]}（旁白 {tts_sec:.0f}s 過長，以 +{pct}% 語速重唸）"
-            boundaries = generate_tts(script['narration'], tts_path, voice=voice, rate=f"+{pct}%")
-            tts_sec = _probe_duration(tts_path)
+            _job['msg'] = f"{STEPS[3]}（旁白 {nar_total:.0f}s 過長，以 +{pct}% 語速重唸）"
+            part_paths, part_bounds, part_secs = [], [], []
+            for pi, text in enumerate(nar_parts):
+                pp = TMP / f"_narration_p{pi}.mp3"
+                b = generate_tts(text, pp, voice=voice, rate=f"+{pct}%")
+                part_paths.append(pp); part_bounds.append(b)
+                part_secs.append(_probe_duration(pp))
+            nar_total = sum(part_secs)
 
-        # 量測旁白實際長度，主畫面/字幕/配對全部對齊它（不再假設剛好 MAIN_SEC）
-        main_sec = round(min(max(tts_sec + 0.4, 15.0), 90.0), 1)
+        # 音軌組裝：旁白（＋SOT 原音）串成單一音軌；SOT 位置在 part0 之後
+        sot_dur = sot['dur'] if sot else 0.0
+        if sot:
+            sot_audio = TMP / "_sot_audio.m4a"
+            extract_audio_clip(Path(sot['path']), sot['start'], sot['dur'], sot_audio)
+            audio_files = [part_paths[0], sot_audio] + part_paths[1:]
+        else:
+            audio_files = list(part_paths)
+        concat_audio(audio_files, tts_path)
+
+        main_sec = round(min(max(nar_total + sot_dur + 0.4, 15.0), 90.0), 1)
         _job['main_sec'] = main_sec
 
         p(4)
-        # 優先用 TTS 逐字時間精確對齊字幕；拿不到（或字數差太多）才退回等比縮放
-        subtitles = align_subtitles_to_boundaries(script['subtitles'], boundaries) if boundaries else []
-        _job['sub_align'] = '逐字對齊' if subtitles else '等比縮放(fallback)'
-        if not subtitles:
-            subtitles = rescale_subtitles(script['subtitles'], float(MAIN_SEC), main_sec)
+        # 每塊旁白各自逐字對齊，再平移到成片時間軸；SOT 字幕用校正後引句按比例分配
+        offsets_nar = [0.0]                       # 每塊旁白在成片的起點
+        if sot and len(nar_parts) == 2:
+            offsets_nar = [0.0, part_secs[0] + sot_dur]
+        elif sot:   # SOT 收尾
+            offsets_nar = [0.0]
+        subtitles = []
+        align_ok = True
+        for pi, text in enumerate(nar_parts):
+            subs_p = _build_subtitles(text)
+            aligned = align_subtitles_to_boundaries(subs_p, part_bounds[pi]) if part_bounds[pi] else []
+            if not aligned:
+                align_ok = False
+                aligned = rescale_subtitles(subs_p, float(MAIN_SEC), part_secs[pi])
+            subtitles += shift_subtitles(aligned, offsets_nar[pi] if pi < len(offsets_nar) else 0.0)
+        if sot:
+            sot_t0 = part_secs[0] if len(nar_parts) >= 1 else 0.0
+            if len(nar_parts) == 1 and sot['after_sentence'] >= len(sentences):
+                sot_t0 = nar_total   # 收尾
+            subtitles += build_sot_subtitles(sot['display'], sot_t0, sot_dur)
+            subtitles.sort(key=lambda s: s['start'])
+        _job['sub_align'] = '逐字對齊' if align_ok else '等比縮放(fallback)'
 
-        # segments（配畫面用）比照字幕做法：優先用 TTS 逐字時間精算，拿不到才退回文字量比例分配
-        segments = align_segments_to_boundaries(script['narration'], script.get('segments', []), boundaries) if boundaries else []
-        _job['seg_align'] = '逐字精算' if segments else '文字比例(fallback)'
-        if not segments:
-            segments = rescale_segments(script['narration'], script.get('segments', []), main_sec)
+        # segments（配畫面用）：按塊精算再平移（只涵蓋旁白時間，SOT 是固定畫面不用配）
+        if sot and k is not None and len(nar_parts) == 2:
+            segsA, segsB = _split_gpt_segments(script.get('segments', []), k)
+            gpt_seg_parts = [segsA, segsB]
+        else:
+            gpt_seg_parts = [script.get('segments', [])]
+        segments = []
+        nar_off = 0.0    # 在「純旁白時間軸」上的偏移（不含 SOT）
+        seg_ok = True
+        for pi, text in enumerate(nar_parts):
+            segs_p = align_segments_to_boundaries(
+                text, gpt_seg_parts[pi] if pi < len(gpt_seg_parts) else [],
+                part_bounds[pi]) if part_bounds[pi] else []
+            if not segs_p:
+                seg_ok = False
+                segs_p = rescale_segments(text, gpt_seg_parts[pi] if pi < len(gpt_seg_parts) else [],
+                                          part_secs[pi])
+            for sgp in segs_p:
+                segments.append({**sgp, 'start': round(sgp['start'] + nar_off, 1),
+                                 'end': round(sgp['end'] + nar_off, 1)})
+            nar_off += part_secs[pi]
+        _job['seg_align'] = '逐字精算' if seg_ok else '文字比例(fallback)'
         write_ass(subtitles, ass_path)
 
-        # ── 步驟5：旁白配畫面（腳本已貼素材寫，配對命中率高很多）──────────────────
+        # ── 步驟5：旁白配畫面（配的是「純旁白時間軸」，配完在 SOT 點切開插入原音段）──
+        # 沒有影片但有照片 → 圖輯式模式：整支用照片輪播（Ken Burns）配旁白
+        photo_items = [
+            {"path": ph, "desc": "新聞報導配圖（事件現場或網傳畫面的截圖）"}
+            for ph in (photos or []) if Path(ph).exists()
+        ]
+        photo_mode = (not catalogs) and bool(photo_items)
         plan = None
-        if catalogs and segments:
+        if (catalogs or photo_items) and segments:
             p(5)
             try:
-                photo_items = [
-                    {"path": ph, "desc": "新聞報導配圖（常是事件現場或網傳畫面的截圖，"
-                                          "適合配「事件主體」相關旁白）"}
-                    for ph in (photos or []) if Path(ph).exists()
-                ]
+                sot_note = None
+                if sot:
+                    sot_note = (f"成片會在旁白中段插入 {sot['label']} 的 "
+                                f"{sot['start']}~{round(sot['start']+sot['dur'],1)} 秒受訪原音段，"
+                                "請不要把該影片的這個區間再拿來當配音底圖")
                 plan, match_tokens = match_narration_to_clips(
-                    segments, catalogs, main_sec, photos=photo_items)
+                    segments, catalogs, round(nar_total, 1),
+                    photos=photo_items, notes=sot_note)
                 _add_tokens(match_tokens)
+
+                # 在 SOT 插入點把配對時間軸切開，插進原音段（畫面=原影片、聲音已在音軌裡）
+                if sot and len(nar_parts) == 2:
+                    planA, planB = _split_plan_at(plan, part_secs[0])
+                    sot_entry = {'path': sot['path'], 'photo': None,
+                                 'start': sot['start'], 'dur': sot_dur,
+                                 'why': f"🎤 SOT 受訪原音：{sot['display'][:40]}"}
+                    plan = _merge_tiny_plan_entries(planA + [sot_entry] + planB)
+                elif sot:   # SOT 收尾
+                    plan = plan + [{'path': sot['path'], 'photo': None,
+                                    'start': sot['start'], 'dur': sot_dur,
+                                    'why': f"🎤 SOT 受訪原音：{sot['display'][:40]}"}]
+
                 _job['plan'] = [
                     {'video': (Path(e['path']).name if e.get('path')
                                else (f"📷 {Path(e['photo']).name}" if e.get('photo') else '（黑幕）')),
@@ -362,9 +662,14 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                      'why': e.get('why', '')}
                     for e in plan
                 ]
-                cover_warn = _coverage_warning(plan, catalogs)
-                if cover_warn:
-                    _job['warning'] = cover_warn
+                # 涵蓋度警告：圖輯式模式（純照片）本來就是照片，不做「照片偏多」提醒；
+                # SOT 段是刻意安排的原音（有聲受訪），不算「閉麥講話臉」問題
+                if not photo_mode:
+                    cover_warn = _coverage_warning(
+                        [e for e in plan if not str(e.get('why', '')).startswith('🎤')], catalogs)
+                    if cover_warn:
+                        _job['warning'] = ((_job.get('warning') + '\n' + cover_warn)
+                                           if _job.get('warning') else cover_warn)
             except Exception:
                 plan = None  # 配對失敗退回依序銜接
 
@@ -372,7 +677,8 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         # 對治「跑完整支才發現畫面對不上／字幕怪／Hook 怪，又得整支重跑」的痛點。
         if checkpoint:
             global _preview
-            _preview = _build_preview(script, subtitles, plan or [])
+            _preview = _build_preview(script, subtitles, plan or [],
+                                      _job.get('factcheck'), _job.get('translit'))
             _confirm_action[0] = 'go'
             _confirm_event.clear()
             _job['awaiting_confirm'] = True
@@ -392,6 +698,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         # 兩處讀不同來源會導致「/logs 顯示有 hook、但實際影片沒燒進去」的落差
         hook = _job.get('hook')
         if plan:
+            _enrich_subject_pos(plan, catalogs)   # 每段查主體位置，供直式裁切偏移
             main_clip, length_info = make_main_plan(tts_path, ass_path, plan, main_sec, hook=hook)
         else:
             main_clip, length_info = make_main(tts_path, ass_path, videos, main_sec, hook=hook)
@@ -412,7 +719,9 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         name = (fname.strip() if fname else safe) or safe
         if not name.endswith('.mp4'):
             name += '.mp4'
-        out_path = OUTPUT / name
+        out_dir = OUTPUT / datetime.datetime.now().strftime('%y%m%d')   # 依產製日期分資料夾
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / name
         concat([intro, main_clip, outro], out_path)
         output_name = name
         step_durations[STEPS[9]] = round(time.time() - _last_step_t[0], 1)
@@ -470,6 +779,9 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             "matched":            bool(_job.get('plan')),
             "sub_align":          _job.get('sub_align', ''),
             "seg_align":          _job.get('seg_align', ''),
+            "sot":                _job.get('sot'),
+            "factcheck":          _job.get('factcheck'),
+            "translit":           _job.get('translit'),
             "main_sec":           _job.get('main_sec', 0),
             "step_durations":     step_durations,
             "cancelled":          bool(_job.get('cancelled')),
@@ -543,6 +855,145 @@ def run_analysis(video_path: str, use_vision: bool):
 
 
 # ── 使用記錄頁面 HTML ────────────────────────────────────────────────────────
+GALLERY_HTML = """<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>成片庫 — VideoAI</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f3f4f6;color:#111;padding:24px}
+.nav{display:flex;gap:6px;align-items:center;margin-bottom:20px}
+.nav h1{font-size:1.2rem;font-weight:700;margin-right:auto}
+.nav a{font-size:.83rem;color:#6b7280;text-decoration:none;padding:7px 14px;border:1px solid #d1d5db;border-radius:7px;background:#fff}
+.nav a.active{background:#2563eb;color:#fff;border-color:#2563eb}
+.nav a:hover:not(.active){background:#f9fafb}
+.bar{display:flex;gap:10px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
+.bar input{padding:8px 12px;border:1px solid #d1d5db;border-radius:7px;font-size:.85rem;width:240px}
+.count{color:#6b7280;font-size:.82rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:18px}
+.card{background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.09);display:flex;flex-direction:column}
+.card video{width:100%;aspect-ratio:9/16;background:#000;object-fit:contain;display:block}
+.card .body{padding:12px 14px;display:flex;flex-direction:column;gap:6px;flex:1}
+.card .t{font-weight:600;font-size:.9rem;line-height:1.4}
+.card .meta{color:#9ca3af;font-size:.74rem}
+.card .tags{color:#2563eb;font-size:.74rem;line-height:1.5}
+.card .fc{color:#b91c1c;font-size:.74rem;font-weight:600}
+.card .acts{display:flex;gap:8px;margin-top:auto;padding-top:8px}
+.card .acts button,.card .acts a{flex:1;text-align:center;padding:6px 0;border-radius:6px;font-size:.78rem;font-weight:600;cursor:pointer;text-decoration:none;border:none}
+.b-dl{background:#16a34a;color:#fff}
+.b-dl:hover{background:#15803d}
+.b-re{background:#374151;color:#fff}
+.b-re:hover{background:#111}
+.b-de{background:#fee2e2;color:#991b1b}
+.b-de:hover{background:#fecaca}
+.b-detail{background:#eff6ff;color:#1d4ed8}
+.empty{padding:60px 20px;text-align:center;color:#9ca3af}
+.detail-wrap{display:none;padding:12px 14px;border-top:1px solid #f0f0f0;font-size:.8rem;line-height:1.7}
+.detail-wrap.show{display:block}
+.detail-wrap b{color:#374151}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#111;color:#fff;padding:10px 20px;border-radius:8px;font-size:.85rem;opacity:0;transition:opacity .3s;pointer-events:none;z-index:100}
+.toast.show{opacity:1}
+</style>
+</head>
+<body>
+<div class="nav">
+  <h1>🎬 成片庫</h1>
+  <a href="/">產製</a>
+  <a href="/gallery" class="active">成片庫</a>
+  <a href="/logs">使用記錄</a>
+</div>
+<div class="bar">
+  <input type="text" id="kw" placeholder="搜尋標題／關鍵字…" oninput="render()">
+  <span class="count" id="count"></span>
+</div>
+<div class="grid" id="grid"></div>
+<div class="toast" id="toast"></div>
+<script>
+let _all = [];
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200);}
+
+async function load(){
+  _all = await (await fetch('/api/gallery')).json();
+  render();
+}
+function render(){
+  const kw = document.getElementById('kw').value.toLowerCase();
+  const rows = _all.filter(r => !kw ||
+    (r.title+' '+(r.hashtags||[]).join(' ')+' '+(r.article||'')).toLowerCase().includes(kw));
+  document.getElementById('count').textContent = `${rows.length} 支成片`;
+  const grid = document.getElementById('grid');
+  if(!rows.length){grid.innerHTML='<div class="empty">目前沒有成片，去「產製」做一支吧</div>';return;}
+  grid.innerHTML = rows.map((r,i) => {
+    const vurl = '/api/video/'+encodeURIComponent(r.filename);
+    const durl = '/api/download/'+encodeURIComponent(r.filename);
+    const ts = (r.timestamp||'').replace('T',' ').slice(0,16);
+    const tags = (r.hashtags||[]).join(' ');
+    const fc = (r.factcheck&&r.factcheck.length)?`<div class="fc">🔍 查核有 ${r.factcheck.length} 處出入（未修）</div>`:'';
+    const sot = r.sot?`<div class="meta">🎤 含受訪原音</div>`:'';
+    return `<div class="card">
+      <video src="${vurl}" data-poster="/api/thumb/${encodeURIComponent(r.filename)}" preload="none" controls playsinline></video>
+      <div class="body">
+        <div class="t">${esc(r.title)}</div>
+        <div class="meta">${ts}・${r.main_sec||0}秒・$${(r.cost||0).toFixed(3)}</div>
+        ${sot}${fc}
+        ${tags?`<div class="tags">${esc(tags)}</div>`:''}
+        <div class="acts">
+          <a class="b-dl" href="${durl}">⬇下載</a>
+          <button class="b-re" onclick="rerun('${esc(r.filename)}')">🔄重跑</button>
+          <button class="b-detail" onclick="toggleDetail(${i})">詳情</button>
+          <button class="b-de" onclick="del('${esc(r.filename)}')">刪</button>
+        </div>
+      </div>
+      <div class="detail-wrap" id="d${i}">
+        <div><b>Hook：</b>${esc(r.hook)}</div>
+        <div style="margin-top:6px"><b>旁白：</b>${esc(r.narration)}</div>
+        ${(r.plan&&r.plan.length)?`<div style="margin-top:6px"><b>配對：</b>${r.plan.map(p=>esc(p.video)+'('+(p.dur||0).toFixed(0)+'s)').join('、')}</div>`:''}
+        ${r.video_path?`<div style="margin-top:6px"><b>素材：</b>${esc(r.video_path.split(';').map(s=>s.split(/[\\\\/]/).pop()).join('、'))}</div>`:''}
+      </div>
+    </div>`;
+  }).join('');
+  lazyPosters();
+}
+// 懶載入封面縮圖：只有捲進視窗的卡片才去抽首幀（避免一次 30 支同時抽幀卡住）
+let _po = null;
+function lazyPosters(){
+  if(_po) _po.disconnect();
+  _po = new IntersectionObserver((ents)=>{
+    ents.forEach(e=>{
+      if(e.isIntersecting){
+        const v=e.target;
+        if(v.dataset.poster){v.poster=v.dataset.poster;delete v.dataset.poster;}
+        _po.unobserve(v);
+      }
+    });
+  },{rootMargin:'200px'});
+  document.querySelectorAll('.card video[data-poster]').forEach(v=>_po.observe(v));
+}
+function toggleDetail(i){document.getElementById('d'+i).classList.toggle('show');}
+async function rerun(fn){
+  if(!confirm('用這支的原始新聞稿＋影片重新產製一支？（分析有快取，會很快）'))return;
+  const d = await (await fetch('/api/rerun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:fn})})).json();
+  if(d.error){toast('重跑失敗：'+d.error);return;}
+  let msg='已開始重跑，到「產製」頁看進度';
+  if(d.videos_found<d.videos_expected)msg+=`（${d.videos_expected}支素材只找到${d.videos_found}支，其餘可能已刪）`;
+  toast(msg);
+  setTimeout(()=>location.href='/',1500);
+}
+async function del(fn){
+  if(!confirm('確定刪除這支成片？此動作無法復原'))return;
+  const d = await (await fetch('/api/gallery/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:fn})})).json();
+  if(d.error){toast('刪除失敗：'+d.error);return;}
+  toast('已刪除');load();
+}
+load();
+</script>
+</body>
+</html>"""
+
+
 LOGS_HTML = """<!doctype html>
 <html lang="zh-TW">
 <head>
@@ -578,12 +1029,21 @@ tr:hover td{background:#fafafa}
 .filter-row select,.filter-row input{padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:.82rem}
 .btn-export{padding:6px 14px;background:#374151;color:#fff;border:none;border-radius:6px;font-size:.82rem;cursor:pointer}
 .btn-export:hover{background:#111}
+.topnav{display:flex;gap:6px;align-items:center;margin-bottom:20px}
+.topnav h1{font-size:1.2rem;font-weight:700;margin:0 auto 0 0}
+.topnav a{font-size:.83rem;color:#6b7280;text-decoration:none;padding:7px 14px;border:1px solid #d1d5db;border-radius:7px;background:#fff}
+.topnav a.active{background:#2563eb;color:#fff;border-color:#2563eb}
+.topnav a:hover:not(.active){background:#f9fafb}
+.btn-rerun{padding:4px 10px;background:#374151;color:#fff;border:none;border-radius:5px;font-size:.76rem;cursor:pointer}
+.btn-rerun:hover{background:#111}
 </style>
 </head>
 <body>
-<div style="display:flex;align-items:center;margin-bottom:18px">
-  <a class="back" href="/">&larr; 返回產製</a>
+<div class="topnav">
   <h1>📋 使用記錄</h1>
+  <a href="/">產製</a>
+  <a href="/gallery">成片庫</a>
+  <a href="/logs" class="active">使用記錄</a>
 </div>
 
 <!-- 統計卡片 -->
@@ -700,9 +1160,13 @@ function render() {
       : '<span class="badge badge-ok">成功</span>';
     const na = '<span class="na">—</span>';
     const hasDetail = r.type === 'produce' && (r.narration || r.output_file);
-    const detailBtn = hasDetail
+    // 失敗的產製給「重跑」按鈕（原始輸入還在，分析有快取，重跑很快）
+    const rerunBtn = (r.type === 'produce' && r.error && r.article)
+      ? `<button class="btn-rerun" onclick="rerunJob('${r.id}')">🔄 重跑</button>`
+      : '';
+    const detailBtn = (hasDetail
       ? `<button class="btn-export" style="padding:3px 10px;font-size:.76rem" onclick="toggleDetail(${i})">🔍 詳情</button>`
-      : na;
+      : (rerunBtn ? '' : na)) + rerunBtn;
     return `<tr>
       <td class="mono">${ts}</td>
       <td>${typeBadge}</td>
@@ -731,6 +1195,16 @@ function escapeHtml(s) {
 function toggleDetail(i) {
   const el = document.getElementById('det-' + i);
   if (el) el.style.display = el.style.display === 'none' ? '' : 'none';
+}
+
+async function rerunJob(id) {
+  if (!confirm('用這筆的原始新聞稿＋影片重新產製？（分析有快取，會很快）')) return;
+  try {
+    const d = await (await fetch('/api/rerun', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id})})).json();
+    if (d.error) { alert('重跑失敗：' + d.error); return; }
+    alert('已開始重跑，前往「產製」頁看進度');
+    location.href = '/';
+  } catch(e) { alert('重跑失敗：' + e.message); }
 }
 
 function detailHtml(r) {
@@ -960,6 +1434,13 @@ textarea{resize:vertical;min-height:210px}
 .bl-status-已完成{background:#d1fae5;color:#065f46}
 .bl-status-不處理不存{background:#fee2e2;color:#991b1b}
 .bl-status-未知{background:#f3f4f6;color:#6b7280}
+/* 素材充足度預判標註 */
+.bl-assess{padding:2px 9px;border-radius:10px;font-size:.72rem;font-weight:700;white-space:nowrap}
+.bl-assess-green{background:#059669;color:#fff;box-shadow:0 0 0 2px #a7f3d0}
+.bl-assess-yellow{background:#fef3c7;color:#92400e}
+.bl-assess-red{background:#f3f4f6;color:#9ca3af}
+.bl-assess-wait{background:#f3f4f6;color:#c4c8cf}
+.backlog-row-ready{background:#ecfdf5}
 .btn-import{
   padding:6px 12px;background:#2563eb;color:#fff;border:none;border-radius:6px;
   font-size:.78rem;font-weight:600;cursor:pointer;white-space:nowrap
@@ -1024,12 +1505,27 @@ textarea{resize:vertical;min-height:210px}
 .cat-車禍{background:#fee2e2;color:#991b1b}
 .cat-警匪槍戰{background:#fce7f3;color:#9d174d}
 .cat-其他{background:#f3f4f6;color:#374151}
+/* 統一頂部導覽 */
+.topnav{display:flex;gap:6px;align-items:center;margin-bottom:22px}
+.topnav h1{font-size:1.25rem;font-weight:700;margin:0 auto 0 0}
+.topnav a{font-size:.83rem;color:#6b7280;text-decoration:none;padding:7px 14px;border:1px solid #d1d5db;border-radius:7px;background:#fff}
+.topnav a.active{background:#2563eb;color:#fff;border-color:#2563eb}
+.topnav a:hover:not(.active){background:#f9fafb}
+/* 圖輯式照片素材區 */
+.photo-strip{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.photo-thumb{position:relative;width:64px;height:64px;border-radius:6px;overflow:hidden;border:1px solid #e5e7eb}
+.photo-thumb img{width:100%;height:100%;object-fit:cover}
+.photo-thumb .rm{position:absolute;top:1px;right:1px;background:rgba(0,0,0,.6);color:#fff;border:none;border-radius:4px;font-size:.7rem;cursor:pointer;width:16px;height:16px;line-height:1;padding:0}
+.btn-addphoto{padding:7px 12px;background:#fff;border:1px dashed #9ca3af;border-radius:6px;font-size:.8rem;cursor:pointer;color:#6b7280}
+.btn-addphoto:hover{border-color:#2563eb;color:#2563eb}
 </style>
 </head>
 <body>
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:22px">
-  <h1 style="margin:0">🎬 短影音產製</h1>
-  <a href="/logs" style="font-size:.82rem;color:#6b7280;text-decoration:none;padding:6px 12px;border:1px solid #d1d5db;border-radius:6px">📋 使用記錄</a>
+<div class="topnav">
+  <h1>🎬 短影音產製</h1>
+  <a href="/" class="active">產製</a>
+  <a href="/gallery">成片庫</a>
+  <a href="/logs">使用記錄</a>
 </div>
 
 <!-- 後臺影音清單（LTN 內部系統匯入） -->
@@ -1077,6 +1573,12 @@ textarea{resize:vertical;min-height:210px}
     <p class="hint">選取後按「加入選取」，每支會自動跑智慧分析，結果顯示在檔名下方（分析過的有快取不重複收費）；產製完成後清單會保留，要換下一則新聞才按「重整」清空</p>
 
     <div id="video-list" class="video-list"></div>
+
+    <label style="margin-top:6px">照片素材（沒有影片時可純用照片做「圖輯式」短影音；有影片時當補畫面備援）</label>
+    <div class="photo-strip" id="photo-strip"></div>
+    <button class="btn-addphoto" onclick="document.getElementById('photo-file').click()">＋ 加照片</button>
+    <input type="file" id="photo-file" accept="image/*" multiple style="display:none" onchange="uploadPhotos(this.files)">
+    <p class="hint" id="photo-mode-hint" style="display:none;color:#2563eb">📸 圖輯式模式：目前沒有影片，會用這些照片輪播（Ken Burns 緩慢推移）配旁白</p>
 
     <label style="display:flex;align-items:center;gap:8px;margin-top:14px;cursor:pointer;font-weight:400">
       <input type="checkbox" id="checkpoint" checked style="width:16px;height:16px">
@@ -1231,6 +1733,39 @@ function renderCheckpoint(pv) {
   const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
   const tags = (pv.hashtags && pv.hashtags.length) ? pv.hashtags.join(' ') : '（無）';
   let html = '';
+  // 事實查核警示：擺最上面最醒目，紅底，逐項列出旁白 vs 原稿的出入
+  if (pv.factcheck && pv.factcheck.length) {
+    const rows = pv.factcheck.map(f => {
+      const sev = f.severity === 'high'
+        ? '<span style="color:#b91c1c;font-weight:700">●高</span>'
+        : '<span style="color:#b45309;font-weight:700">●中</span>';
+      return `<div style="margin:4px 0;padding:6px 8px;background:#fff;border-radius:5px">
+        ${sev} <b>${esc(f.field)}</b>：旁白說「${esc(f.narration_says)}」，
+        但原稿是「${esc(f.article_says)}」</div>`;
+    }).join('');
+    html += `<div style="margin-bottom:12px;padding:10px 12px;background:#fef2f2;border:2px solid #fca5a5;border-radius:8px">
+      <div style="color:#991b1b;font-weight:700;margin-bottom:6px">🔍 事實查核：旁白與原稿有 ${pv.factcheck.length} 處出入，請核對後再決定是否渲染</div>
+      ${rows}</div>`;
+  }
+  // 譯名核實：跟報社音譯總表比對的結果（不符標紅、相符打勾、未收錄給提示）
+  if (pv.translit && pv.translit.length) {
+    const mis = pv.translit.filter(t => t.status === 'mismatch');
+    const std = pv.translit.filter(t => t.status === 'standard');
+    const unk = pv.translit.filter(t => t.status === 'unknown');
+    let trHtml = '';
+    if (mis.length) {
+      trHtml += mis.map(t =>
+        `<div style="margin:3px 0;padding:5px 8px;background:#fff;border-radius:5px">
+          <span style="color:#b91c1c;font-weight:700">✗</span> 旁白用「<b>${esc(t.chinese)}</b>」，
+          報社標準譯名是「<b style="color:#166534">${esc(t.expected)}</b>」（${esc(t.english)}）</div>`).join('');
+    }
+    const okLine = std.length ? `<span style="color:#166534">✓ 符合標準：${std.map(t=>esc(t.chinese)).join('、')}</span>` : '';
+    const unkLine = unk.length ? `<span style="color:#92400e">ℹ 音譯表未收錄：${unk.map(t=>esc(t.chinese)).join('、')}（照原稿用字即可）</span>` : '';
+    const subLines = [okLine, unkLine].filter(Boolean).join('　');
+    html += `<div style="margin-bottom:12px;padding:10px 12px;background:${mis.length?'#fef2f2':'#f0fdf4'};border:2px solid ${mis.length?'#fca5a5':'#bbf7d0'};border-radius:8px">
+      <div style="font-weight:700;margin-bottom:4px;color:${mis.length?'#991b1b':'#166534'}">🈯 譯名核實（報社音譯總表）</div>
+      ${trHtml}${subLines?`<div style="font-size:.78rem;margin-top:4px">${subLines}</div>`:''}</div>`;
+  }
   html += `<div style="margin-bottom:8px"><b>標題：</b>${esc(pv.title)}　<b>Hook：</b>${esc(pv.hook)}</div>`;
   html += `<div style="margin-bottom:8px"><b>Hashtags：</b>${esc(tags)}</div>`;
   html += `<div style="margin-bottom:8px"><b>旁白全文：</b><div style="white-space:pre-wrap;line-height:1.7;margin-top:4px;background:#fff;padding:8px;border-radius:6px">${esc(pv.narration)}</div></div>`;
@@ -1463,11 +1998,45 @@ function removeVideoFromList(index) {
 }
 
 function clearVideoList() {
-  if (videoList.length && !confirm('確定要清空目前的影片清單嗎？')) return;
+  if ((videoList.length || importedPhotos.length) && !confirm('確定要清空目前的影片與照片清單嗎？')) return;
   videoList = [];
   importedPhotos = [];
   document.getElementById('import-keywords').style.display = 'none';
   renderVideoList();
+  renderPhotoStrip();
+  saveLastSettings();
+}
+
+// ─── 照片素材（圖輯式模式）──────────────────────────────────────────────────
+function renderPhotoStrip() {
+  const strip = document.getElementById('photo-strip');
+  strip.innerHTML = importedPhotos.map((p, i) =>
+    `<div class="photo-thumb">
+       <img src="/api/photo?path=${encodeURIComponent(p)}" alt="">
+       <button class="rm" onclick="removePhoto(${i})" title="移除">&times;</button>
+     </div>`).join('');
+  // 沒影片但有照片 → 圖輯式模式提示
+  const hint = document.getElementById('photo-mode-hint');
+  hint.style.display = (!videoList.length && importedPhotos.length) ? 'block' : 'none';
+}
+
+function removePhoto(i) {
+  importedPhotos.splice(i, 1);
+  renderPhotoStrip();
+  saveLastSettings();
+}
+
+async function uploadPhotos(files) {
+  for (const f of files) {
+    const fd = new FormData();
+    fd.append('photo', f);
+    try {
+      const d = await (await fetch('/api/upload_photo', {method:'POST', body:fd})).json();
+      if (d.path && !importedPhotos.includes(d.path)) importedPhotos.push(d.path);
+    } catch(_) {}
+  }
+  document.getElementById('photo-file').value = '';
+  renderPhotoStrip();
   saveLastSettings();
 }
 
@@ -1521,6 +2090,9 @@ function renderVideoList() {
 
     container.appendChild(row);
   });
+  // 影片清單變動可能切換圖輯式模式提示
+  const hint = document.getElementById('photo-mode-hint');
+  if (hint) hint.style.display = (!videoList.length && importedPhotos.length) ? 'block' : 'none';
 }
 
 function escapeHtml(s) {
@@ -1599,6 +2171,7 @@ function restoreLastSettings() {
   const cpPref = localStorage.getItem('videoai_checkpoint');
   if (cpPref !== null) document.getElementById('checkpoint').checked = (cpPref === '1');
   renderVideoList();
+  renderPhotoStrip();
 }
 
 restoreLastSettings();
@@ -1644,7 +2217,7 @@ async function loadBacklog() {
   }
 }
 
-function renderBacklog() {
+function renderBacklog(skipAssess) {
   const filter = document.getElementById('bl-status-filter').value;
   const list = document.getElementById('backlog-list');
   const rows = backlogItems.filter(it => !filter || it.status === filter);
@@ -1656,13 +2229,47 @@ function renderBacklog() {
     const ts = (it.articleCreateTime || '').replace(/^(\\d{4})(\\d{2})(\\d{2})(\\d{2})(\\d{2}).*/, '$2/$3 $4:$5');
     const vc = it.videoCount || (it.videos || []).length;
     const status = it.status || '未知';
-    return `<div class="backlog-row">
+    const a = it._assess;
+    const assessHtml = a
+      ? `<span class="bl-assess bl-assess-${a.level}" title="影片總長 ${a.total_sec}s">${a.label}</span>`
+      : `<span class="bl-assess bl-assess-wait" id="bl-assess-${it.articleNo}">⋯評估中</span>`;
+    return `<div class="backlog-row${a && a.level === 'green' ? ' backlog-row-ready' : ''}">
       <span class="bl-status bl-status-${status}">${status}</span>
+      ${assessHtml}
       <span class="bl-title">${_escBl(it.title)}</span>
-      <span class="bl-meta">${ts}・${vc}支影片</span>
+      <span class="bl-meta">${ts}・${vc}支影片${a && a.total_sec ? '/' + a.total_sec + 's' : ''}</span>
       <button class="btn-import" onclick="importBacklogItem('${it.articleNo}')" id="bl-import-${it.articleNo}">📥 匯入</button>
     </div>`;
   }).join('');
+  if (!skipAssess) assessBacklogItems();
+}
+
+// 逐篇探測影片總長 → 標註「可一鍵生成／素材偏少／素材不足」（一次最多 3 篇並行）
+let _assessRunning = false;
+async function assessBacklogItems() {
+  if (_assessRunning) return;
+  _assessRunning = true;
+  try {
+    const queue = backlogItems.filter(it => !it._assess);
+    const runOne = async () => {
+      while (queue.length) {
+        const it = queue.shift();
+        try {
+          const r = await fetch('/api/backlog/assess', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({videoUrls: (it.videos || []).map(v => v.url)}),
+          });
+          const d = await r.json();
+          if (!d.error) it._assess = d;
+        } catch (_) {}
+      }
+    };
+    await Promise.all([runOne(), runOne(), runOne()]);
+  } finally {
+    _assessRunning = false;
+  }
+  // 全部評估完重繪一次（含綠標醒目列）；skipAssess=true 避免遞迴
+  if (backlogItems.some(it => it._assess)) renderBacklog(true);
 }
 
 function _escBl(s) {
@@ -1685,11 +2292,11 @@ async function importBacklogItem(articleNo) {
     if (d.error) { alert('匯入失敗：' + d.error); btn.disabled = false; btn.textContent = '📥 匯入'; return; }
 
     document.getElementById('article').value = d.content || '';
-    importedPhotos = d.photo ? [d.photo] : [];   // 換新聞就換配圖，不累積上一篇的
+    importedPhotos = d.photos || [];   // 換新聞就換配圖，不累積上一篇的
     const kwBox = document.getElementById('import-keywords');
     const kwParts = [];
     if (d.keywords && d.keywords.length) kwParts.push('關鍵字：' + d.keywords.join('、'));
-    if (d.photo) kwParts.push('📷 已附新聞配圖（配不到畫面的旁白段會自動用它補）');
+    if (importedPhotos.length) kwParts.push(`📷 已附 ${importedPhotos.length} 張配圖（配不到畫面的旁白段會自動用它補）`);
     if (kwParts.length) {
       kwBox.textContent = kwParts.join('　');
       kwBox.style.display = 'block';
@@ -1710,6 +2317,7 @@ async function importBacklogItem(articleNo) {
       }
     });
     renderVideoList();
+    renderPhotoStrip();
     saveLastSettings();
     if (newItems.length) analyzeQueued(newItems);
   } catch (e) {
@@ -1873,6 +2481,22 @@ def index():
     return render_template_string(HTML)
 
 
+@app.route('/api/upload_photo', methods=['POST'])
+def api_upload_photo():
+    """上傳照片素材（圖輯式模式用），存 input/photos/，回傳本機路徑"""
+    f = request.files.get('photo')
+    if not f or not f.filename:
+        return jsonify({'error': '沒有檔案'}), 400
+    ext = Path(f.filename).suffix.lower()
+    if ext not in {'.jpg', '.jpeg', '.png', '.webp'}:
+        return jsonify({'error': '只接受 jpg / png / webp'}), 400
+    photo_dir = BASE / 'input' / 'photos'
+    photo_dir.mkdir(parents=True, exist_ok=True)
+    dest = photo_dir / f"upload-{uuid.uuid4().hex[:8]}{ext}"
+    f.save(str(dest))
+    return jsonify({'ok': True, 'path': str(dest), 'name': f.filename})
+
+
 @app.route('/api/generate', methods=['POST'])
 def api_generate():
     global _busy, _job
@@ -2011,6 +2635,19 @@ def api_browse():
 
 
 # ── 後臺影音清單（LTN 內部 API 匯入，供自動化測試用）──────────────────────────
+@app.route('/api/backlog/assess', methods=['POST'])
+def api_backlog_assess():
+    """探測一篇文章的影片總長，回傳「素材夠不夠做 60 秒」預判（清單標註用）"""
+    data = request.json or {}
+    urls = [u for u in (data.get('videoUrls') or []) if u]
+    if not urls:
+        return jsonify({'total_sec': 0, 'n_videos': 0, 'level': 'red', 'label': '✕ 素材不足'})
+    try:
+        return jsonify(ltn_api.assess_materials(urls))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/backlog')
 def api_backlog():
     year  = (request.args.get('year') or '').strip()
@@ -2048,10 +2685,11 @@ def api_backlog_import():
             errors.append(f'{url}：{e}')
 
     # 文章主圖一併下載：配不到動態畫面的旁白段，可用照片+Ken Burns 取代黑幕
-    photo_path = None
+    # （只用記者放的新聞主圖，不碰文章內嵌的網傳影片——那走 LiTV，刻意不處理）
+    photo_paths = []
     if article.get('photo_url'):
         try:
-            photo_path = ltn_api.download_photo(article['photo_url'], article_no)
+            photo_paths.append(ltn_api.download_photo(article['photo_url'], article_no))
         except Exception as e:
             errors.append(f"配圖下載失敗：{e}")
 
@@ -2061,7 +2699,7 @@ def api_backlog_import():
         'keywords': article['keywords'],
         'source_url': article['source_url'],
         'downloaded': downloaded,
-        'photo': photo_path,
+        'photos': photo_paths,
         'errors': errors,
     })
 
@@ -2077,12 +2715,158 @@ def page_logs():
     return render_template_string(LOGS_HTML)
 
 
+def _find_output(filename: str):
+    """依檔名在 output/（含日期子資料夾）遞迴找成片，回傳 Path 或 None"""
+    if '/' in filename or '\\' in filename or '..' in filename:
+        return None
+    p = OUTPUT / filename
+    if p.exists():
+        return p
+    return next((q for q in OUTPUT.rglob(filename) if q.is_file()), None)
+
+
 @app.route('/api/download/<filename>')
 def api_download(filename):
-    path = OUTPUT / filename
-    if not path.exists():
+    path = _find_output(filename)
+    if not path:
         return 'File not found', 404
     return send_file(str(path), as_attachment=True, download_name=filename)
+
+
+@app.route('/api/video/<filename>')
+def api_video(filename):
+    """inline 串流成片（給成片庫播放器用，不是下載）"""
+    path = _find_output(filename)
+    if not path:
+        return 'File not found', 404
+    return send_file(str(path), mimetype='video/mp4', conditional=True)
+
+
+@app.route('/api/thumb/<filename>')
+def api_thumb(filename):
+    """成片首幀縮圖（成片庫封面用），抽一次存快取，之後直接回快取檔"""
+    path = _find_output(filename)
+    if not path:
+        return 'not found', 404
+    thumb_dir = TMP / "gallery_thumbs"
+    thumb_dir.mkdir(parents=True, exist_ok=True)
+    thumb = thumb_dir / (filename.rsplit('.', 1)[0] + '.jpg')
+    if not thumb.exists():
+        from produce import ff
+        try:
+            ff("-ss", "3.5", "-i", str(path), "-vframes", "1",
+               "-vf", "scale=270:-1", "-q:v", "5", thumb)
+        except Exception:
+            return 'thumb failed', 500
+    if not thumb.exists():
+        return 'thumb failed', 500
+    return send_file(str(thumb), mimetype='image/jpeg')
+
+
+@app.route('/api/photo')
+def api_photo():
+    """顯示 input/photos/ 底下的照片縮圖（限定該目錄，防目錄穿越）"""
+    raw = request.args.get('path', '')
+    photos_dir = (BASE / 'input' / 'photos').resolve()
+    try:
+        rp = Path(raw).resolve()
+        if photos_dir not in rp.parents or not rp.is_file():
+            return 'not found', 404
+    except Exception:
+        return 'not found', 404
+    return send_file(str(rp))
+
+
+@app.route('/api/gallery')
+def api_gallery():
+    """成片庫：jobs.jsonl 裡成功產出、且檔案還在的成片，附完整 metadata，新到舊"""
+    seen = set()
+    items = []
+    for r in _read_logs(1000):
+        if r.get('type') != 'produce' or r.get('error') or r.get('cancelled'):
+            continue
+        fn = r.get('output_file') or ''
+        if not fn or fn in seen:
+            continue
+        path = _find_output(fn)
+        if not path:
+            continue
+        seen.add(fn)
+        pp = float(r.get('prompt_tokens', 0)) / 1e6 * 5 + float(r.get('completion_tokens', 0)) / 1e6 * 15
+        items.append({
+            'filename': fn,
+            'title': r.get('title') or fn.rsplit('.', 1)[0],
+            'timestamp': r.get('timestamp', ''),
+            'main_sec': r.get('main_sec', 0),
+            'hook': r.get('hook', ''),
+            'hashtags': r.get('hashtags', []),
+            'narration': r.get('narration', ''),
+            'article': r.get('article', ''),
+            'plan': r.get('plan', []),
+            'video_path': r.get('video_path', ''),
+            'sot': r.get('sot'),
+            'factcheck': r.get('factcheck') or [],
+            'cost': round(pp, 4),
+            'day': path.parent.name if path.parent != OUTPUT else '',
+        })
+    return jsonify(items)
+
+
+@app.route('/api/gallery/delete', methods=['POST'])
+def api_gallery_delete():
+    fn = (request.json or {}).get('filename', '')
+    path = _find_output(fn)
+    if not path:
+        return jsonify({'error': '找不到檔案'}), 404
+    try:
+        path.unlink()
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/rerun', methods=['POST'])
+def api_rerun():
+    """用某支成片/失敗 job 的原始輸入重跑（分析有快取，等於只重做後面的步驟）"""
+    global _busy, _job
+    data = request.json or {}
+    fn = data.get('filename', '')
+    jid = data.get('id', '')
+    src = None
+    for r in _read_logs(1000):
+        if r.get('type') != 'produce':
+            continue
+        if (jid and r.get('id') == jid) or (fn and r.get('output_file') == fn):
+            src = r
+            break
+    if not src:
+        return jsonify({'error': '找不到對應的產製記錄'}), 404
+
+    article = src.get('article', '')
+    vpaths = [p.strip() for p in (src.get('video_path') or '').split(';') if p.strip()]
+    videos = [{'path': p, 'start': 0} for p in vpaths if Path(p).exists()]
+    if not article:
+        return jsonify({'error': '原始記錄沒有新聞稿內容，無法重跑'}), 400
+
+    with _lock:
+        if _busy:
+            return jsonify({'error': '目前有工作進行中，請稍後再試'}), 429
+        _busy = True
+        _job = {'step': 0, 'msg': '準備中（重跑）', 'done': False,
+                'error': None, 'filename': None, 'title': None, 'warning': None,
+                'plan': None, 'started_at': time.time(), 'step_started_at': time.time(),
+                'elapsed_sec': 0, 'step_elapsed_sec': 0}
+    t = threading.Thread(target=run_job,
+                         args=(article, videos, src.get('output_file', '').rsplit('.', 1)[0],
+                               'hsiaochen', True, []),
+                         daemon=True)
+    t.start()
+    return jsonify({'ok': True, 'videos_found': len(videos), 'videos_expected': len(vpaths)})
+
+
+@app.route('/gallery')
+def page_gallery():
+    return render_template_string(GALLERY_HTML)
 
 
 if __name__ == '__main__':

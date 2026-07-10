@@ -437,6 +437,85 @@ def _cache_put(namespace: str, video: Path, value: dict):
         pass  # 快取失敗不影響主流程
 
 
+# ── 近重複素材偵測（記者常同場景連拍多支，只精析一支省錢也防重複選用）────────
+
+def _dhash_frame(video: Path, t: float) -> int | None:
+    """抽 9x8 灰階影格算 dHash（64-bit 感知雜湊）——純 ffmpeg + Python，零依賴"""
+    try:
+        r = subprocess.run(
+            [_ffmpeg_exe(), "-ss", str(t), "-i", str(video),
+             "-vframes", "1", "-vf", "scale=9:8", "-pix_fmt", "gray",
+             "-f", "rawvideo", "-"],
+            capture_output=True, timeout=30)
+        buf = r.stdout
+        if len(buf) < 72:
+            return None
+        h = 0
+        for row in range(8):
+            for col in range(8):
+                h = (h << 1) | (1 if buf[row * 9 + col] > buf[row * 9 + col + 1] else 0)
+        return h
+    except Exception:
+        return None
+
+
+def video_fingerprint(video: Path, duration: float) -> list[int | None]:
+    """三個取樣點（25%/50%/75%）的 dHash 指紋"""
+    return [_dhash_frame(video, duration * r) for r in (0.25, 0.5, 0.75)]
+
+
+def near_duplicate(fp_a: list, fp_b: list, dur_a: float, dur_b: float) -> bool:
+    """
+    近重複判定：三個取樣點的 dHash 漢明距離都 ≤8，且長度差 <20%。
+    長度條件是刻意保守——受訪 take1/take2 畫面幾乎一樣但長度常不同，
+    不能因為畫面像就丟掉（音訊內容不同）。
+    """
+    if dur_a <= 0 or dur_b <= 0:
+        return False
+    if abs(dur_a - dur_b) / max(dur_a, dur_b) > 0.2:
+        return False
+    for a, b in zip(fp_a, fp_b):
+        if a is None or b is None:
+            return False
+        if bin(a ^ b).count("1") > 8:
+            return False
+    return True
+
+
+# ── 向量相似度輔助（旁白段 ↔ 畫面描述，給配對當客觀參考）────────────────────
+# 用 Azure text-embedding（文字對文字）——真正的影像向量（CLIP）留給線3
+# 語意搜片一起建，屆時此處無縫換成影像向量分數。
+
+def _embed_texts(texts: list[str]) -> list[list[float]]:
+    dep = os.environ.get("AZURE_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
+    resp = _azure_client().embeddings.create(model=dep, input=texts)
+    return [d.embedding for d in resp.data]
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1e-9
+    nb = math.sqrt(sum(x * x for x in b)) or 1e-9
+    return dot / (na * nb)
+
+
+def seg_line(seg: dict) -> str:
+    """把結構化欄位組成一行素材描述（配對 prompt 與腳本 footage_notes 共用格式）"""
+    marks = []
+    if seg.get("subject"):
+        marks.append(f"主體:{seg['subject']}")
+    if seg.get("shot"):
+        marks.append(seg["shot"])
+    if seg.get("quality") and seg["quality"] != "正常":
+        marks.append(seg["quality"])
+    if seg.get("screen_text"):
+        marks.append(f"畫面字:{seg['screen_text'][:12]}")
+    if seg.get("has_speech"):
+        marks.append("有原音人聲")
+    tag = f"【{'|'.join(marks)}】" if marks else ""
+    return f"{seg['start']}s~{seg['end']}s：{seg.get('description', '')}{tag}"
+
+
 # ── 影片內容目錄（給旁白配對用）──────────────────────────────────────────────
 
 def _extract_frame_at(video: Path, t: float, tag: str) -> Path | None:
@@ -451,20 +530,22 @@ def _extract_frame_at(video: Path, t: float, tag: str) -> Path | None:
     return out if out.exists() else None
 
 
-def catalog_video(video: Path, max_segments: int = 10) -> dict:
+def catalog_video(video: Path, max_segments: int = 16) -> dict:
     """
     幫一支影片建「內容目錄」：動態偵測切段，每段抽 2 張影格，
-    一次 GPT 呼叫描述所有段落的畫面內容。
+    一次 GPT 呼叫做結構化描述（描述/主體/鏡位/畫質/畫面文字），
+    空泛段落再用高解析影格重描述一次（小主體遠景常在 low detail 下看不清）。
 
     回傳:
       {"path": str, "duration": float,
-       "segments": [{"start": float, "end": float, "description": str}, ...],
+       "segments": [{"start", "end", "description", "subject", "shot",
+                     "quality", "screen_text"}, ...],
        "tokens": {...}}
     """
     video = Path(video)
 
-    # namespace 帶版本：切段粒度改過（catalog→catalog2），舊粗粒度快取自動失效
-    cached = _cache_get("catalog2", video)
+    # namespace 帶版本：結構改過（catalog2→catalog3 加結構化欄位），舊快取自動失效
+    cached = _cache_get("catalog3", video)
     if cached:
         return {**cached, "tokens": {}}   # 快取命中 → 零 API 花費
 
@@ -523,9 +604,17 @@ def catalog_video(video: Path, max_segments: int = 10) -> dict:
     content.append({"type": "text", "text": (
         "以下是一支新聞素材影片各段落的影格（每段 2 張，依段落順序排列）。\n"
         f"段落清單：\n{seg_lines}\n\n"
-        "請描述每一段畫面拍到什麼（人事物與動作，具體、15 字內），"
-        "只回傳 JSON（不含說明）：\n"
-        '{"segments": [{"index": 1, "description": "..."}, ...]}'
+        "請對每一段做結構化描述，只回傳 JSON（不含說明）：\n"
+        '{"segments": [{"index": 1,\n'
+        '  "description": "畫面拍到什麼（人事物與動作，具體、15 字內）",\n'
+        '  "subject": "主要人事物（6 字內，例：機車拖車/警員/傷者；沒有明確主體填空字串）",\n'
+        '  "subject_pos": "主體在畫面水平位置：左|中|右|滿版 擇一（滿版=主體佔滿畫面或無單一主體）",\n'
+        '  "shot": "特寫|中景|遠景|空景 擇一",\n'
+        '  "quality": "正常|晃動|模糊|逆光|過暗 擇一",\n'
+        '  "screen_text": "畫面上可辨識的文字（招牌/字卡/車牌等，無則空字串）"\n'
+        "}, ...]}\n"
+        "注意：遠景裡的小主體（畫面角落的車輛/人物）也要指出來，那常是新聞事件的主角；"
+        "subject_pos 要準——這決定直式裁切時要保留畫面的哪一側，抓錯主體會被裁掉。"
     )})
     for i, f in frames:
         content.append({"type": "text", "text": f"（段{i+1} 的影格）"})
@@ -537,7 +626,7 @@ def catalog_video(video: Path, max_segments: int = 10) -> dict:
         model=deployment,
         messages=[{"role": "user", "content": content}],
         response_format={"type": "json_object"},
-        max_completion_tokens=512,
+        max_completion_tokens=2000,
     )
     result = json.loads(resp.choices[0].message.content)
 
@@ -550,9 +639,15 @@ def catalog_video(video: Path, max_segments: int = 10) -> dict:
             "frames_sent":       len(frames),
         }
 
-    desc_map = {d.get("index"): d.get("description", "") for d in result.get("segments", [])}
+    info_map = {d.get("index"): d for d in result.get("segments", [])}
     for i, seg in enumerate(segments):
-        seg["description"] = desc_map.get(i + 1, "（未取得描述）")
+        d = info_map.get(i + 1, {})
+        seg["description"] = d.get("description", "（未取得描述）")
+        seg["subject"]     = (d.get("subject") or "").strip()
+        seg["subject_pos"] = (d.get("subject_pos") or "滿版").strip()
+        seg["shot"]        = (d.get("shot") or "").strip()
+        seg["quality"]     = (d.get("quality") or "正常").strip()
+        seg["screen_text"] = (d.get("screen_text") or "").strip()
 
     for _, f in frames:
         try:
@@ -560,9 +655,62 @@ def catalog_video(video: Path, max_segments: int = 10) -> dict:
         except Exception:
             pass
 
+    # 空泛段補拍：描述含糊（空景/不明/沒有主體）的段落，改用 high detail 影格
+    # 重描述一次——遠景小主體（角落的機車/人物）在 low detail 下常被看漏
+    vague_idx = [i for i, s in enumerate(segments)
+                 if (not s["subject"]) or
+                    any(k in s["description"] for k in ("空曠", "不明", "無法辨識", "空景"))][:4]
+    if vague_idx:
+        content2: list = [{"type": "text", "text": (
+            "以下段落先前用低解析影格描述得太空泛，請用這批高解析影格重新仔細看：\n"
+            "特別注意畫面角落/遠處的小主體（車輛、人物、動作），那常是新聞主角。\n"
+            "只回傳 JSON：{\"segments\": [{\"index\": 段號, \"description\": \"...\", "
+            "\"subject\": \"...\", \"subject_pos\": \"左|中|右|滿版\", \"shot\": \"...\", "
+            "\"quality\": \"...\", \"screen_text\": \"...\"}]}"
+        )}]
+        refits = []
+        for i in vague_idx:
+            mid = (segments[i]["start"] + segments[i]["end"]) / 2
+            f = _extract_frame_at(video, mid, f"hi_{i}")
+            if f:
+                refits.append((i, f))
+                content2.append({"type": "text", "text": f"（段{i+1} 的高解析影格）"})
+                content2.append({"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{_b64(f)}", "detail": "high"}})
+        if refits:
+            try:
+                resp2 = _azure_client().chat.completions.create(
+                    model=deployment,
+                    messages=[{"role": "user", "content": content2}],
+                    response_format={"type": "json_object"},
+                    max_completion_tokens=800,
+                )
+                r2 = json.loads(resp2.choices[0].message.content)
+                if resp2.usage:
+                    tokens["prompt_tokens"] = tokens.get("prompt_tokens", 0) + resp2.usage.prompt_tokens
+                    tokens["completion_tokens"] = tokens.get("completion_tokens", 0) + resp2.usage.completion_tokens
+                    tokens["total_tokens"] = tokens.get("total_tokens", 0) + resp2.usage.total_tokens
+                    tokens["frames_sent"] = tokens.get("frames_sent", 0) + len(refits)
+                for d in r2.get("segments", []):
+                    i = int(d.get("index", 0)) - 1
+                    if 0 <= i < len(segments) and d.get("description"):
+                        segments[i]["description"] = d["description"]
+                        segments[i]["subject"] = (d.get("subject") or segments[i]["subject"]).strip()
+                        segments[i]["subject_pos"] = (d.get("subject_pos") or segments[i].get("subject_pos", "滿版")).strip()
+                        segments[i]["shot"] = (d.get("shot") or segments[i]["shot"]).strip()
+                        segments[i]["quality"] = (d.get("quality") or segments[i]["quality"]).strip()
+                        segments[i]["screen_text"] = (d.get("screen_text") or "").strip()
+            except Exception:
+                pass   # 補拍失敗就用第一輪結果
+            for _, f in refits:
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
     result = {"path": str(video), "duration": round(duration, 1),
               "segments": segments}
-    _cache_put("catalog2", video, result)
+    _cache_put("catalog3", video, result)
     return {**result, "tokens": tokens}
 
 
@@ -573,6 +721,7 @@ def match_narration_to_clips(
     catalogs: list[dict],
     total_sec: float,
     photos: list[dict] | None = None,
+    notes: str | None = None,
 ) -> tuple[list[dict], dict]:
     """
     narration_segments: [{"start": 0, "end": 18, "desc": "..."}] 來自 generate_script
@@ -580,6 +729,7 @@ def match_narration_to_clips(
     total_sec:          主畫面總秒數
     photos:             [{"path": str, "desc": str}, ...] 新聞配圖（靜態照片，
                         會以 Ken Burns 緩慢推移呈現），沒有就不給
+    notes:              額外備註（例如 SOT 原音段佔用了哪支影片的哪個區間，配對要避開）
 
     回傳 (plan, tokens)：
       plan = [{"path": str|None, "start": float, "dur": float, "why": str,
@@ -591,9 +741,7 @@ def match_narration_to_clips(
     for vi, cat in enumerate(catalogs):
         vid_lines.append(f"影片V{vi+1}（總長 {cat['duration']}s）：")
         for seg in cat["segments"]:
-            vid_lines.append(
-                f"  {seg['start']}s~{seg['end']}s：{seg.get('description', '')}"
-            )
+            vid_lines.append(f"  {seg_line(seg)}")
     for pi, p in enumerate(photos):
         vid_lines.append(f"照片P{pi+1}（靜態新聞配圖，可指定任意秒數）：{p.get('desc', '')}")
     nar_lines = [
@@ -601,12 +749,38 @@ def match_narration_to_clips(
         for ni, n in enumerate(narration_segments)
     ]
 
+    # 向量相似度提示（文字向量，客觀參考值）：每段旁白最相近的素材段落 top-2
+    sim_block = ""
+    try:
+        foot_entries = []   # (label, text)
+        for vi, cat in enumerate(catalogs):
+            for seg in cat["segments"]:
+                foot_entries.append((f"V{vi+1}的{seg['start']}~{seg['end']}秒",
+                                     f"{seg.get('description','')} {seg.get('subject','')}"))
+        nar_texts = [n["desc"] for n in narration_segments]
+        if foot_entries and nar_texts:
+            embs = _embed_texts(nar_texts + [t for _, t in foot_entries])
+            nar_embs, foot_embs = embs[:len(nar_texts)], embs[len(nar_texts):]
+            sim_lines = []
+            for ni, ne in enumerate(nar_embs):
+                scored = sorted(
+                    ((_cosine(ne, fe), foot_entries[fi][0]) for fi, fe in enumerate(foot_embs)),
+                    reverse=True)[:2]
+                sim_lines.append(f"旁白{ni+1} ↔ " + "、".join(
+                    f"{lbl}({s:.2f})" for s, lbl in scored))
+            sim_block = ("\n語意相似度參考（自動計算，數值越高畫面描述與旁白越相關，"
+                         "僅供參考、仍以你的判斷為準）：\n" + "\n".join(sim_lines) + "\n")
+    except Exception:
+        sim_block = ""   # 向量服務不可用就略過，不擋配對
+
     prompt = (
         "你是新聞影音剪輯師。請把旁白各段配上最合適的畫面（影片片段或新聞照片），輸出一條完整時間軸。\n"
         "旁白是照著這批素材寫的（write to picture），若旁白段落的描述有註明建議影片段落"
         "（如「配V1的0~5秒」），優先照建議採用。\n\n"
         f"旁白分段（成片主畫面共 {total_sec} 秒）：\n" + "\n".join(nar_lines) + "\n\n"
-        "可用素材：\n" + "\n".join(vid_lines) + "\n\n"
+        "可用素材（【】內是結構化標記：主體/鏡位/畫質/畫面文字/是否有原音人聲）：\n"
+        + "\n".join(vid_lines) + "\n"
+        + sim_block + "\n"
         "規則：\n"
         f"1. 時間軸總長必須正好 {total_sec} 秒，依序排列\n"
         "2. 影片片段標明用哪支影片、從第幾秒取、取多長；照片只標 P 編號跟秒數\n"
@@ -615,15 +789,18 @@ def match_narration_to_clips(
         "優先配「拍到事件主體」的片段——就算那段很短、需要重複使用也可以，"
         "重複主體畫面遠勝過空景或不相關畫面；若有照片拍到主體（新聞配圖常是事件現場截圖），"
         "主體動態片段不夠長時就接照片，不要拿空景硬撐\n"
-        "5. ⚠️ 受訪/講話特寫（描述含「受訪」「對鏡頭說話」「發言」這類）當配音底圖有嚴格限制："
+        "5. ⚠️ 受訪/講話特寫（標記「有原音人聲」或描述含「受訪」「對鏡頭說話」）當配音底圖有嚴格限制："
         "只能配「警方表示/說明/提醒/呼籲」這種引述性旁白，且連續使用不要超過 12 秒；"
         "敘事性旁白（講案發經過）配受訪特寫會顯得畫面空洞，寧可用主體畫面重複或照片\n"
+        "5-1. 善用鏡位與畫質標記：開場/交代環境用遠景，講主體細節用中景/特寫；"
+        "標記「晃動」「模糊」「過暗」的段落畫質差，有其他選擇時盡量避開\n"
         "6. ⚠️ 相鄰兩個片段不可取用同一支影片的重疊區間（例如上一段用了 V1 的 1~11 秒，"
         "下一段就不要再用 V1 的 8~15 秒——觀眾會看到同樣畫面連播兩次）\n"
         "7. 完全找不到相關畫面的旁白段落：有照片先用照片，真的都沒有才用 \"black\" 補黑幕\n"
         "8. 單一片段 5~15 秒為佳（少於 4 秒太碎、超過 20 秒太拖）；照片單段 4~8 秒為佳\n"
-        "9. 盡量避免從影片最開頭 0 秒取（常有黑幀/晃動），可從段落起點往後 1~2 秒取\n\n"
-        "只回傳 JSON（不含說明）：\n"
+        "9. 盡量避免從影片最開頭 0 秒取（常有黑幀/晃動），可從段落起點往後 1~2 秒取\n"
+        + (f"\n額外備註：{notes}\n\n" if notes else "\n")
+        + "只回傳 JSON（不含說明）：\n"
         '{"timeline": [\n'
         '  {"video": "V1", "from": 12.0, "dur": 8.0, "why": "嫌犯亮刀對應旁白案發"},\n'
         '  {"video": "P1", "dur": 6.0, "why": "網傳畫面截圖對應旁白描述"},\n'
@@ -700,11 +877,40 @@ def match_narration_to_clips(
         acc += dur
 
     if acc < total_sec - 0.05:
-        # 時間軸不足：有照片先拿第一張照片墊，沒有才黑幕
-        filler_photo = photos[0]["path"] if photos else None
-        plan.append({"path": None, "photo": filler_photo, "start": 0.0,
-                     "dur": round(total_sec - acc, 2),
-                     "why": "時間軸不足，" + ("以新聞配圖補足" if filler_photo else "補黑幕")})
+        # 時間軸不足：先試著延長最後一個影片片段（來源還有畫面就用），
+        # 再用照片墊，最後才黑幕
+        gap = total_sec - acc
+        if plan and plan[-1].get("path"):
+            last = plan[-1]
+            cat = next((c for c in catalogs if str(c["path"]) == str(last["path"])), None)
+            if cat:
+                avail = cat["duration"] - (last["start"] + last["dur"])
+                take = round(min(max(avail, 0.0), gap), 2)
+                if take > 0.05:
+                    last["dur"] = round(last["dur"] + take, 2)
+                    acc += take
+                    gap = total_sec - acc
+        if gap > 0.05:
+            filler_photo = photos[0]["path"] if photos else None
+            plan.append({"path": None, "photo": filler_photo, "start": 0.0,
+                         "dur": round(gap, 2),
+                         "why": "時間軸不足，" + ("以新聞配圖補足" if filler_photo else "補黑幕")})
+
+    # 碎片段合併：<2 秒的片段觀眾根本來不及看，直接併給前一段（延長前段時長）
+    merged: list[dict] = []
+    for e in plan:
+        if merged and e["dur"] < 2.0:
+            merged[-1]["dur"] = round(merged[-1]["dur"] + e["dur"], 2)
+        elif not merged and e["dur"] < 2.0 and len(plan) > 1:
+            e["_absorb_next"] = True   # 第一段太碎 → 標記讓下一段吸收
+            merged.append(e)
+        else:
+            if merged and merged[-1].pop("_absorb_next", False):
+                e = {**e, "dur": round(e["dur"] + merged[-1]["dur"], 2)}
+                merged[-1] = e
+                continue
+            merged.append(e)
+    plan = merged
 
     return plan, tokens
 

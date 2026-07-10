@@ -153,13 +153,17 @@ def _build_subtitles(narration: str) -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 1：生成腳本
 # ─────────────────────────────────────────────────────────────────────────────
-def generate_script(article: str, footage_notes: str | None = None) -> dict:
+def generate_script(article: str, footage_notes: str | None = None,
+                    interview_notes: str | None = None) -> dict:
     """
-    新聞稿 → JSON 腳本（標題、地點、旁白、字幕、語意分段）。
+    新聞稿 → JSON 腳本（標題、地點、旁白、字幕、語意分段、SOT 原音安排）。
     footage_notes: 素材畫面清單（catalog_video 的結果彙整）。有給的話，
     旁白會在「新聞稿內容為主」的前提下貼著畫面寫（write to picture）——
     新聞稿寫了什麼、篇幅怎麼分配就照樣寫，畫面只用來決定「怎麼描述細節」，
     不能反過來讓畫面有無去裁剪或打亂新聞稿本身的內容。
+    interview_notes: 素材裡的受訪原音逐字稿（Whisper 轉譯，可能有同音錯字）。
+    有給的話，GPT 可以安排一段 SOT（受訪原音）插進成片——這是電視新聞的
+    標準做法（旁白＋原音交替），比整支都是旁白蓋過閉麥講話臉專業得多。
     """
     footage_block = ""
     if footage_notes:
@@ -181,8 +185,28 @@ def generate_script(article: str, footage_notes: str | None = None) -> dict:
   事件本身，不是在講解你看到的素材
 """
 
+    interview_block = ""
+    if interview_notes:
+        interview_block = f"""
+素材裡的受訪原音逐字稿（本機語音辨識，可能有同音錯字，請對照新聞稿判讀真意）：
+{interview_notes}
+
+⚠️ SOT（受訪原音）安排規則——電視新聞的標準做法是「旁白與受訪原音交替」：
+- 若逐字稿裡有一段適合直接讓當事人/警方「自己講」的話（完整、切題、5~15 秒），
+  安排一段 SOT：在輸出 JSON 加 "sots" 欄位（見格式）。最多安排 1 段，寧缺勿濫；
+  逐字稿內容破碎、離題或品質差就不要安排（"sots" 給空陣列）
+- "quote" 必須從上面逐字稿**一字不差**複製（含錯字也照抄，程式要靠它對回時間軸）；
+  "display" 是給觀眾看的字幕版本：把 quote 的同音錯字對照新聞稿改正、轉繁體、
+  但不增刪語句結構
+- "after_sentence"：原音要插在旁白第幾句之後（句子以句號／驚嘆號／問號計算，1-based）。
+  插入點要順：通常放在旁白講完「誰說了什麼」的引導句之後（例：旁白「警方表示」→ SOT 原音）
+- ⚠️ 旁白不要複述 SOT 裡講的內容（會重複）；旁白負責敘事，細節讓原音自己講
+- ⚠️ 安排 SOT 時，旁白字數上限要扣掉原音時間：SOT 每秒約佔 4.3 字的額度
+  （例：安排 10 秒 SOT，旁白就寫 {int(MAIN_SEC * 4.2)} 減 43 字左右）
+"""
+
     prompt = f"""你是台灣電視新聞影音編輯。根據以下新聞稿，產出一支 {MAIN_SEC} 秒短影音的播報腳本。
-{footage_block}
+{footage_block}{interview_block}
 
 輸出 JSON（嚴格依此格式，不要加任何說明）：
 {{
@@ -195,8 +219,12 @@ def generate_script(article: str, footage_notes: str | None = None) -> dict:
     {{"sentences": 2, "desc": "這段涵蓋的頭 2 句在講什麼（例：案發經過，嫌犯持刀進入超商）"}},
     {{"sentences": 1, "desc": "嫌犯特徵與逃逸方向"}},
     {{"sentences": 2, "desc": "警方調閱監視器追查"}}
+  ],
+  "sots": [
+    {{"video": "V2", "quote": "從逐字稿一字不差複製的原句", "display": "校正後的繁體字幕版", "after_sentence": 3}}
   ]
 }}
+（沒有受訪逐字稿、或沒有適合的原音時，"sots" 給空陣列 []）
 
 hook／hashtag 規則：
 - hook 是給演算法用的「前 2 秒留人」鉤子，跟 title（片頭卡的正式標題）分開寫、語氣可以比 title 更直白聳動，
@@ -275,6 +303,8 @@ def shorten_script(script: dict, max_chars: int) -> tuple[dict, dict]:
 - segments 3~5 段，"sentences" 是該段涵蓋幾句（依句號/驚嘆號/問號切句），不用給秒數
 - 句號要省著用（每句號間隔 25~40 字，中間用逗號串短分句），句號斷太密 TTS 停頓會很卡
 - 旁白正文不能出現「畫面中」「這段影像」「另一段影像可以看到」這種解說詞
+- 若原腳本有 "sots"（受訪原音安排），原樣保留不要改；但 after_sentence 要對應
+  縮寫後新旁白的句子位置，必要時調整這個數字（quote/display 不動）
 
 原腳本：
 {json.dumps(script, ensure_ascii=False)}
@@ -299,6 +329,72 @@ hook 跟 hashtags 原樣保留不用重寫。"""
     data = json.loads(resp.choices[0].message.content)
     data["subtitles"] = _build_subtitles(data["narration"])
     return data, usage
+
+
+def factcheck_narration(article: str, narration: str) -> tuple[list[dict], list[dict], dict]:
+    """
+    查核 Agent：把 AI 改寫的旁白逐項比對記者原稿，抓「改寫過程改錯的關鍵事實」。
+    新聞的命脈，只查會出事的硬事實（數字/地名/人名/罪名/時間/因果），
+    不管文句風格。同一次呼叫順便抽出旁白裡的「外國人名/地名/組織譯名」，
+    供後續比對報社音譯總表（譯名核實），不用多花一次 GPT。
+
+    回傳 (issues, translits, tokens)：
+      issues    = [{"field","narration_says","article_says","severity"}]
+      translits = [{"chinese": "旁白用的譯名", "english_guess": "推測英文原名"}]
+      severity: high（數字/人名/地名/罪名錯）/ medium（時序、因果、程度用詞偏差）
+    """
+    prompt = f"""你是嚴謹的新聞事實查核員。以下「旁白」是 AI 根據「原稿」改寫的短影音口白。
+
+任務一：逐項比對，只抓「旁白與原稿不符、或旁白無中生有」的**硬事實**錯誤，這是要播出去的新聞，錯了會出事：
+- 數字（金額、罰款、人數、年齡、時間、樓層、車速…）
+- 專有名詞（人名、地名、路段、機關、法條）
+- 罪名／違規事由
+- 因果與時序（誰對誰做了什麼、先後順序）
+- 無中生有（旁白講了原稿完全沒有的事實）
+不要管文句風格、順暢度、用詞優劣——只查事實對不對。旁白做「合理的精簡」（省略次要細節）不算錯，
+只有「講錯」或「捏造」才算。
+
+任務二：列出旁白裡出現的**外國**人名/地名/組織的中文譯名（音譯詞），
+每個附上你推測的英文/原文名稱（用來查報社音譯表）。台灣本地的人名地名不要列；
+沒有外國譯名就給空陣列。
+
+原稿：
+{article}
+
+旁白：
+{narration}
+
+只回傳 JSON：
+{{"issues": [
+  {{"field": "罰款金額", "narration_says": "旁白寫的內容", "article_says": "原稿寫的內容", "severity": "high"}}
+],
+"translits": [
+  {{"chinese": "澤倫斯基", "english_guess": "Zelensky"}}
+]}}
+severity：high＝數字/人名/地名/罪名等硬事實錯；medium＝時序/因果/程度偏差。"""
+
+    deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2")
+    resp = _client().chat.completions.create(
+        model=deployment,
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        max_completion_tokens=1500,
+    )
+    usage = {}
+    if resp.usage:
+        usage = {"prompt_tokens": resp.usage.prompt_tokens,
+                 "completion_tokens": resp.usage.completion_tokens,
+                 "total_tokens": resp.usage.total_tokens}
+    try:
+        data = json.loads(resp.choices[0].message.content)
+        issues = data.get("issues", [])
+        translits = data.get("translits", [])
+    except Exception:
+        issues, translits = [], []
+    # 只留有實質內容的
+    issues = [i for i in issues if i.get("field") and i.get("severity") in ("high", "medium")]
+    translits = [t for t in translits if t.get("chinese")]
+    return issues, translits, usage
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -429,6 +525,57 @@ def align_subtitles_to_boundaries(subtitles: list, boundaries: list) -> list:
         out.append({k: v for k, v in sub.items() if not k.startswith("_")} |
                    {"start": _sec_to_ts(sub["_start_sec"]),
                     "end":   _sec_to_ts(max(end, sub["_end_sec"]))})
+    return out
+
+
+def shift_subtitles(subtitles: list, offset_sec: float) -> list:
+    """把一批字幕的時間軸整體往後平移 offset_sec 秒（SOT 分段組裝用）"""
+    if offset_sec <= 0:
+        return subtitles
+    return [{**s,
+             "start": _sec_to_ts(_ts_to_sec(s["start"]) + offset_sec),
+             "end":   _sec_to_ts(_ts_to_sec(s["end"]) + offset_sec)}
+            for s in subtitles]
+
+
+def build_sot_subtitles(display_text: str, start_sec: float, dur_sec: float) -> list:
+    """
+    SOT（受訪原音）段的字幕：display_text 是 GPT 校正過的引句，
+    照標點切段後按字數比例分配到 [start_sec, start_sec+dur_sec] 區間。
+    （精度 ±0.5 秒等級，對受訪字幕夠用；旁白字幕仍走逐字精算不受影響）
+    """
+    chunks = _chunk_narration(display_text)
+    total_chars = sum(len(c) for c in chunks) or 1
+    subs, t = [], start_sec
+    for i, c in enumerate(chunks):
+        d = dur_sec * len(c) / total_chars
+        subs.append({"index": i + 1,
+                     "start": _sec_to_ts(t),
+                     "end": _sec_to_ts(min(t + d, start_sec + dur_sec)),
+                     "text": c})
+        t += d
+    return subs
+
+
+def extract_audio_clip(src: Path, start: float, dur: float, out: Path) -> Path:
+    """從來源影片抽出指定區間的原音（SOT 用），統一轉 aac 44100 立體聲"""
+    ff("-ss", f"{start:.2f}", "-i", src, "-t", f"{dur:.2f}",
+       "-vn", "-c:a", "aac", "-ar", "44100", "-ac", "2", out)
+    return out
+
+
+def concat_audio(files: list[Path], out: Path) -> Path:
+    """把多段音訊（TTS mp3 / SOT m4a 混搭）串接成單一音軌，重取樣統一規格"""
+    if len(files) == 1:
+        ff("-i", files[0], "-c:a", "aac", "-ar", "44100", "-ac", "2", out)
+        return out
+    args: list = []
+    for f in files:
+        args += ["-i", str(f)]
+    labels = "".join(f"[{i}:a]" for i in range(len(files)))
+    ff(*args, "-filter_complex",
+       f"{labels}concat=n={len(files)}:v=0:a=1[a]",
+       "-map", "[a]", "-c:a", "aac", "-ar", "44100", "-ac", "2", out)
     return out
 
 
@@ -585,8 +732,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
 
     MAX_CHARS = 12  # 84 級字在 1080 寬的安全上限，超過自動斷行
 
-    def _wrap(text: str) -> str:
+    _PUNCT = "，。、；：！？,.;:!?"
+
+    def _display(text: str) -> str:
+        """
+        電視新聞字幕慣例：不帶標點。頭尾標點直接去掉；句中標點換半形空格
+        （切段是照標點切的，句中標點只會出現在短尾併回前句的情況）。
+        只影響「顯示」——時間軸對齊用的是去標點字數，本來就不受影響。
+        """
         text = text.replace("\n", "")
+        text = text.strip(_PUNCT)
+        text = re.sub(f"[{re.escape(_PUNCT)}]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _wrap(text: str) -> str:
         if len(text) <= MAX_CHARS:
             return text
         mid = (len(text) + 1) // 2  # 對半斷，兩行都不超過上限（字幕最長 ~24 字）
@@ -594,9 +753,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
 
     lines = [header]
     for s in subtitles:
+        disp = _display(s["text"])
+        if not disp:
+            continue   # 整句只剩標點（理論上不會發生），跳過
         start = _srt_time_to_ass(s["start"])
         end = _srt_time_to_ass(s["end"])
-        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{_wrap(s['text'])}")
+        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{_wrap(disp)}")
 
     path.write_text("\n".join(lines), encoding="utf-8-sig")
     return path
@@ -865,7 +1027,8 @@ def make_main_plan(tts: Path, srt: Path, plan: list[dict],
             continue
         if e.get("path"):
             norm_plan.append({"path": Path(e["path"]),
-                              "start": float(e.get("start", 0) or 0), "dur": dur})
+                              "start": float(e.get("start", 0) or 0), "dur": dur,
+                              "subject_pos": e.get("subject_pos", "")})
         elif e.get("photo") and Path(e["photo"]).exists():
             clip = TMP / f"_photo_seg{i}.mp4"
             _photo_clip(Path(e["photo"]), dur, clip)
@@ -889,12 +1052,21 @@ def _plan_length_info(plan: list[dict], target_sec: float = MAIN_SEC) -> dict:
     }
 
 
+def _crop_scale(subject_pos: str = "") -> str:
+    """
+    16:9→9:16 直式裁切，依主體水平位置決定保留哪一側，避免主體被裁掉。
+    x 偏移 = (可裁範圍) × factor：左 0.2、右 0.8、中/滿版 0.5（正中）。
+    對已是 9:16 的來源（照片/黑幕）iw-cw=0，任何 factor 都得 x=0，等同無作用、不會裁壞。
+    """
+    factor = {"左": 0.2, "右": 0.8}.get((subject_pos or "").strip(), 0.5)
+    return f"crop=ih*9/16:ih:(iw-ih*9/16)*{factor}:0,scale={W}:{H}"
+
+
 def _assemble_main(plan: list[dict], audio_out: Path, sub_f: str, out: Path,
                    main_sec: float = MAIN_SEC, hook: str | None = None):
     """把 plan 的片段（影片/黑幕交錯皆可）串接 → 疊 hook → 上字幕 → 疊角標 → 混音輸出"""
     logo_path = resolve_logo_path()
     has_logo  = logo_path is not None
-    crop_scale = f"crop=ih*9/16:ih,scale={W}:{H}"
 
     args: list = []
     filter_parts: list[str] = []
@@ -905,7 +1077,8 @@ def _assemble_main(plan: list[dict], audio_out: Path, sub_f: str, out: Path,
         if e.get("path"):
             args += ["-ss", f"{e['start']}", "-i", str(e["path"])]
             filter_parts.append(
-                f"[{idx}:v]trim=duration={e['dur']:.2f},setpts=PTS-STARTPTS,{crop_scale},setsar=1[seg{idx}]"
+                f"[{idx}:v]trim=duration={e['dur']:.2f},setpts=PTS-STARTPTS,"
+                f"{_crop_scale(e.get('subject_pos'))},setsar=1[seg{idx}]"
             )
         else:
             args += ["-f", "lavfi", "-i",
