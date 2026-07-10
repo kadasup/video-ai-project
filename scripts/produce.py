@@ -218,6 +218,11 @@ hook／hashtag 規則：
 - 數字用口語唸法：「三萬元」不寫「30,000元」、「七十歲」不寫「70歲」
 - 平鋪直敘、不帶評論、不煽情
 - 匿名原則：嫌疑人用「王姓男子」「張姓嫌犯」，不寫全名
+- ⚠️ 動詞只負責準確，不要用花俏動詞硬撐力道：專業新聞旁白的力道來自「句子結構」與
+  「資訊本身」，不是靠聳動的動詞。不要為了讓句子看起來有力，就把好幾個獨立事件／動作
+  硬濃縮成一個花俏動詞（例：把「駕車衝撞、逆向、闖越三個路口」濃縮成「一路狂飆碾壓」），
+  這樣會失去新聞語境、變成 AI 腔。寧可用平實準確的動詞，把事件一件一件交代清楚，
+  也不要用一個帥氣動詞含糊帶過多個事實。
 
 語感範例（模仿這種台灣電視新聞口白的節奏，不要照抄內容；注意句號很省，都是用逗號把短分句串成一句）：
 「台南安平一間超商，昨天下午驚傳搶案，一名王姓男子戴著口罩走進店裡，突然亮出水果刀，
@@ -817,12 +822,35 @@ def make_main(tts: Path, srt: Path, sources: list[dict] | None = None,
     return out, length_info
 
 
+def _photo_clip(photo: Path, dur: float, out: Path):
+    """
+    新聞照片 → 9:16 影片段：模糊放大的同一張照片墊滿背景、原圖置中、
+    整體緩慢推近（Ken Burns），是電視新聞呈現靜態圖的標準做法，
+    比黑幕或不相關空景更能撐住「有畫面感」。
+    """
+    frames = max(1, int(round(dur * 30)))
+    ff(
+        "-i", photo,
+        "-filter_complex", (
+            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{H},boxblur=30:3,eq=brightness=-0.15,setsar=1[bg];"
+            f"[0:v]scale={W}:-2,setsar=1[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[comp];"
+            f"[comp]zoompan=z='min(1+0.0010*on,1.12)':d={frames}"
+            f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={W}x{H}:fps=30[v]"
+        ),
+        "-map", "[v]", "-t", f"{dur:.2f}", "-r", "30", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", out
+    )
+
+
 def make_main_plan(tts: Path, srt: Path, plan: list[dict],
                    main_sec: float = MAIN_SEC, hook: str | None = None) -> tuple[Path, dict]:
     """
     依智慧配對產生的時間軸組裝主畫面。
-    plan: [{"path": str|None, "start": float, "dur": float}, ...]
-          path=None 代表該段配不到畫面、用黑幕；黑幕可以出現在任何位置。
+    plan: [{"path": str|None, "photo": str|None, "start": float, "dur": float}, ...]
+          path=None 且 photo=None 代表該段配不到畫面、用黑幕。
+          photo 有值代表該段用新聞照片（轉成 Ken Burns 片段）。
     hook: 疊在最前 HOOK_SEC 秒畫面上的純文字鉤子，不影響旁白/字幕。
     """
     out       = TMP / "main.mp4"
@@ -830,12 +858,20 @@ def make_main_plan(tts: Path, srt: Path, plan: list[dict],
     sub_f = _sub_filter(srt)
     _mix_audio(tts, audio_out, main_sec)
 
-    norm_plan = [
-        {"path": (Path(e["path"]) if e.get("path") else None),
-         "start": float(e.get("start", 0) or 0),
-         "dur": float(e["dur"])}
-        for e in plan if float(e.get("dur", 0)) > 0.05
-    ]
+    norm_plan = []
+    for i, e in enumerate(plan):
+        dur = float(e.get("dur", 0) or 0)
+        if dur <= 0.05:
+            continue
+        if e.get("path"):
+            norm_plan.append({"path": Path(e["path"]),
+                              "start": float(e.get("start", 0) or 0), "dur": dur})
+        elif e.get("photo") and Path(e["photo"]).exists():
+            clip = TMP / f"_photo_seg{i}.mp4"
+            _photo_clip(Path(e["photo"]), dur, clip)
+            norm_plan.append({"path": clip, "start": 0.0, "dur": dur})
+        else:
+            norm_plan.append({"path": None, "start": 0.0, "dur": dur})
     length_info = _plan_length_info(norm_plan, main_sec)
     _assemble_main(norm_plan, audio_out, sub_f, out, main_sec, hook=hook)
     return out, length_info

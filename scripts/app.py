@@ -5,6 +5,7 @@
   瀏覽器開 http://localhost:5000
 """
 
+import base64
 import datetime
 import json
 import os
@@ -68,6 +69,7 @@ from produce import (
     make_intro, make_main, make_main_plan, make_outro, concat,
 )
 from select_clip import select_clip, catalog_video, match_narration_to_clips
+import ltn_api
 
 app = Flask(__name__)
 
@@ -90,6 +92,123 @@ _busy = False
 _job: dict = {'step': 0, 'msg': '', 'done': True, 'error': None,
               'filename': None, 'title': None}
 
+# ── 分鏡確認 checkpoint（產製跑到配對完成後暫停、等使用者確認才進最後渲染）──────
+_confirm_event = threading.Event()   # 主執行緒用它喚醒被暫停的產製執行緒
+_confirm_action = ['go']             # 使用者的決定：'go'（渲染）/ 'cancel'（放棄）
+_preview: dict = {}                  # 暫停時給前端看的分鏡預覽（旁白/Hook/配對+縮圖/字幕）
+
+
+class _Cancelled(Exception):
+    """使用者在分鏡確認 checkpoint 按了「取消」——正常中止，不是錯誤"""
+
+
+def _frame_thumb_b64(video_path: str, t: float) -> str | None:
+    """抽該片段一張代表影格、縮到 200 寬轉 base64（給分鏡預覽用，用完刪檔）"""
+    from produce import ff
+    out = TMP / "_pv_thumb.jpg"
+    try:
+        ff("-ss", str(max(0.0, t)), "-i", str(video_path),
+           "-vframes", "1", "-vf", "scale=200:-1", "-q:v", "6", out)
+        b = base64.b64encode(out.read_bytes()).decode()
+        return b
+    except Exception:
+        return None
+    finally:
+        try:
+            out.unlink()
+        except Exception:
+            pass
+
+
+def _photo_thumb_b64(photo_path: str) -> str | None:
+    """照片縮圖 base64（分鏡預覽用）"""
+    from produce import ff
+    out = TMP / "_pv_thumb.jpg"
+    try:
+        ff("-i", str(photo_path), "-vframes", "1", "-vf", "scale=200:-1", "-q:v", "6", out)
+        return base64.b64encode(out.read_bytes()).decode()
+    except Exception:
+        return None
+    finally:
+        try:
+            out.unlink()
+        except Exception:
+            pass
+
+
+def _build_preview(script: dict, subtitles: list, plan_rows: list) -> dict:
+    """組裝分鏡預覽 payload：旁白、Hook、hashtags、字幕分段、每段配對＋代表縮圖"""
+    segs = []
+    for e in (plan_rows or []):
+        if e.get('path'):
+            label = Path(e['path']).name
+            thumb = _frame_thumb_b64(e['path'], e.get('start', 0))
+        elif e.get('photo'):
+            label = f"📷 {Path(e['photo']).name}（照片）"
+            thumb = _photo_thumb_b64(e['photo'])
+        else:
+            label = '（黑幕）'
+            thumb = None
+        segs.append({
+            'video': label,
+            'start': e.get('start', 0),
+            'dur': e.get('dur', 0),
+            'why': e.get('why', ''),
+            'thumb': thumb,
+        })
+    return {
+        'title': script.get('title', ''),
+        'hook': script.get('hook', ''),
+        'hashtags': script.get('hashtags', []),
+        'narration': script.get('narration', ''),
+        'subtitles': [s.get('text', '') for s in (subtitles or [])],
+        'segments': segs,
+    }
+
+_TALK_KEYWORDS = ('受訪', '說話', '發言', '講話', '對鏡頭', '口型', '受访')
+
+def _coverage_warning(plan: list, catalogs: list) -> str | None:
+    """
+    素材涵蓋度預警：算出成片裡「受訪特寫當底」「照片」「黑幕」各佔幾秒，
+    佔比過高就回警告字串——讓「素材撐不起旁白」在確認分鏡時就被看見，
+    而不是整支渲染完才發現畫面空洞。
+    """
+    desc_map = {}   # path -> [(start, end, desc)]
+    for cat in catalogs:
+        desc_map[str(cat['path'])] = [
+            (s['start'], s['end'], s.get('description', '')) for s in cat['segments']]
+
+    total = talk = photo = black = 0.0
+    for e in plan:
+        dur = float(e.get('dur', 0) or 0)
+        total += dur
+        if e.get('photo'):
+            photo += dur
+        elif not e.get('path'):
+            black += dur
+        else:
+            segs = desc_map.get(str(e['path']), [])
+            s0 = float(e.get('start', 0) or 0)
+            s1 = s0 + dur
+            talk_overlap = sum(
+                max(0.0, min(s1, seg_end) - max(s0, seg_start))
+                for seg_start, seg_end, desc in segs
+                if any(k in desc for k in _TALK_KEYWORDS))
+            talk += talk_overlap
+    if total <= 0:
+        return None
+
+    parts = []
+    if talk / total > 0.4:
+        parts.append(f"受訪特寫畫面佔了 {talk:.0f} 秒（{talk/total:.0%}）——"
+                     "閉麥的講話臉當配音底圖太久會顯得空洞，建議補事件現場素材")
+    if black > 0.05:
+        parts.append(f"黑幕 {black:.0f} 秒")
+    if photo / total > 0.5:
+        parts.append(f"靜態照片佔 {photo:.0f} 秒（{photo/total:.0%}），動態素材偏少")
+    return ("⚠️ 素材涵蓋度提醒：" + "；".join(parts)) if parts else None
+
+
 # ── 智慧分析工作狀態 ───────────────────────────────────────────────────────────
 _alock = threading.Lock()
 _abusy = False
@@ -106,8 +225,12 @@ STEPS = ['', '分析影片內容', '生成播報腳本', '生成旁白音訊', '
          '組裝片頭', '組裝主畫面', '組裝片尾', '串接輸出']
 
 
-def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str = "hsiaochen"):
-    """videos: [{"path": "...", "start": 12.0}, ...]，依序銜接補滿 MAIN_SEC 秒"""
+def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str = "hsiaochen",
+            checkpoint: bool = True, photos: list[str] | None = None):
+    """videos: [{"path": "...", "start": 12.0}, ...]，依序銜接補滿 MAIN_SEC 秒
+    photos: 新聞配圖本機路徑（匯入時下載的文章主圖），配不到動態畫面的旁白段
+            會用「照片＋Ken Burns 推移」取代黑幕/空洞畫面。
+    checkpoint=True 時，配對完成後會暫停等使用者確認分鏡，才進最後渲染。"""
     global _busy, _job
     voice = TTS_VOICES.get(voice_key, TTS_VOICES["hsiaochen"])
 
@@ -224,17 +347,41 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         if catalogs and segments:
             p(5)
             try:
+                photo_items = [
+                    {"path": ph, "desc": "新聞報導配圖（常是事件現場或網傳畫面的截圖，"
+                                          "適合配「事件主體」相關旁白）"}
+                    for ph in (photos or []) if Path(ph).exists()
+                ]
                 plan, match_tokens = match_narration_to_clips(
-                    segments, catalogs, main_sec)
+                    segments, catalogs, main_sec, photos=photo_items)
                 _add_tokens(match_tokens)
                 _job['plan'] = [
-                    {'video': (Path(e['path']).name if e.get('path') else '（黑幕）'),
+                    {'video': (Path(e['path']).name if e.get('path')
+                               else (f"📷 {Path(e['photo']).name}" if e.get('photo') else '（黑幕）')),
                      'start': e.get('start', 0), 'dur': e['dur'],
                      'why': e.get('why', '')}
                     for e in plan
                 ]
+                cover_warn = _coverage_warning(plan, catalogs)
+                if cover_warn:
+                    _job['warning'] = cover_warn
             except Exception:
                 plan = None  # 配對失敗退回依序銜接
+
+        # ── Checkpoint：分鏡確認（渲染前先讓人看旁白/Hook/配對縮圖/字幕，確認才渲染）──
+        # 對治「跑完整支才發現畫面對不上／字幕怪／Hook 怪，又得整支重跑」的痛點。
+        if checkpoint:
+            global _preview
+            _preview = _build_preview(script, subtitles, plan or [])
+            _confirm_action[0] = 'go'
+            _confirm_event.clear()
+            _job['awaiting_confirm'] = True
+            _job['msg'] = '⏸ 等待分鏡確認（渲染前）'
+            got = _confirm_event.wait(timeout=1800)   # 最多等 30 分鐘，逾時視同取消
+            _job['awaiting_confirm'] = False
+            _preview = {}
+            if (not got) or _confirm_action[0] == 'cancel':
+                raise _Cancelled()
 
         p(6)
         intro = make_intro(script)
@@ -249,11 +396,13 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         else:
             main_clip, length_info = make_main(tts_path, ass_path, videos, main_sec, hook=hook)
         if length_info.get("insufficient"):
-            _job['warning'] = (
+            short_msg = (
                 f"來源畫面只涵蓋 {length_info['covered_sec']} 秒，"
                 f"不足 {length_info['target_sec']} 秒，"
                 f"其餘 {length_info['shortfall_sec']} 秒為黑幕空景"
             )
+            # 不要蓋掉步驟5的涵蓋度提醒，兩則都留
+            _job['warning'] = (_job.get('warning') + '\n' + short_msg) if _job.get('warning') else short_msg
 
         p(8)
         outro = make_outro()
@@ -275,6 +424,18 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                 pass
 
         _job.update({'step': 9, 'msg': '完成', 'done': True, 'filename': name,
+                     'elapsed_sec': round(time.time() - t0, 1),
+                     'step_durations': dict(step_durations)})
+
+    except _Cancelled:
+        # 使用者在分鏡確認按了取消：正常中止、不算錯誤，清掉暫存
+        for f in [tts_path, ass_path]:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+        _job.update({'done': True, 'cancelled': True, 'awaiting_confirm': False,
+                     'msg': '已取消（分鏡未通過，未渲染）',
                      'elapsed_sec': round(time.time() - t0, 1),
                      'step_durations': dict(step_durations)})
 
@@ -311,6 +472,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             "seg_align":          _job.get('seg_align', ''),
             "main_sec":           _job.get('main_sec', 0),
             "step_durations":     step_durations,
+            "cancelled":          bool(_job.get('cancelled')),
             "error":              err_msg,
             # 產製歷史回溯用：旁白全文、標題/hook/hashtag、配對明細、原始新聞稿
             "article":            article,
@@ -774,6 +936,37 @@ textarea{resize:vertical;min-height:210px}
 }
 .btn-browse:hover{background:#1f2937}
 
+/* 後臺影音清單 */
+.backlog-card{
+  background:#fff;border-radius:12px;padding:20px 24px;
+  box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:20px
+}
+.backlog-filters{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:14px}
+.backlog-filters label{font-size:.76rem;color:#6b7280;display:block;margin-bottom:4px}
+.backlog-filters input, .backlog-filters select{
+  padding:7px 9px;border:1px solid #d1d5db;border-radius:6px;font-size:.85rem
+}
+.backlog-list{max-height:340px;overflow-y:auto;border:1px solid #e5e7eb;border-radius:8px}
+.backlog-row{
+  display:flex;align-items:center;gap:10px;padding:9px 12px;
+  border-bottom:1px solid #f3f4f6;font-size:.82rem
+}
+.backlog-row:last-child{border-bottom:none}
+.backlog-row .bl-title{flex:1;color:#1f2937}
+.backlog-row .bl-meta{color:#9ca3af;font-size:.72rem;white-space:nowrap}
+.bl-status{
+  padding:2px 9px;border-radius:10px;font-size:.72rem;font-weight:700;white-space:nowrap
+}
+.bl-status-已完成{background:#d1fae5;color:#065f46}
+.bl-status-不處理不存{background:#fee2e2;color:#991b1b}
+.bl-status-未知{background:#f3f4f6;color:#6b7280}
+.btn-import{
+  padding:6px 12px;background:#2563eb;color:#fff;border:none;border-radius:6px;
+  font-size:.78rem;font-weight:600;cursor:pointer;white-space:nowrap
+}
+.btn-import:hover{background:#1d4ed8}
+.btn-import:disabled{background:#9ca3af;cursor:not-allowed}
+
 /* 資料夾瀏覽 modal */
 .modal-overlay{
   position:fixed;inset:0;background:rgba(0,0,0,.42);
@@ -838,6 +1031,34 @@ textarea{resize:vertical;min-height:210px}
   <h1 style="margin:0">🎬 短影音產製</h1>
   <a href="/logs" style="font-size:.82rem;color:#6b7280;text-decoration:none;padding:6px 12px;border:1px solid #d1d5db;border-radius:6px">📋 使用記錄</a>
 </div>
+
+<!-- 後臺影音清單（LTN 內部系統匯入） -->
+<div class="backlog-card">
+  <h2 style="margin-top:0">📡 後臺影音清單</h2>
+  <div class="backlog-filters">
+    <div>
+      <label>起始日期</label>
+      <input type="date" id="bl-start" onclick="this.showPicker && this.showPicker()">
+    </div>
+    <div>
+      <label>結束日期</label>
+      <input type="date" id="bl-end" onclick="this.showPicker && this.showPicker()">
+    </div>
+    <div>
+      <label>狀態篩選</label>
+      <select id="bl-status-filter" onchange="renderBacklog()">
+        <option value="">全部</option>
+        <option value="已完成">已完成</option>
+        <option value="不處理不存">不處理不存</option>
+      </select>
+    </div>
+    <button class="btn-browse" onclick="loadBacklog()">🔍 搜尋</button>
+  </div>
+  <div class="backlog-list" id="backlog-list">
+    <div style="padding:14px;color:#9ca3af;font-size:.82rem">選好日期區間後按「搜尋」載入清單</div>
+  </div>
+</div>
+
 <div class="grid">
 
   <!-- 左：表單 -->
@@ -846,6 +1067,7 @@ textarea{resize:vertical;min-height:210px}
 
     <label>新聞稿內容 <span style="color:#e00">*</span></label>
     <textarea id="article" placeholder="貼上新聞稿全文…"></textarea>
+    <div id="import-keywords" style="display:none;font-size:.76rem;color:#6b7280;margin-top:-8px;margin-bottom:12px"></div>
 
     <label>影片（可瀏覽選取多支，依序銜接補滿主畫面秒數）</label>
     <div style="display:flex;gap:8px">
@@ -855,6 +1077,11 @@ textarea{resize:vertical;min-height:210px}
     <p class="hint">選取後按「加入選取」，每支會自動跑智慧分析，結果顯示在檔名下方（分析過的有快取不重複收費）；產製完成後清單會保留，要換下一則新聞才按「重整」清空</p>
 
     <div id="video-list" class="video-list"></div>
+
+    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;cursor:pointer;font-weight:400">
+      <input type="checkbox" id="checkpoint" checked style="width:16px;height:16px">
+      <span>渲染前先讓我確認分鏡（旁白／配對畫面／字幕都 OK 才輸出，避免整支跑完才發現要重來）</span>
+    </label>
 
     <button class="btn" id="btn" onclick="startJob()">開始產製</button>
   </div>
@@ -880,6 +1107,17 @@ textarea{resize:vertical;min-height:210px}
       <li id="s8"><div class="step-row"><span class="icon">○</span>組裝片尾（5 秒）<span class="step-time" id="t8"></span></div><div class="step-mini"><div class="step-mini-bar" id="m8"></div></div></li>
       <li id="s9"><div class="step-row"><span class="icon">○</span>串接輸出<span class="step-time" id="t9"></span></div><div class="step-mini"><div class="step-mini-bar" id="m9"></div></div></li>
     </ul>
+
+    <!-- 分鏡確認 checkpoint 面板 -->
+    <div id="checkpoint-box" style="display:none;margin-top:14px;padding:14px;border:2px solid #f59e0b;border-radius:10px;background:#fffbeb">
+      <p style="font-weight:700;color:#92400e;margin:0 0 4px">⏸ 渲染前分鏡確認</p>
+      <p style="font-size:.78rem;color:#78350f;margin:0 0 10px">下面是這支的旁白、Hook、每段配到的畫面與字幕。確認沒問題再渲染；覺得不對就取消、調整後重跑（省下整支渲染時間）。</p>
+      <div id="cp-content" style="font-size:.82rem;color:#333"></div>
+      <div style="display:flex;gap:10px;margin-top:14px">
+        <button class="btn" style="flex:1;background:#16a34a" onclick="confirmJob('go')">✅ 確認，開始渲染</button>
+        <button class="btn" style="flex:1;background:#9ca3af" onclick="confirmJob('cancel')">✖ 取消</button>
+      </div>
+    </div>
 
     <div class="result" id="result">
       <p>✅ 產製完成！《<span id="titleText"></span>》</p>
@@ -939,6 +1177,8 @@ async function startJob() {
       body: JSON.stringify({
         article: art,
         videos:  videos,
+        photos:  importedPhotos,
+        checkpoint: document.getElementById('checkpoint').checked,
       })
     });
     const d = await r.json();
@@ -954,11 +1194,22 @@ const STEP_NAMES = ['', '分析影片內容', '生成播報腳本', '生成旁�
                      '旁白配對畫面',
                      '組裝片頭', '組裝主畫面', '組裝片尾', '串接輸出'];
 const N_STEPS = 9;
+let cpShown = false;     // 分鏡確認面板是否已顯示（避免每次輪詢重抓 preview）
+let cpDecided = false;   // 使用者已按過確認/取消（避免 server 尚未清旗標時面板閃回）
 
 async function poll() {
   try {
     const d = await (await fetch('/api/status')).json();
     renderSteps(d);
+    if (d.awaiting_confirm && !cpDecided) {
+      if (!cpShown) { cpShown = true; showCheckpoint(); }
+      return;   // 暫停中，等使用者按確認/取消，不當作完成
+    }
+    if (cpShown && !d.awaiting_confirm) {
+      // 已確認、繼續渲染 → 收起面板
+      cpShown = false;
+      document.getElementById('checkpoint-box').style.display = 'none';
+    }
     if (d.done) {
       clearInterval(timer);
       document.getElementById('btn').disabled = false;
@@ -967,11 +1218,69 @@ async function poll() {
   } catch(_) {}
 }
 
+async function showCheckpoint() {
+  try {
+    const pv = await (await fetch('/api/preview')).json();
+    renderCheckpoint(pv);
+    document.getElementById('checkpoint-box').style.display = 'block';
+    document.getElementById('checkpoint-box').scrollIntoView({behavior:'smooth', block:'nearest'});
+  } catch(_) {}
+}
+
+function renderCheckpoint(pv) {
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const tags = (pv.hashtags && pv.hashtags.length) ? pv.hashtags.join(' ') : '（無）';
+  let html = '';
+  html += `<div style="margin-bottom:8px"><b>標題：</b>${esc(pv.title)}　<b>Hook：</b>${esc(pv.hook)}</div>`;
+  html += `<div style="margin-bottom:8px"><b>Hashtags：</b>${esc(tags)}</div>`;
+  html += `<div style="margin-bottom:8px"><b>旁白全文：</b><div style="white-space:pre-wrap;line-height:1.7;margin-top:4px;background:#fff;padding:8px;border-radius:6px">${esc(pv.narration)}</div></div>`;
+  if (pv.segments && pv.segments.length) {
+    html += `<div style="margin-bottom:6px"><b>配對畫面（每段配到什麼）：</b></div>`;
+    let at = 0;
+    html += pv.segments.map(s => {
+      const from = at.toFixed(0); at += (s.dur || 0); const to = at.toFixed(0);
+      const img = s.thumb
+        ? `<img src="data:image/jpeg;base64,${s.thumb}" style="width:90px;border-radius:6px;flex-shrink:0">`
+        : `<div style="width:90px;height:60px;background:#111;border-radius:6px;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#888;font-size:.7rem">黑幕</div>`;
+      return `<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;background:#fff;padding:6px;border-radius:6px">
+        ${img}
+        <div style="font-size:.76rem;line-height:1.5">
+          <div style="color:#92400e;font-weight:600">${from}-${to}s ← ${esc(s.video)}${s.start ? ' 第'+s.start+'s起' : ''}</div>
+          <div style="color:#666">${esc(s.why)}</div>
+        </div>
+      </div>`;
+    }).join('');
+  }
+  if (pv.subtitles && pv.subtitles.length) {
+    html += `<div style="margin-top:8px"><b>字幕分段（${pv.subtitles.length} 句）：</b><div style="color:#555;margin-top:4px;line-height:1.8">${pv.subtitles.map(esc).join(' ／ ')}</div></div>`;
+  }
+  document.getElementById('cp-content').innerHTML = html;
+}
+
+async function confirmJob(action) {
+  const box = document.getElementById('checkpoint-box');
+  box.querySelectorAll('button').forEach(b => b.disabled = true);
+  cpDecided = true;   // 先擋住 poll 再送出，避免 server 尚未清旗標時面板閃回
+  try {
+    await fetch('/api/confirm', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action}),
+    });
+  } catch(_) {}
+  box.querySelectorAll('button').forEach(b => b.disabled = false);
+  cpShown = false;
+  box.style.display = 'none';
+  // 之後由 poll 繼續：'go' 會看到渲染步驟、'cancel' 會走到 done+cancelled
+}
+
 function handleJobDone(d) {
   // 記下這支工作「已經看過結果了」，避免下次開網頁又跳出同一支的完成畫面
   if (d.started_at) localStorage.setItem('videoai_last_seen_job', String(d.started_at));
   if (d.error) {
     showErr(d.error);
+  } else if (d.cancelled) {
+    showErr('已取消：分鏡未通過，未進行渲染。調整後可重新產製。');
   } else if (d.filename) {
     showResult(d.filename, d.title, d.warning, d.plan, d.hashtags);
     // 影片清單保留（方便核對這次用了哪些素材），要換下一則新聞才手動按「重整」清空
@@ -1124,6 +1433,10 @@ function resetUI() {
   document.getElementById('err').style.display = 'none';
   document.getElementById('warn').style.display = 'none';
   document.getElementById('plan-box').style.display = 'none';
+  const cp = document.getElementById('checkpoint-box');
+  if (cp) cp.style.display = 'none';
+  cpShown = false;
+  cpDecided = false;
   document.getElementById('preview-video').removeAttribute('src');
   document.getElementById('progress-bar').style.width = '0%';
   document.getElementById('progress-pct').textContent = '0%';
@@ -1141,6 +1454,7 @@ function resetUI() {
 
 // ─── 多影片清單（含每支自動智慧分析）─────────────────────────────────────────
 let videoList = [];  // {path, start, analyzing, analysis:{category,description,error}}
+let importedPhotos = [];  // 匯入時下載的新聞配圖本機路徑（配不到畫面時當 Ken Burns 備援）
 
 function removeVideoFromList(index) {
   videoList.splice(index, 1);
@@ -1151,6 +1465,8 @@ function removeVideoFromList(index) {
 function clearVideoList() {
   if (videoList.length && !confirm('確定要清空目前的影片清單嗎？')) return;
   videoList = [];
+  importedPhotos = [];
+  document.getElementById('import-keywords').style.display = 'none';
   renderVideoList();
   saveLastSettings();
 }
@@ -1266,6 +1582,8 @@ function saveLastSettings() {
   }));
   localStorage.setItem('videoai_video_list', JSON.stringify(slim));
   localStorage.setItem('videoai_last_browse_dir', localStorage.getItem('videoai_last_browse_dir') || '');
+  localStorage.setItem('videoai_checkpoint', document.getElementById('checkpoint').checked ? '1' : '0');
+  localStorage.setItem('videoai_photos', JSON.stringify(importedPhotos));
 }
 
 function restoreLastSettings() {
@@ -1274,11 +1592,133 @@ function restoreLastSettings() {
     const saved = JSON.parse(localStorage.getItem('videoai_video_list') || '[]');
     if (Array.isArray(saved)) videoList = saved;
   } catch(_) { videoList = []; }
+  try {
+    const ph = JSON.parse(localStorage.getItem('videoai_photos') || '[]');
+    if (Array.isArray(ph)) importedPhotos = ph;
+  } catch(_) { importedPhotos = []; }
+  const cpPref = localStorage.getItem('videoai_checkpoint');
+  if (cpPref !== null) document.getElementById('checkpoint').checked = (cpPref === '1');
   renderVideoList();
 }
 
 restoreLastSettings();
 resumeIfRunning();
+
+// ─── 後臺影音清單（LTN 內部 API 匯入）───────────────────────────────────────
+let backlogItems = [];
+
+function _pad2(n) { return String(n).padStart(2, '0'); }
+
+function _dateToParts(dateStr, isEnd) {
+  // 輸入是 <input type=date> 的 "YYYY-MM-DD"，API 要 year + MMDDHHmm；
+  // 起始日補 0000（當天開始），結束日補 2359（當天結束），涵蓋整天
+  const [y, m, d] = dateStr.split('-');
+  const hhmm = isEnd ? '2359' : '0000';
+  return { year: y, mmddhhmm: m + d + hhmm };
+}
+
+function _initBacklogDefaults() {
+  const now = new Date();
+  const today = `${now.getFullYear()}-${_pad2(now.getMonth()+1)}-${_pad2(now.getDate())}`;
+  document.getElementById('bl-start').value = today;
+  document.getElementById('bl-end').value = today;
+}
+_initBacklogDefaults();
+
+async function loadBacklog() {
+  const startVal = document.getElementById('bl-start').value;
+  const endVal = document.getElementById('bl-end').value;
+  if (!startVal || !endVal) { alert('請選擇起始與結束日期'); return; }
+  const s = _dateToParts(startVal, false);
+  const e = _dateToParts(endVal, true);
+  const list = document.getElementById('backlog-list');
+  list.innerHTML = '<div style="padding:14px;color:#9ca3af;font-size:.82rem">載入中…</div>';
+  try {
+    const r = await fetch(`/api/backlog?year=${s.year}&start=${s.mmddhhmm}&end=${e.mmddhhmm}`);
+    const d = await r.json();
+    if (d.error) { list.innerHTML = `<div style="padding:14px;color:#b91c1c;font-size:.82rem">${d.error}</div>`; return; }
+    backlogItems = d.items || [];
+    renderBacklog();
+  } catch (err) {
+    list.innerHTML = `<div style="padding:14px;color:#b91c1c;font-size:.82rem">${err.message}</div>`;
+  }
+}
+
+function renderBacklog() {
+  const filter = document.getElementById('bl-status-filter').value;
+  const list = document.getElementById('backlog-list');
+  const rows = backlogItems.filter(it => !filter || it.status === filter);
+  if (!rows.length) {
+    list.innerHTML = '<div style="padding:14px;color:#9ca3af;font-size:.82rem">沒有符合篩選條件的項目</div>';
+    return;
+  }
+  list.innerHTML = rows.map(it => {
+    const ts = (it.articleCreateTime || '').replace(/^(\\d{4})(\\d{2})(\\d{2})(\\d{2})(\\d{2}).*/, '$2/$3 $4:$5');
+    const vc = it.videoCount || (it.videos || []).length;
+    const status = it.status || '未知';
+    return `<div class="backlog-row">
+      <span class="bl-status bl-status-${status}">${status}</span>
+      <span class="bl-title">${_escBl(it.title)}</span>
+      <span class="bl-meta">${ts}・${vc}支影片</span>
+      <button class="btn-import" onclick="importBacklogItem('${it.articleNo}')" id="bl-import-${it.articleNo}">📥 匯入</button>
+    </div>`;
+  }).join('');
+}
+
+function _escBl(s) {
+  return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+async function importBacklogItem(articleNo) {
+  const it = backlogItems.find(x => x.articleNo === articleNo);
+  if (!it) return;
+  const btn = document.getElementById('bl-import-' + articleNo);
+  btn.disabled = true;
+  btn.textContent = '匯入中…';
+  try {
+    const videoUrls = (it.videos || []).map(v => v.url);
+    const r = await fetch('/api/backlog/import', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({articleNo, videoUrls}),
+    });
+    const d = await r.json();
+    if (d.error) { alert('匯入失敗：' + d.error); btn.disabled = false; btn.textContent = '📥 匯入'; return; }
+
+    document.getElementById('article').value = d.content || '';
+    importedPhotos = d.photo ? [d.photo] : [];   // 換新聞就換配圖，不累積上一篇的
+    const kwBox = document.getElementById('import-keywords');
+    const kwParts = [];
+    if (d.keywords && d.keywords.length) kwParts.push('關鍵字：' + d.keywords.join('、'));
+    if (d.photo) kwParts.push('📷 已附新聞配圖（配不到畫面的旁白段會自動用它補）');
+    if (kwParts.length) {
+      kwBox.textContent = kwParts.join('　');
+      kwBox.style.display = 'block';
+    } else {
+      kwBox.style.display = 'none';
+    }
+    if (d.errors && d.errors.length) {
+      alert('部分影片下載失敗：\\n' + d.errors.join('\\n'));
+    }
+
+    // 下載好的影片直接加進選取清單，比照「加入選取」流程自動跑智慧分析
+    const newItems = [];
+    (d.downloaded || []).forEach(path => {
+      if (!videoList.some(v => v.path === path)) {
+        const item = {path, start: 0, analyzing: false, analysis: null};
+        videoList.push(item);
+        newItems.push(item);
+      }
+    });
+    renderVideoList();
+    saveLastSettings();
+    if (newItems.length) analyzeQueued(newItems);
+  } catch (e) {
+    alert('匯入失敗：' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '📥 匯入';
+  }
+}
 
 // ─── 資料夾瀏覽 modal ──────────────────────────────────────────────────────
 let browseSelected = new Set();  // 已勾選的檔案路徑（跨資料夾保留）
@@ -1467,9 +1907,13 @@ def api_generate():
                 'started_at': time.time(), 'step_started_at': time.time(),
                 'elapsed_sec': 0, 'step_elapsed_sec': 0}
 
+    checkpoint = data.get('checkpoint')
+    checkpoint = True if checkpoint is None else bool(checkpoint)
+    photos = [p for p in (data.get('photos') or []) if p and Path(p).exists()]
     t = threading.Thread(
         target=run_job,
-        args=(article, videos, data.get('fname'), data.get('voice') or 'hsiaochen'),
+        args=(article, videos, data.get('fname'), data.get('voice') or 'hsiaochen',
+              checkpoint, photos),
         daemon=True,
     )
     t.start()
@@ -1479,11 +1923,30 @@ def api_generate():
 @app.route('/api/status')
 def api_status():
     d = dict(_job)
+    d.pop('preview', None)   # 預覽 payload 較大，只走 /api/preview，狀態輪詢保持輕量
     if not d.get('done'):
         now = time.time()
         d['elapsed_sec'] = round(now - d.get('started_at', now), 1)
         d['step_elapsed_sec'] = round(now - d.get('step_started_at', now), 1)
     return jsonify(d)
+
+
+@app.route('/api/preview')
+def api_preview():
+    """分鏡確認暫停時，前端一次性抓取的預覽內容（旁白/Hook/配對縮圖/字幕）"""
+    return jsonify(_preview or {})
+
+
+@app.route('/api/confirm', methods=['POST'])
+def api_confirm():
+    """使用者在分鏡確認 checkpoint 的決定：go=繼續渲染、cancel=放棄"""
+    data = request.json or {}
+    action = 'cancel' if data.get('action') == 'cancel' else 'go'
+    if not _job.get('awaiting_confirm'):
+        return jsonify({'error': '目前沒有等待確認的工作'}), 409
+    _confirm_action[0] = action
+    _confirm_event.set()
+    return jsonify({'ok': True, 'action': action})
 
 
 @app.route('/api/analyze', methods=['POST'])
@@ -1547,6 +2010,62 @@ def api_browse():
     return jsonify({'path': str(p), 'parent': parent, 'dirs': dirs, 'files': files})
 
 
+# ── 後臺影音清單（LTN 內部 API 匯入，供自動化測試用）──────────────────────────
+@app.route('/api/backlog')
+def api_backlog():
+    year  = (request.args.get('year') or '').strip()
+    start = (request.args.get('start') or '').strip()
+    end   = (request.args.get('end') or '').strip()
+    if not (year and start and end):
+        return jsonify({'error': '請提供 year/start/end（start/end 格式 MMDDHHmm）'}), 400
+    try:
+        items = ltn_api.fetch_backlog(year, start, end)
+    except Exception as e:
+        return jsonify({'error': f'抓後臺清單失敗：{e}'}), 502
+    return jsonify({'items': items})
+
+
+@app.route('/api/backlog/import', methods=['POST'])
+def api_backlog_import():
+    """匯入：抓文章全文＋關鍵字、下載該篇所有影片到 input/"""
+    data = request.json or {}
+    article_no = (data.get('articleNo') or '').strip()
+    video_urls = data.get('videoUrls') or []
+    if not article_no:
+        return jsonify({'error': '缺少 articleNo'}), 400
+
+    try:
+        article = ltn_api.fetch_article(article_no)
+    except Exception as e:
+        return jsonify({'error': f'抓文章內容失敗：{e}'}), 502
+
+    downloaded = []
+    errors = []
+    for url in video_urls:
+        try:
+            downloaded.append(ltn_api.download_video(url))
+        except Exception as e:
+            errors.append(f'{url}：{e}')
+
+    # 文章主圖一併下載：配不到動態畫面的旁白段，可用照片+Ken Burns 取代黑幕
+    photo_path = None
+    if article.get('photo_url'):
+        try:
+            photo_path = ltn_api.download_photo(article['photo_url'], article_no)
+        except Exception as e:
+            errors.append(f"配圖下載失敗：{e}")
+
+    return jsonify({
+        'ok': True,
+        'content': article['content'],
+        'keywords': article['keywords'],
+        'source_url': article['source_url'],
+        'downloaded': downloaded,
+        'photo': photo_path,
+        'errors': errors,
+    })
+
+
 @app.route('/api/logs')
 def api_logs():
     limit = int(request.args.get('limit', 500))
@@ -1568,4 +2087,7 @@ def api_download(filename):
 
 if __name__ == '__main__':
     print("[VideoAI] Starting on http://localhost:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    # threaded=True：後臺清單/文章/影片下載這幾個新端點是同步處理，
+    # 沒有這個參數整台伺服器只能一次處理一個請求，下載影片時會卡住其他所有請求
+    # （含正在跑的產製工作的 /api/status 輪詢）
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

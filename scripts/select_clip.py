@@ -572,16 +572,21 @@ def match_narration_to_clips(
     narration_segments: list[dict],
     catalogs: list[dict],
     total_sec: float,
+    photos: list[dict] | None = None,
 ) -> tuple[list[dict], dict]:
     """
     narration_segments: [{"start": 0, "end": 18, "desc": "..."}] 來自 generate_script
     catalogs:           [catalog_video() 的輸出, ...]
     total_sec:          主畫面總秒數
+    photos:             [{"path": str, "desc": str}, ...] 新聞配圖（靜態照片，
+                        會以 Ken Burns 緩慢推移呈現），沒有就不給
 
     回傳 (plan, tokens)：
-      plan = [{"path": str|None, "start": float, "dur": float, "why": str}, ...]
-      依序鋪滿 total_sec；path=None 為黑幕。
+      plan = [{"path": str|None, "start": float, "dur": float, "why": str,
+               "photo": str|None}, ...]
+      依序鋪滿 total_sec；path=None 且 photo=None 為黑幕。
     """
+    photos = photos or []
     vid_lines = []
     for vi, cat in enumerate(catalogs):
         vid_lines.append(f"影片V{vi+1}（總長 {cat['duration']}s）：")
@@ -589,30 +594,39 @@ def match_narration_to_clips(
             vid_lines.append(
                 f"  {seg['start']}s~{seg['end']}s：{seg.get('description', '')}"
             )
+    for pi, p in enumerate(photos):
+        vid_lines.append(f"照片P{pi+1}（靜態新聞配圖，可指定任意秒數）：{p.get('desc', '')}")
     nar_lines = [
         f"旁白{ni+1}（{n['start']}s~{n['end']}s）：{n['desc']}"
         for ni, n in enumerate(narration_segments)
     ]
 
     prompt = (
-        "你是新聞影音剪輯師。請把旁白各段配上最合適的影片畫面，輸出一條完整時間軸。\n"
+        "你是新聞影音剪輯師。請把旁白各段配上最合適的畫面（影片片段或新聞照片），輸出一條完整時間軸。\n"
         "旁白是照著這批素材寫的（write to picture），若旁白段落的描述有註明建議影片段落"
         "（如「配V1的0~5秒」），優先照建議採用。\n\n"
         f"旁白分段（成片主畫面共 {total_sec} 秒）：\n" + "\n".join(nar_lines) + "\n\n"
-        "可用素材片段：\n" + "\n".join(vid_lines) + "\n\n"
+        "可用素材：\n" + "\n".join(vid_lines) + "\n\n"
         "規則：\n"
         f"1. 時間軸總長必須正好 {total_sec} 秒，依序排列\n"
-        "2. 每個片段標明用哪支影片、從第幾秒取、取多長\n"
-        "3. 畫面內容要呼應該時間點的旁白內容；同一素材區段可重複使用，但盡量少重複\n"
-        "4. 完全找不到相關畫面的旁白段落，用 \"black\" 補黑幕；"
-        "但「畫面相關性普通」優於黑幕——寧可放大致相關的現場畫面，也不要黑\n"
-        "5. 單一片段 5~15 秒為佳（少於 4 秒太碎、超過 20 秒太拖）\n"
-        "6. 選畫面的優先序：有人物動作/事件發生的段落 > 靜態現場 > 空景；"
-        "描述裡有具體人事物（如「消防員救援」「車輛翻覆」）的段落優先配給講到相同人事物的旁白\n"
-        "7. 盡量避免從影片最開頭 0 秒取（常有黑幀/晃動），可從段落起點往後 1~2 秒取\n\n"
+        "2. 影片片段標明用哪支影片、從第幾秒取、取多長；照片只標 P 編號跟秒數\n"
+        "3. 畫面內容要呼應該時間點的旁白內容\n"
+        "4. ⚠️ 事件主體優先：旁白在講事件經過（如車輛行駛、案發、救援）時，"
+        "優先配「拍到事件主體」的片段——就算那段很短、需要重複使用也可以，"
+        "重複主體畫面遠勝過空景或不相關畫面；若有照片拍到主體（新聞配圖常是事件現場截圖），"
+        "主體動態片段不夠長時就接照片，不要拿空景硬撐\n"
+        "5. ⚠️ 受訪/講話特寫（描述含「受訪」「對鏡頭說話」「發言」這類）當配音底圖有嚴格限制："
+        "只能配「警方表示/說明/提醒/呼籲」這種引述性旁白，且連續使用不要超過 12 秒；"
+        "敘事性旁白（講案發經過）配受訪特寫會顯得畫面空洞，寧可用主體畫面重複或照片\n"
+        "6. ⚠️ 相鄰兩個片段不可取用同一支影片的重疊區間（例如上一段用了 V1 的 1~11 秒，"
+        "下一段就不要再用 V1 的 8~15 秒——觀眾會看到同樣畫面連播兩次）\n"
+        "7. 完全找不到相關畫面的旁白段落：有照片先用照片，真的都沒有才用 \"black\" 補黑幕\n"
+        "8. 單一片段 5~15 秒為佳（少於 4 秒太碎、超過 20 秒太拖）；照片單段 4~8 秒為佳\n"
+        "9. 盡量避免從影片最開頭 0 秒取（常有黑幀/晃動），可從段落起點往後 1~2 秒取\n\n"
         "只回傳 JSON（不含說明）：\n"
         '{"timeline": [\n'
         '  {"video": "V1", "from": 12.0, "dur": 8.0, "why": "嫌犯亮刀對應旁白案發"},\n'
+        '  {"video": "P1", "dur": 6.0, "why": "網傳畫面截圖對應旁白描述"},\n'
         '  {"video": "black", "dur": 5.0, "why": "無對應畫面"}\n'
         "]}"
     )
@@ -646,8 +660,20 @@ def match_narration_to_clips(
         dur = min(dur, total_sec - acc)
 
         vid_id = str(entry.get("video", "black")).strip().upper()
+
+        if vid_id.startswith("P"):
+            try:
+                pi = int(vid_id[1:]) - 1
+                photo_path = photos[pi]["path"]
+                plan.append({"path": None, "photo": photo_path, "start": 0.0,
+                             "dur": round(dur, 2), "why": entry.get("why", "")})
+                acc += dur
+                continue
+            except (ValueError, IndexError, KeyError):
+                pass  # P 編號對不上 → 往下當黑幕處理
+
         if vid_id == "BLACK" or not vid_id.startswith("V"):
-            plan.append({"path": None, "start": 0.0, "dur": dur,
+            plan.append({"path": None, "photo": None, "start": 0.0, "dur": dur,
                          "why": entry.get("why", "")})
             acc += dur
             continue
@@ -656,7 +682,7 @@ def match_narration_to_clips(
             vi = int(vid_id[1:]) - 1
             cat = catalogs[vi]
         except (ValueError, IndexError):
-            plan.append({"path": None, "start": 0.0, "dur": dur,
+            plan.append({"path": None, "photo": None, "start": 0.0, "dur": dur,
                          "why": entry.get("why", "")})
             acc += dur
             continue
@@ -664,18 +690,21 @@ def match_narration_to_clips(
         start = max(0.0, float(entry.get("from", 0) or 0))
         avail = cat["duration"] - start
         if avail <= 0.05:
-            plan.append({"path": None, "start": 0.0, "dur": dur,
+            plan.append({"path": None, "photo": None, "start": 0.0, "dur": dur,
                          "why": entry.get("why", "")})
             acc += dur
             continue
         dur = min(dur, avail)
-        plan.append({"path": cat["path"], "start": round(start, 2),
+        plan.append({"path": cat["path"], "photo": None, "start": round(start, 2),
                      "dur": round(dur, 2), "why": entry.get("why", "")})
         acc += dur
 
     if acc < total_sec - 0.05:
-        plan.append({"path": None, "start": 0.0,
-                     "dur": round(total_sec - acc, 2), "why": "時間軸不足補黑幕"})
+        # 時間軸不足：有照片先拿第一張照片墊，沒有才黑幕
+        filler_photo = photos[0]["path"] if photos else None
+        plan.append({"path": None, "photo": filler_photo, "start": 0.0,
+                     "dur": round(total_sec - acc, 2),
+                     "why": "時間軸不足，" + ("以新聞配圖補足" if filler_photo else "補黑幕")})
 
     return plan, tokens
 
