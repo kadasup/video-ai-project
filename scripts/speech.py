@@ -50,6 +50,7 @@ def transcribe(video: Path) -> dict:
         return cached
 
     result = {"segments": [], "full_text": ""}
+    transcribed_ok = True   # 真的「確認無語音」才快取；轉譯失敗（OOM/磁碟滿等）不快取，下次重試
     if has_speech_energy(video):
         try:
             # 不給 initial_prompt：實測無清楚人聲時 Whisper 會把 prompt 內容
@@ -73,9 +74,10 @@ def transcribe(video: Path) -> dict:
                 segs, full = [], ""   # 太短視同無人聲（噪音/幻覺）
             result = {"segments": segs, "full_text": full}
         except Exception:
-            pass   # 轉譯失敗視同無人聲，不擋主流程
+            transcribed_ok = False   # 轉譯本身失敗（曾見：C 槽空間不足導致模型載入失敗）
 
-    _cache_put("speech1", video, result)
+    if transcribed_ok:
+        _cache_put("speech1", video, result)
     return result
 
 

@@ -70,12 +70,33 @@ def _video_date_folder(name: str) -> str:
     return name[:6] if len(name) >= 6 and name[:6].isdigit() else "misc"
 
 
-def download_photo(url: str, article_no: str) -> str:
+def discover_photos(photo_url: str, max_photos: int = 8) -> list[str]:
+    """
+    LTN 圖檔照編號遞增命名（….../5500760_1_1.jpg → _2_1、_3_1…），
+    API 只回報第一張；用 HEAD 逐號探測抓出同篇全部配圖（不存在回 404 即停）。
+    """
+    m = re.match(r"^(.*_)\d+(_\d+\.[A-Za-z0-9]+)$", photo_url or "")
+    if not m:
+        return [photo_url] if photo_url else []
+    urls = []
+    for i in range(1, max_photos + 1):
+        u = f"{m.group(1)}{i}{m.group(2)}"
+        try:
+            req = urllib.request.Request(u, method="HEAD", headers=_UA)
+            urllib.request.urlopen(req, timeout=10)
+            urls.append(u)
+        except Exception:
+            break
+    return urls or ([photo_url] if photo_url else [])
+
+
+def download_photo(url: str, article_no: str, idx: int = 1) -> str:
     """下載新聞配圖到 input/photos/，回傳本機路徑；已存在就跳過重下"""
     photo_dir = INPUT / "photos"
     photo_dir.mkdir(parents=True, exist_ok=True)
     ext = Path(url.split("?")[0]).suffix or ".jpg"
-    dest = photo_dir / f"photo-{article_no}{ext}"
+    dest = photo_dir / (f"photo-{article_no}{ext}" if idx == 1
+                        else f"photo-{article_no}-{idx}{ext}")
     if not dest.exists():
         req = urllib.request.Request(url, headers=_UA)
         with urllib.request.urlopen(req, timeout=60) as resp:

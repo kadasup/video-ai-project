@@ -20,3 +20,12 @@ if ($ok) {
 Start-Process -FilePath "powershell.exe" `
     -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$proj\scripts\watchdog.ps1`"" `
     -WindowStyle Hidden
+
+# 語意搜尋伺服器（port 5001），沒起來才啟動
+$searchUp = $false
+try {
+    $searchUp = (Invoke-WebRequest "http://localhost:5001/" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200
+} catch {}
+if (-not $searchUp) {
+    Start-Process -FilePath "cmd" -ArgumentList "/c `"$proj\scripts\start_search.bat`"" -WindowStyle Hidden
+}

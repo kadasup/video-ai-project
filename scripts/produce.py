@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -39,7 +40,8 @@ INTRO_PNG = TEMPLATES / "intro.png"    # 片頭圖卡（設計師提供）
 OUTRO_PNG = TEMPLATES / "outro.png"    # 片尾圖卡（設計師提供，靜態圖，次要備援）
 OUTRO_MP4 = TEMPLATES / "shorts片尾.mp4"  # 設計師提供的 shorts 專用動態片尾（已是 1080x1920，優先使用）
 LOGO_PNG  = TEMPLATES / "logo.png"     # 角標（標準命名，找不到時退回下方實際素材）
-BGM_MP3   = TEMPLATES / "bgm.mp3"     # 背景音樂
+BGM_MP3   = TEMPLATES / "bgm.mp3"     # 背景音樂（人工指定單曲，優先於嚴選庫）
+BGM_DIR   = BASE / "assets" / "bgm"   # BGM 嚴選庫（每支隨機選曲，sidechain 閃避旁白）
 FONT_TTF  = TEMPLATES / "font.ttf"    # 字幕字型
 # 沒有設計師素材時，自動用黑底 / 系統字型暫代，流程照跑
 
@@ -56,7 +58,9 @@ W, H       = 1080, 1920
 INTRO_SEC  = 3
 OUTRO_SEC  = 5
 HOOK_SEC   = 2    # hook 文字疊加在主畫面最前幾秒，純畫面文字，不唸出來
-MAIN_SEC   = 60   # 主畫面目標秒數；來源影片不足時後段補黑幕並提醒
+TITLE_SEC  = 3.8  # 標題條疊在主畫面最前幾秒（冷開場取代片頭卡，2026-07 格式改版）
+MAIN_SEC   = 45   # 主畫面目標秒數（研究：敘事型甜蜜點 30~45s，45s 後留存下滑；
+                  # 60s 留給有 SOT+數據卡的大題當上限，不再是預設目標）
 TTS_VOICE  = "zh-TW-HsiaoChenNeural"
 TTS_RATE   = "+8%"    # 新聞播報語速略快於預設，貼近主播腔
 TTS_PITCH  = "+0Hz"
@@ -90,6 +94,77 @@ def apply_pronounce(text: str) -> str:
     for k, v in _load_pronounce_map().items():
         text = text.replace(k, v)
     return text
+
+
+# ── 數字轉中文讀法（只給 TTS 用，字幕照樣顯示阿拉伯數字）────────────────────
+# edge-tts 對阿拉伯數字常逐字唸（760 唸成「七六〇」），轉成中文數字才會唸「七百六十」。
+# 字幕/TTS 字數差由對齊端的比例縮放吸收（跟 apply_pronounce 同一套機制）。
+
+_ZH_DIGITS = "零一二三四五六七八九"
+_HOTLINES = {"110", "119", "113", "165", "1999", "1968", "1995"}
+
+
+def _int_to_zh(s: str) -> str:
+    """整數 → 中文讀法（到億；零插入、十四不唸一十四、兩百/兩千慣用）"""
+    n = int(s)
+    if n == 0:
+        return "零"
+    units4 = ["", "萬", "億", "兆"]
+    parts = []
+    gi = 0
+    while n > 0:
+        parts.append((n % 10000, units4[gi]))
+        n //= 10000
+        gi += 1
+    out = ""
+    need_zero = False
+    for val, unit in reversed(parts):
+        if val == 0:
+            need_zero = bool(out)
+            continue
+        seg = ""
+        u = ["", "十", "百", "千"]
+        digs = [int(c) for c in str(val)]
+        ln = len(digs)
+        for i, dg in enumerate(digs):
+            pos = ln - 1 - i
+            if dg == 0:
+                if seg and not seg.endswith("零") and pos > 0 and any(digs[i + 1:]):
+                    seg += "零"
+                continue
+            seg += _ZH_DIGITS[dg] + u[pos]
+        if out and (need_zero or ln < 4):
+            out += "零"
+        out += seg + unit
+        need_zero = False
+    out = re.sub(r"^一十", "十", out)                      # 14 → 十四
+    out = re.sub(r"(^|零)二(百|千|萬|億)", r"\g<1>兩\g<2>", out)   # 慣用：兩百/兩千/兩萬
+    return out
+
+
+def _digits_to_zh(s: str) -> str:
+    """逐字唸（年份/專線/長號碼）：2026 → 二零二六"""
+    return "".join(_ZH_DIGITS[int(c)] for c in s)
+
+
+def num2zh(text: str) -> str:
+    """把文中的阿拉伯數字換成中文讀法。規則：
+    百分比 → 百分之N；4 位數+年 → 逐字唸；報案/服務專線與 7 位以上長號碼 → 逐字唸；
+    小數 → 整數部分讀量值＋點＋逐字；其餘一律讀量值（760 → 七百六十）。"""
+    def _num(m: re.Match) -> str:
+        s = m.group(0)
+        tail = text[m.end(): m.end() + 1]
+        if len(s) == 4 and tail == "年":
+            return _digits_to_zh(s)
+        if s in _HOTLINES or len(s) >= 7:
+            return _digits_to_zh(s)
+        if "." in s:
+            a, b = s.split(".", 1)
+            return _int_to_zh(a) + "點" + _digits_to_zh(b)
+        return _int_to_zh(s)
+
+    text = re.sub(r"(\d+(?:\.\d+)?)\s*[%％]", lambda m: "百分之" + num2zh(m.group(1)), text)
+    return re.sub(r"\d+(?:\.\d+)?", _num, text)
 
 def _client() -> AzureOpenAI:
     """延遲建立 AzureOpenAI client，讀 D:\\VideoAI\\.env 的設定"""
@@ -130,7 +205,7 @@ def _chunk_narration(text: str, max_len: int = 16) -> list[str]:
         if len(clause) <= max_len:
             chunks.append(clause)
         else:
-            chunks.extend(clause[i:i + max_len] for i in range(0, len(clause), max_len))
+            chunks.extend(_split_long_clause(clause, max_len))
 
     # 太短的片段（<4字）併回前一句，避免出現孤零零一兩個字的字幕
     merged: list[str] = []
@@ -140,6 +215,88 @@ def _chunk_narration(text: str, max_len: int = 16) -> list[str]:
         else:
             merged.append(c)
     return merged
+
+
+_OPENCC_T2S = None
+_USERDICT_LOADED = False
+USERDICT_FILE = BASE / "assets" / "jieba_userdict.txt"
+
+
+def _load_userdict():
+    """自訂詞典：報社/新聞常用詞遇到斷錯，往 assets/jieba_userdict.txt 加一行即修
+    （寫繁體即可，載入時自動轉簡體餵給 jieba）"""
+    global _USERDICT_LOADED
+    if _USERDICT_LOADED:
+        return
+    _USERDICT_LOADED = True
+    try:
+        import jieba
+        for line in USERDICT_FILE.read_text(encoding="utf-8").splitlines():
+            w = line.strip()
+            if w and not w.startswith("#"):
+                jieba.add_word(_OPENCC_T2S.convert(w) if _OPENCC_T2S else w)
+    except Exception:
+        pass
+
+
+def _seg_words(text: str) -> list[str] | None:
+    """
+    結巴斷詞（回傳原文的逐詞切分）。jieba 預設詞典是簡體，直接斷繁體會把
+    「董事長」切成「董事/長」（實測翻車）——先繁→簡（OpenCC，字數 1:1）再斷，
+    詞長映射回原文。不可用時回 None，呼叫端自行退回硬切。
+    """
+    global _OPENCC_T2S
+    try:
+        import jieba
+        if _OPENCC_T2S is None:
+            from opencc import OpenCC
+            _OPENCC_T2S = OpenCC("t2s")
+        _load_userdict()
+        simp = _OPENCC_T2S.convert(text)
+        if len(simp) != len(text):   # 極少數一對多轉換，位置對不上就直接斷原文
+            simp = text
+        out, pos = [], 0
+        for w in jieba.cut(simp):
+            out.append(text[pos:pos + len(w)])
+            pos += len(w)
+        # 數字/序數詞跟後面的詞黏著成一個單位（第二+航廈、760+架次）——
+        # 這種組合被拆開跨卡/跨行會很難讀（「…前往第二 ‖ 航廈車道…」）
+        glued: list[str] = []
+        numish = re.compile(r"第?[0-9０-９零一二兩三四五六七八九十百千]+$")
+        for w in out:
+            if glued and numish.fullmatch(glued[-1]):
+                glued[-1] += w
+            else:
+                glued.append(w)
+        return glued
+    except Exception:
+        return None
+
+
+def _split_long_clause(clause: str, max_len: int) -> list[str]:
+    """
+    超長分句（GPT 沒下標點）照結巴詞界打包切卡，寧可卡短也不切開詞
+    （實測踩過：「車道入口」被切成上一卡尾「…車」、下一卡頭「道入口與行李區」）。
+    jieba 不可用時退回字數硬切。
+    """
+    words = _seg_words(clause)
+    if words is None:
+        return [clause[i:i + max_len] for i in range(0, len(clause), max_len)]
+    out, cur = [], ""
+    for w in words:
+        if len(w) > max_len:            # 單詞比上限還長（幾乎不可能），退回硬切
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.extend(w[i:i + max_len] for i in range(0, len(w), max_len))
+            continue
+        if cur and len(cur) + len(w) > max_len:
+            out.append(cur)
+            cur = ""
+        cur += w
+    if cur:
+        out.append(cur)
+    return out
 
 
 def _build_subtitles(narration: str) -> list[dict]:
@@ -192,9 +349,11 @@ def generate_script(article: str, footage_notes: str | None = None,
 {interview_notes}
 
 ⚠️ SOT（受訪原音）安排規則——電視新聞的標準做法是「旁白與受訪原音交替」：
-- 若逐字稿裡有一段適合直接讓當事人/警方「自己講」的話（完整、切題、5~15 秒），
-  安排一段 SOT：在輸出 JSON 加 "sots" 欄位（見格式）。最多安排 1 段，寧缺勿濫；
+- 若逐字稿裡有適合直接讓當事人/警方「自己講」的話（完整、切題、5~15 秒），
+  安排 SOT：在輸出 JSON 加 "sots" 欄位（見格式）。**最多 2 段**，寧缺勿濫；
   逐字稿內容破碎、離題或品質差就不要安排（"sots" 給空陣列）
+- 安排 2 段時：兩段要講**不同重點**（例：一段講經過、一段講後續處理），
+  不要選內容重疊的兩段；兩段合計不超過 22 秒；after_sentence 必須遞增（前後有旁白隔開最好）
 - "quote" 必須從上面逐字稿**一字不差**複製（含錯字也照抄，程式要靠它對回時間軸）；
   "display" 是給觀眾看的字幕版本：把 quote 的同音錯字對照新聞稿改正、轉繁體、
   但不增刪語句結構
@@ -202,7 +361,10 @@ def generate_script(article: str, footage_notes: str | None = None,
   插入點要順：通常放在旁白講完「誰說了什麼」的引導句之後（例：旁白「警方表示」→ SOT 原音）
 - ⚠️ 旁白不要複述 SOT 裡講的內容（會重複）；旁白負責敘事，細節讓原音自己講
 - ⚠️ 安排 SOT 時，旁白字數上限要扣掉原音時間：SOT 每秒約佔 4.3 字的額度
-  （例：安排 10 秒 SOT，旁白就寫 {int(MAIN_SEC * 4.2)} 減 43 字左右）
+  （例：安排 10 秒 SOT，旁白就寫 {int(MAIN_SEC * 4.2)} 減 43 字左右；兩段就扣兩段的秒數）
+- "speaker_name"/"speaker_title"（受訪者名條）：**只在新聞稿能明確判斷這段原音是誰講的**
+  才填（例：稿裡寫「桃機公司代理董事長楊○○表示…」且原音內容與其發言吻合）。
+  名字職稱照新聞稿用字。**不確定是誰講的就兩個都給空字串——名條掛錯人是重大事故，寧缺勿濫**
 """
 
     prompt = f"""你是台灣電視新聞影音編輯。根據以下新聞稿，產出一支 {MAIN_SEC} 秒短影音的播報腳本。
@@ -221,10 +383,25 @@ def generate_script(article: str, footage_notes: str | None = None,
     {{"sentences": 2, "desc": "警方調閱監視器追查"}}
   ],
   "sots": [
-    {{"video": "V2", "quote": "從逐字稿一字不差複製的原句", "display": "校正後的繁體字幕版", "after_sentence": 3}}
-  ]
+    {{"video": "V2", "quote": "從逐字稿一字不差複製的原句", "display": "校正後的繁體字幕版",
+      "after_sentence": 3, "speaker_name": "楊○○", "speaker_title": "桃機公司代理董事長"}}
+  ],
+  "stat": {{"value": "760", "unit": "架次", "label": "航班取消", "note": "颱風影響桃園機場"}},
+  "highlights": ["760架次", "全數取消", "陳彥伯"]
 }}
 （沒有受訪逐字稿、或沒有適合的原音時，"sots" 給空陣列 []）
+
+"stat"（數據動態字卡）規則：
+- 只在新聞裡有「一個」具衝擊力的關鍵數字時才給（金額、人數、次數、百分比等），
+  成片會在旁白唸到它時插入 2.8 秒的動態數字卡強化記憶點
+- value 必須是阿拉伯數字（可含小數點），且**旁白裡要用同樣的阿拉伯數字寫法**唸出這個數字
+  （程式靠字面比對找插卡時間點）；label 6 字內；note 12 字內可省略
+- 沒有適合的數字、或數字不是新聞重點時，"stat" 給 null，寧缺勿濫
+
+"highlights"（字幕關鍵詞標色）規則：
+- 從旁白挑 3~6 個「觀眾掃一眼就該抓到」的詞：關鍵數字含單位、人名、地名、罪名、
+  關鍵動作（例：肇事逃逸、全數取消）。字幕會把這些詞標成金黃色
+- 每個詞 2~6 字、**必須與旁白字面完全一致**（程式靠字面比對上色）；沒有就給空陣列
 
 hook／hashtag 規則：
 - hook 是給演算法用的「前 2 秒留人」鉤子，跟 title（片頭卡的正式標題）分開寫、語氣可以比 title 更直白聳動，
@@ -305,6 +482,8 @@ def shorten_script(script: dict, max_chars: int) -> tuple[dict, dict]:
 - 旁白正文不能出現「畫面中」「這段影像」「另一段影像可以看到」這種解說詞
 - 若原腳本有 "sots"（受訪原音安排），原樣保留不要改；但 after_sentence 要對應
   縮寫後新旁白的句子位置，必要時調整這個數字（quote/display 不動）
+- 若原腳本有 "stat"（數據卡），原樣保留；縮寫後的旁白仍要用同樣的阿拉伯數字寫法唸到該數字
+- 若原腳本有 "highlights"，保留仍出現在縮寫後旁白裡的詞（字面一致），被縮掉的詞移除
 
 原腳本：
 {json.dumps(script, ensure_ascii=False)}
@@ -329,6 +508,83 @@ hook 跟 hashtags 原樣保留不用重寫。"""
     data = json.loads(resp.choices[0].message.content)
     data["subtitles"] = _build_subtitles(data["narration"])
     return data, usage
+
+
+def dedup_narration_vs_sots(narration: str,
+                            sot_texts: list[str]) -> tuple[str, list[int], dict]:
+    """
+    旁白 vs 受訪原音（SOT）內容去重：實測 GPT 寫稿常犯「旁白先講一遍取消班次數字、
+    原音又講一遍」。有重複時把該資訊留給原音講、重寫旁白（重複句改成引導句或刪除），
+    並回傳每段原音改寫後的插入句位。回 (narration, after_sentences, tokens)。
+    """
+    sots_block = "\n".join(f"原音{i+1}：「{t}」" for i, t in enumerate(sot_texts))
+    prompt = (
+        "你是電視新聞編審。成片會在旁白中插入受訪原音（SOT），內容如下：\n"
+        f"{sots_block}\n\n"
+        f"旁白全文：\n{narration}\n\n"
+        "請檢查旁白是否有句子「複述了原音要講的資訊」（同樣的數字、同一件事的細節）。\n"
+        "- 有重複：把該資訊留給原音講——旁白的重複句改成不含該細節的引導句"
+        "（例：「至於取消的班次數量，聽聽桃機公司怎麼說」的語感，但要自然）或直接刪除；"
+        "其餘句子一字不動\n"
+        "- 沒重複：narration 原樣回傳、changed 給 false\n"
+        "- 同時給每段原音應插在（改寫後）旁白第幾句之後 after_sentence"
+        "（句以句號/驚嘆號/問號計、1-based；引導句之後就是原音的最佳位置）\n\n"
+        '回傳 JSON：{"changed": true/false, "narration": "改寫後全文", '
+        '"after_sentences": [3]}'
+    )
+    resp = _client().chat.completions.create(
+        model=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2"),
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        max_completion_tokens=1500,
+    )
+    data = json.loads(resp.choices[0].message.content)
+    usage = {}
+    if resp.usage:
+        usage = {"prompt_tokens": resp.usage.prompt_tokens,
+                 "completion_tokens": resp.usage.completion_tokens,
+                 "total_tokens": resp.usage.total_tokens}
+    if not data.get("changed"):
+        return narration, [], usage
+    new_nar = (data.get("narration") or "").strip()
+    afters = [int(x) for x in (data.get("after_sentences") or []) if str(x).isdigit()]
+    if len(new_nar) < 30:   # 改寫結果異常短，視同失敗、用原稿
+        return narration, [], usage
+    return new_nar, afters, usage
+
+
+def extract_stat(narration: str) -> tuple[dict | None, dict]:
+    """
+    數據卡補判：generate_script 對 stat 的判斷不穩定（同一篇稿有時給有時不給），
+    旁白裡明明有數字時再單獨判一次，讓數據卡穩定出現。回傳 (stat|None, tokens)。
+    """
+    prompt = (
+        "你是新聞影音編輯。以下旁白若有「一個」最具衝擊力的關鍵數字，適合做 2.8 秒的"
+        "動態數字卡強化記憶點（金額、人數、架次、百分比等，且必須是這則新聞的重點數字），"
+        "請挑出來。\n"
+        "- value 必須跟旁白裡的阿拉伯數字寫法完全一致（程式靠字面比對找插卡時間）\n"
+        "- label 6 字內、note 12 字內（note 可省略）\n"
+        "- 旁白沒有數字、或數字都不是重點時回 null，寧缺勿濫\n\n"
+        f"旁白：{narration}\n\n"
+        '回傳 JSON：{"stat": {"value": "760", "unit": "架次", "label": "航班取消", '
+        '"note": "颱風影響桃園機場"}} 或 {"stat": null}'
+    )
+    resp = _client().chat.completions.create(
+        model=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2"),
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        max_completion_tokens=200,
+    )
+    data = json.loads(resp.choices[0].message.content)
+    usage = {}
+    if resp.usage:
+        usage = {"prompt_tokens": resp.usage.prompt_tokens,
+                 "completion_tokens": resp.usage.completion_tokens,
+                 "total_tokens": resp.usage.total_tokens}
+    stat = data.get("stat")
+    if isinstance(stat, dict) and str(stat.get("value", "")).strip():
+        return stat, usage
+    return None, usage
 
 
 def factcheck_narration(article: str, narration: str) -> tuple[list[dict], list[dict], dict]:
@@ -409,7 +665,7 @@ async def _tts_async(text: str, path: Path, voice: str, rate: str, pitch: str) -
     回傳 boundaries 供字幕逐字對齊。offset/duration 單位是 100ns ticks。
     edge-tts 免費服務偶爾會暫時性失敗（如 'No audio was received'），重試 3 次再放棄。
     """
-    tts_text = apply_pronounce(text)   # 專有名詞發音修正（字幕不受影響）
+    tts_text = num2zh(apply_pronounce(text))   # 發音修正＋數字轉中文讀法（字幕不受影響）
     last_err = None
     for attempt in range(3):
         boundaries: list[dict] = []
@@ -492,7 +748,7 @@ def align_subtitles_to_boundaries(subtitles: list, boundaries: list) -> list:
 
     chars = _flatten_boundaries_to_chars(boundaries)
     total_bnd = len(chars)
-    total_sub = sum(len(_clean(apply_pronounce(s["text"]))) for s in subtitles)
+    total_sub = sum(len(_clean(num2zh(apply_pronounce(s["text"])))) for s in subtitles)
     if total_sub == 0 or total_bnd == 0:
         return []
     ratio = total_bnd / total_sub
@@ -501,7 +757,7 @@ def align_subtitles_to_boundaries(subtitles: list, boundaries: list) -> list:
     ci = 0.0        # 累計「應該」消耗到第幾個字元（浮點，不提前 round）
     consumed = 0
     for sub in subtitles:
-        need_len = len(_clean(apply_pronounce(sub["text"])))
+        need_len = len(_clean(num2zh(apply_pronounce(sub["text"]))))
         if need_len == 0:
             continue
         ci += need_len * ratio
@@ -613,7 +869,7 @@ def align_segments_to_boundaries(narration: str, segments: list, boundaries: lis
 
     chars = _flatten_boundaries_to_chars(boundaries)
     total_bnd = len(chars)
-    total_text = sum(len(_clean(apply_pronounce(s))) for s in sentences)
+    total_text = sum(len(_clean(num2zh(apply_pronounce(s)))) for s in sentences)
     if total_bnd == 0 or total_text == 0:
         return []
     ratio = total_bnd / total_text
@@ -639,7 +895,7 @@ def align_segments_to_boundaries(narration: str, segments: list, boundaries: lis
         n = min(n, remaining)
         chunk = sentences[si: si + n]
         si += n
-        seg_len = sum(len(_clean(apply_pronounce(s))) for s in chunk)
+        seg_len = sum(len(_clean(num2zh(apply_pronounce(s)))) for s in chunk)
         running += seg_len * ratio
         target = min(total_bnd, round(running))
         take = max(1, target - consumed)
@@ -716,7 +972,7 @@ def _srt_time_to_ass(t: str) -> str:
     return f"{int(h)}:{m}:{s}.{centis:02d}"
 
 
-def write_ass(subtitles: list, path: Path) -> Path:
+def write_ass(subtitles: list, path: Path, highlights: list | None = None) -> Path:
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {W}
@@ -726,6 +982,7 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Default,Microsoft JhengHei,84,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,3,1,2,20,20,280,1
+Style: Strap,Microsoft JhengHei,50,&H00FFFFFF,&H000000FF,&H99000000,&H99000000,1,0,0,0,100,100,0,0,3,10,0,1,36,36,600,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"""
@@ -745,20 +1002,99 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
         text = re.sub(f"[{re.escape(_PUNCT)}]+", " ", text)
         return re.sub(r"\s+", " ", text).strip()
 
+    # 斷行語感：只在「詞的邊界」斷（結巴斷詞），介詞後面優先、數字絕不拆；
+    # 盲目對半剁會把人名/地名切成兩行（實測：「…董事長陳／彥伯到…」「桃／園機場」）
+    _BREAK_AFTER = set("的了到在與和及或並把被讓向從對為於是等後前中內外")
+
+    def _word_bounds(text: str) -> set:
+        """結巴斷詞的詞界位置集合（可斷點）；斷詞不可用時回 None 退回純規則"""
+        words = _seg_words(text)
+        if words is None:
+            return None
+        bounds, pos = set(), 0
+        for w in words:
+            pos += len(w)
+            bounds.add(pos)
+        return bounds
+
     def _wrap(text: str) -> str:
         if len(text) <= MAX_CHARS:
             return text
-        mid = (len(text) + 1) // 2  # 對半斷，兩行都不超過上限（字幕最長 ~24 字）
-        return text[:mid] + "\\N" + text[mid:]
+        n = len(text)
+        mid = (n + 1) // 2
+        lo, hi = max(2, n - MAX_CHARS), min(n - 2, MAX_CHARS)
+        bounds = _word_bounds(text)
+        best_j, best_score = mid, -99.0
+        for j in range(lo, hi + 1):
+            score = -abs(j - mid) * 0.6          # 越接近對半越好（兩行平衡）
+            prev, nxt = text[j - 1], text[j]
+            if bounds is not None:
+                score += 2.5 if j in bounds else -2.5   # 詞界可斷、詞中間重罰
+            if prev == " ":
+                score += 4                        # 原本的標點位置（_display 換成空格）最優先
+            elif prev in _BREAK_AFTER:
+                score += 2                        # 介詞/連接詞後面是自然停頓
+            if nxt in _BREAK_AFTER:
+                score -= 2                        # 下一行用「的/了…」開頭很難讀
+            if prev.isdigit() and nxt.isdigit():
+                score -= 5                        # 數字絕不能拆（760 → 7／60）
+            if score > best_score:
+                best_score, best_j = score, j
+        a, b = text[:best_j].rstrip(), text[best_j:].lstrip()
+        return a + "\\N" + b
+
+    # ── 關鍵字標色（B 檔）：GPT 標的重點詞＋所有數字上金黃色（台灣新聞字幕慣例），
+    #    字卡本身維持靜態不跳動，專業感不變、重點一眼可抓
+    _HL_TERMS = [h.strip() for h in (highlights or []) if h and len(h.strip()) >= 2]
+    _NUM_RE = re.compile(
+        r"\d+(?:\.\d+)?[%％]?"
+        r"(?:架次|人次|毫米|公里|公尺|億|萬|元|人|架|次|件|戶|棟|歲|度|時|分|秒|年|月|日|天|級)?")
+    _YEL = r"{\1c&H00D7FF&}"   # 金黃（ASS 是 BGR）
+    _WHI = r"{\1c&HFFFFFF&}"
+
+    def _colorize(line: str) -> str:
+        spans = []
+        for t in _HL_TERMS:
+            i = 0
+            while True:
+                i = line.find(t, i)
+                if i < 0:
+                    break
+                spans.append((i, i + len(t)))
+                i += len(t)
+        for m in _NUM_RE.finditer(line):
+            spans.append((m.start(), m.end()))
+        if not spans:
+            return line
+        spans.sort()
+        merged = []
+        for st_, en_ in spans:
+            if merged and st_ <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(en_, merged[-1][1]))
+            else:
+                merged.append((st_, en_))
+        out, pos = [], 0
+        for st_, en_ in merged:
+            out.append(line[pos:st_])
+            out.append(_YEL + line[st_:en_] + _WHI)
+            pos = en_
+        out.append(line[pos:])
+        return "".join(out)
 
     lines = [header]
     for s in subtitles:
+        start = _srt_time_to_ass(s["start"])
+        end = _srt_time_to_ass(s["end"])
+        if s.get("style") == "strap":
+            # 受訪者名條（SOT lower-third）：左下半透明底框、不去標點不斷行
+            lines.append(f"Dialogue: 1,{start},{end},Strap,,0,0,0,,{s['text']}")
+            continue
         disp = _display(s["text"])
         if not disp:
             continue   # 整句只剩標點（理論上不會發生），跳過
-        start = _srt_time_to_ass(s["start"])
-        end = _srt_time_to_ass(s["end"])
-        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{_wrap(disp)}")
+        # 先斷行再逐行上色（色碼標籤不能被斷行邏輯當成字數）
+        wrapped = "\\N".join(_colorize(seg) for seg in _wrap(disp).split("\\N"))
+        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{wrapped}")
 
     path.write_text("\n".join(lines), encoding="utf-8-sig")
     return path
@@ -902,6 +1238,33 @@ def _hook_filter(hook: str | None) -> str:
     )
 
 
+def _title_filter(title: str | None) -> str:
+    """
+    冷開場的標題條：疊在主畫面最前 TITLE_SEC 秒（取代舊 3 秒片頭卡——
+    研究指出 50~60% 流失發生在前 3 秒，片頭卡正好燒掉最貴的時段）。
+    位置在 hook 上方，字級略小，一起構成開場資訊組。
+    """
+    if not title:
+        return ""
+    text = title.replace("'", "\\'").replace(":", "\\:")
+    fp = font_path()
+    font_arg = f":fontfile='{fp}'" if fp else ""
+    return (
+        f"drawtext=text='{text}'{font_arg}:fontsize=46:fontcolor=white"
+        f":x=(w-text_w)/2:y=180:shadowcolor=black:shadowx=2:shadowy=2"
+        f":box=1:boxcolor=black@0.55:boxborderw=16"
+        f":enable='between(t,0,{TITLE_SEC})'"
+    )
+
+
+def _ai_label_filter() -> str:
+    """AI 協作標示（NCC 廣電 AI 製播指引：AI 參與需標示），全片左上角小字"""
+    fp = font_path()
+    font_arg = f":fontfile='{fp}'" if fp else ""
+    return (f"drawtext=text='AI協作製作'{font_arg}:fontsize=26"
+            f":fontcolor=white@0.55:x=30:y=66")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 4b：主畫面
 # ─────────────────────────────────────────────────────────────────────────────
@@ -913,14 +1276,38 @@ def _sub_filter(srt: Path) -> str:
     return f"subtitles='{srt_esc}':force_style='{style}'" if style else f"subtitles='{srt_esc}'"
 
 
-def _mix_audio(tts: Path, audio_out: Path, main_sec: float):
-    """TTS + BGM 混音（無 BGM 時只轉檔），長度切齊 main_sec"""
+def _pick_bgm() -> Path | None:
+    """選 BGM：templates/bgm.mp3（人工指定曲）優先；否則從 assets/bgm 嚴選庫隨機。
+    嚴選庫是從報社 templates/背景mp3（56 首曲風很雜）挑出的新聞/紀實氛圍曲，
+    要增減曲目直接對 assets/bgm 加刪檔案即可。"""
     if BGM_MP3.exists():
+        return BGM_MP3
+    try:
+        tracks = sorted(BGM_DIR.glob("*.mp3")) + sorted(BGM_DIR.glob("*.m4a"))
+    except OSError:
+        tracks = []
+    return random.choice(tracks) if tracks else None
+
+
+def _mix_audio(tts: Path, audio_out: Path, main_sec: float):
+    """
+    TTS + BGM 混音，長度切齊 main_sec，結尾 1 秒淡出。
+    BGM 走 sidechain 閃避：旁白/受訪原音出聲時自動壓低、空隙時浮上來，
+    不再是整條固定音量硬墊。無 BGM 時只轉檔（行為與過去一致）。
+    """
+    bgm = _pick_bgm()
+    if bgm:
+        fade_st = max(0.0, float(main_sec) - 1.0)
         ff(
             "-i", tts,
-            "-stream_loop", "-1", "-i", BGM_MP3,
+            "-stream_loop", "-1", "-i", bgm,
             "-filter_complex",
-            "[0:a]volume=1.0[tts];[1:a]volume=0.08[bgm];[tts][bgm]amix=inputs=2:duration=first[a]",
+            "[0:a]asplit=2[n1][n2];"
+            "[1:a]volume=0.32,aformat=sample_rates=44100:channel_layouts=stereo[bg];"
+            "[bg][n1]sidechaincompress=threshold=0.02:ratio=14:attack=60:release=700[duck];"
+            # amix 實測仍會把輸出壓 -3dB（normalize=0 也一樣），volume 補償回原響度
+            f"[n2][duck]amix=inputs=2:duration=first:normalize=0,volume=3dB,"
+            f"afade=t=out:st={fade_st:.2f}:d=1[a]",
             "-map", "[a]", "-t", main_sec,
             "-c:a", "aac", "-ar", "44100", "-ac", "2",
             audio_out
@@ -934,7 +1321,8 @@ def _mix_audio(tts: Path, audio_out: Path, main_sec: float):
 
 
 def make_main(tts: Path, srt: Path, sources: list[dict] | None = None,
-              main_sec: float = MAIN_SEC, hook: str | None = None) -> tuple[Path, dict]:
+              main_sec: float = MAIN_SEC, hook: str | None = None,
+              title: str | None = None) -> tuple[Path, dict]:
     """
     sources: [{"path": "...", "start": 12.0}, ...] 依序使用，不足 main_sec 秒的部分自動補黑幕。
              傳 None 或空 list = 全黑幕（測試流程）。
@@ -980,7 +1368,7 @@ def make_main(tts: Path, srt: Path, sources: list[dict] | None = None,
         plan.append({"path": None, "start": 0, "dur": remaining})
 
     length_info = _plan_length_info(plan, main_sec)
-    _assemble_main(plan, audio_out, sub_f, out, main_sec, hook=hook)
+    _assemble_main(plan, audio_out, sub_f, out, main_sec, hook=hook, title=title)
     return out, length_info
 
 
@@ -1006,17 +1394,58 @@ def _photo_clip(photo: Path, dur: float, out: Path):
     )
 
 
+def make_strap_png(name: str, title: str, out: Path) -> Path:
+    """
+    受訪者名條圖卡（SOT lower-third）：深藍圓角底＋亮藍色邊條，
+    姓名粗體大字、職稱小字同行。輸出帶透明背景的 PNG，寬度依文字自動。
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    name = (name or "").strip()
+    title = (title or "").strip()
+    f_name  = ImageFont.truetype(r"C:\Windows\Fonts\msjhbd.ttc", 58)
+    f_title = ImageFont.truetype(r"C:\Windows\Fonts\msjh.ttc", 38)
+
+    pad_x, gap = 34, 26
+    accent_w = 10
+    h = 104
+    w_name  = int(f_name.getlength(name)) if name else 0
+    w_title = int(f_title.getlength(title)) if title else 0
+    w = accent_w + pad_x + w_name + (gap + w_title if title else 0) + pad_x
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    # 底：深藍半透明圓角；左緣亮藍 accent 條
+    d.rounded_rectangle([0, 0, w - 1, h - 1], radius=14, fill=(10, 27, 51, 225))
+    d.rounded_rectangle([0, 0, accent_w + 14, h - 1], radius=14, fill=(46, 139, 255, 255))
+    d.rectangle([accent_w + 4, 0, accent_w + 14, h - 1], fill=(10, 27, 51, 225))
+
+    x = accent_w + pad_x
+    if name:
+        d.text((x, h // 2), name, font=f_name, fill=(255, 255, 255, 255), anchor="lm")
+        x += w_name + gap
+    if title:
+        d.text((x, h // 2 + 6), title, font=f_title, fill=(159, 193, 255, 255), anchor="lm")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out)
+    return out
+
+
 def make_main_plan(tts: Path, srt: Path, plan: list[dict],
-                   main_sec: float = MAIN_SEC, hook: str | None = None) -> tuple[Path, dict]:
+                   main_sec: float = MAIN_SEC, hook: str | None = None,
+                   straps: list[dict] | None = None,
+                   draft: bool = False, title: str | None = None) -> tuple[Path, dict]:
     """
     依智慧配對產生的時間軸組裝主畫面。
     plan: [{"path": str|None, "photo": str|None, "start": float, "dur": float}, ...]
           path=None 且 photo=None 代表該段配不到畫面、用黑幕。
           photo 有值代表該段用新聞照片（轉成 Ken Burns 片段）。
     hook: 疊在最前 HOOK_SEC 秒畫面上的純文字鉤子，不影響旁白/字幕。
+    draft: 快速預覽模式（480p＋ultrafast），檔名分開、不干擾正式渲染。
     """
-    out       = TMP / "main.mp4"
-    audio_out = TMP / "audio.aac"
+    out       = TMP / ("draft_main.mp4" if draft else "main.mp4")
+    audio_out = TMP / ("draft_audio.aac" if draft else "audio.aac")
     sub_f = _sub_filter(srt)
     _mix_audio(tts, audio_out, main_sec)
 
@@ -1030,13 +1459,15 @@ def make_main_plan(tts: Path, srt: Path, plan: list[dict],
                               "start": float(e.get("start", 0) or 0), "dur": dur,
                               "subject_pos": e.get("subject_pos", "")})
         elif e.get("photo") and Path(e["photo"]).exists():
-            clip = TMP / f"_photo_seg{i}.mp4"
+            # draft 版檔名分開：預覽渲染中途按下正式渲染也不會互寫同一檔
+            clip = TMP / f"_photo_seg{'d' if draft else ''}{i}.mp4"
             _photo_clip(Path(e["photo"]), dur, clip)
             norm_plan.append({"path": clip, "start": 0.0, "dur": dur})
         else:
             norm_plan.append({"path": None, "start": 0.0, "dur": dur})
     length_info = _plan_length_info(norm_plan, main_sec)
-    _assemble_main(norm_plan, audio_out, sub_f, out, main_sec, hook=hook)
+    _assemble_main(norm_plan, audio_out, sub_f, out, main_sec, hook=hook,
+                   straps=straps, draft=draft, title=title)
     return out, length_info
 
 
@@ -1063,8 +1494,13 @@ def _crop_scale(subject_pos: str = "") -> str:
 
 
 def _assemble_main(plan: list[dict], audio_out: Path, sub_f: str, out: Path,
-                   main_sec: float = MAIN_SEC, hook: str | None = None):
-    """把 plan 的片段（影片/黑幕交錯皆可）串接 → 疊 hook → 上字幕 → 疊角標 → 混音輸出"""
+                   main_sec: float = MAIN_SEC, hook: str | None = None,
+                   straps: list[dict] | None = None, draft: bool = False,
+                   title: str | None = None):
+    """把 plan 的片段（影片/黑幕交錯皆可）串接 → 疊 hook → 上字幕 → 疊角標
+    → 疊受訪者名條（straps: [{png,start,end}]，SOT 時段顯示）→ 混音輸出。
+    draft=True 是分鏡站的快速預覽：內容完全相同（字幕/名條/數據卡/BGM 都在），
+    只是縮到 480p＋最快編碼檔位，十幾秒可出——正式渲染不受影響。"""
     logo_path = resolve_logo_path()
     has_logo  = logo_path is not None
 
@@ -1094,25 +1530,47 @@ def _assemble_main(plan: list[dict], audio_out: Path, sub_f: str, out: Path,
     filter_parts.append("".join(seg_labels) + f"concat=n={len(seg_labels)}:v=1:a=0[vraw]")
 
     base_label = "vraw"
-    hook_f = _hook_filter(hook)
-    if hook_f:
-        filter_parts.append(f"[vraw]{hook_f}[vhk]")
+    # 冷開場：標題條＋Hook 疊在主畫面最前幾秒（取代舊 3 秒片頭卡）
+    open_f = ",".join(f for f in (_title_filter(title), _hook_filter(hook)) if f)
+    if open_f:
+        filter_parts.append(f"[vraw]{open_f}[vhk]")
         base_label = "vhk"
 
+    ai_f = _ai_label_filter()
     if has_logo:
         logo_idx = idx
         args += ["-i", str(logo_path)]
         idx += 1
-        filter_parts.append(f"[{base_label}]{sub_f}[vs]")
-        filter_parts.append(f"[vs][{logo_idx}:v]overlay=main_w-overlay_w-30:60[vout]")
+        filter_parts.append(f"[{base_label}]{sub_f},{ai_f}[vs]")
+        filter_parts.append(f"[vs][{logo_idx}:v]overlay=main_w-overlay_w-30:60[vlg]")
+        cur = "vlg"
     else:
-        filter_parts.append(f"[{base_label}]{sub_f}[vout]")
+        filter_parts.append(f"[{base_label}]{sub_f},{ai_f}[vlg]")
+        cur = "vlg"
 
+    # 受訪者名條：SOT 時段疊在左下（字幕帶上方），時間窗控制顯示
+    for si, stp in enumerate(straps or []):
+        if not Path(stp["png"]).exists():
+            continue
+        strap_idx = idx
+        args += ["-i", str(stp["png"])]
+        idx += 1
+        filter_parts.append(
+            f"[{cur}][{strap_idx}:v]overlay=40:main_h-overlay_h-600"
+            f":enable='between(t,{stp['start']},{stp['end']})'[vst{si}]")
+        cur = f"vst{si}"
+    if draft:   # 預覽：全部效果照舊疊完，最後縮到 480p，用最快檔位編碼
+        filter_parts.append(f"[{cur}]scale=480:-2[vout]")
+    else:
+        filter_parts.append(f"[{cur}]null[vout]")
+
+    enc = (["-preset", "ultrafast", "-crf", "32", "-r", "24"]
+           if draft else ["-r", "30"])
     ff(
         *args,
         "-filter_complex", ";".join(filter_parts),
         "-map", "[vout]", "-map", f"{audio_idx}:a",
-        "-t", main_sec, "-r", "30", "-pix_fmt", "yuv420p",
+        "-t", main_sec, *enc, "-pix_fmt", "yuv420p",
         "-c:v", "libx264", "-c:a", "copy",
         out
     )
@@ -1130,7 +1588,8 @@ def make_outro() -> Path:
     """
     out = TMP / "outro.mp4"
     if OUTRO_MP4.exists():
-        dur = _probe_duration(OUTRO_MP4)
+        # 片尾是第二大流失點，壓到 2.8 秒內（取設計片尾的前段）
+        dur = min(_probe_duration(OUTRO_MP4), 2.8)
         ff(
             "-i", OUTRO_MP4,
             "-vf", f"scale={W}:{H},setsar=1",

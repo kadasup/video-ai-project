@@ -62,11 +62,13 @@ _load_env()
 sys.path.insert(0, str(Path(__file__).parent))
 from produce import (
     BASE, OUTPUT, TMP, MAIN_SEC, TTS_VOICES,
-    generate_script, shorten_script, factcheck_narration, generate_tts, write_ass,
+    generate_script, shorten_script, factcheck_narration, extract_stat,
+    dedup_narration_vs_sots, generate_tts, write_ass,
     align_subtitles_to_boundaries, rescale_subtitles,
     align_segments_to_boundaries, rescale_segments,
     _probe_duration, _split_sentences, _build_subtitles,
     shift_subtitles, build_sot_subtitles, extract_audio_clip, concat_audio,
+    _sec_to_ts,
     make_intro, make_main, make_main_plan, make_outro, concat,
 )
 from select_clip import (
@@ -101,7 +103,58 @@ _job: dict = {'step': 0, 'msg': '', 'done': True, 'error': None,
 # ── 分鏡確認 checkpoint（產製跑到配對完成後暫停、等使用者確認才進最後渲染）──────
 _confirm_event = threading.Event()   # 主執行緒用它喚醒被暫停的產製執行緒
 _confirm_action = ['go']             # 使用者的決定：'go'（渲染）/ 'cancel'（放棄）
+_confirm_edits = [None]              # 分鏡站的人工換片段清單 [{index, path, start}]
+
+# ── 快速預覽（分鏡站的低畫質草稿渲染）───────────────────────────────────────
+_pending_ctx: dict = {}              # 分鏡確認暫停期間的渲染上下文（給預覽用）
+_draft = {"running": False, "error": None, "file": None, "ts": 0}
+
+
+def _apply_plan_edits(plan: list, edits: list, cat_paths: set) -> tuple[list, int]:
+    """套用分鏡站的人工換片段（只換畫面來源與起始秒，時長/時間軸不動）。
+    回傳 (新 plan, 套用筆數)；SOT/數據卡段鎖定不可換。"""
+    out = [dict(e) for e in plan]
+    applied = 0
+    for ed in (edits or []):
+        try:
+            ei = int(ed.get('index'))
+            npath = str(ed.get('path') or '')
+            nstart = float(ed.get('start') or 0)
+        except Exception:
+            continue
+        if not (0 <= ei < len(out)) or npath not in cat_paths:
+            continue
+        if str(out[ei].get('why', '')).startswith(('🎤', '📊')):
+            continue
+        out[ei] = {'path': npath, 'photo': None,
+                   'start': round(nstart, 2), 'dur': out[ei]['dur'],
+                   'why': '👤 人工指定片段'}
+        applied += 1
+    return out, applied
+
+
+def _render_draft(edits: list):
+    """背景渲染低畫質預覽（480p/ultrafast），內容與正式版完全一致"""
+    try:
+        ctx = dict(_pending_ctx)
+        if not ctx:
+            raise RuntimeError('沒有等待中的分鏡（預覽只在分鏡確認時可用）')
+        plan2, _n = _apply_plan_edits(ctx['plan'], edits, ctx['cat_paths'])
+        clip, _info = make_main_plan(Path(ctx['tts']), Path(ctx['ass']), plan2,
+                                     ctx['main_sec'], hook=ctx['hook'],
+                                     straps=ctx['straps'], draft=True,
+                                     title=ctx.get('title'))
+        _draft.update({'file': str(clip), 'ts': time.time(), 'error': None})
+    except Exception as e:
+        _draft['error'] = str(e)
+    finally:
+        _draft['running'] = False
 _preview: dict = {}                  # 暫停時給前端看的分鏡預覽（旁白/Hook/配對+縮圖/字幕）
+
+# ── 旁白稿確認 checkpoint（腳本+查核完就暫停，TTS/配對前——改稿成本最低的時點）──
+# 兩個 checkpoint 先後發生、絕不同時，共用同一組 event/action
+_script_preview: dict = {}
+_script_edit = [None]                # 使用者在旁白稿確認時改過的稿（None=沒改）
 
 
 class _Cancelled(Exception):
@@ -111,7 +164,7 @@ class _Cancelled(Exception):
 def _frame_thumb_b64(video_path: str, t: float) -> str | None:
     """抽該片段一張代表影格、縮到 200 寬轉 base64（給分鏡預覽用，用完刪檔）"""
     from produce import ff
-    out = TMP / "_pv_thumb.jpg"
+    out = TMP / f"_pv_thumb_{uuid.uuid4().hex[:8]}.jpg"   # 獨立檔名，供並行抽幀
     try:
         ff("-ss", str(max(0.0, t)), "-i", str(video_path),
            "-vframes", "1", "-vf", "scale=200:-1", "-q:v", "6", out)
@@ -129,7 +182,7 @@ def _frame_thumb_b64(video_path: str, t: float) -> str | None:
 def _photo_thumb_b64(photo_path: str) -> str | None:
     """照片縮圖 base64（分鏡預覽用）"""
     from produce import ff
-    out = TMP / "_pv_thumb.jpg"
+    out = TMP / f"_pv_thumb_{uuid.uuid4().hex[:8]}.jpg"
     try:
         ff("-i", str(photo_path), "-vframes", "1", "-vf", "scale=200:-1", "-q:v", "6", out)
         return base64.b64encode(out.read_bytes()).decode()
@@ -144,26 +197,51 @@ def _photo_thumb_b64(photo_path: str) -> str | None:
 
 def _build_preview(script: dict, subtitles: list, plan_rows: list,
                    factcheck: list | None = None,
-                   translit_results: list | None = None) -> dict:
-    """組裝分鏡預覽 payload：旁白、Hook、hashtags、字幕分段、每段配對＋代表縮圖"""
+                   translit_results: list | None = None,
+                   catalogs: list | None = None) -> dict:
+    """組裝分鏡預覽 payload：旁白、Hook、hashtags、字幕分段、每段配對＋代表縮圖；
+    另附素材庫全部片段清單（options），供分鏡站「換畫面」下拉選用"""
+    # 縮圖並行抽幀（原本逐張串行，7 段要 ~5 秒；並行 ~1 秒）
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one_thumb(e):
+        if e.get('path'):
+            return _frame_thumb_b64(e['path'], e.get('start', 0))
+        if e.get('photo'):
+            return _photo_thumb_b64(e['photo'])
+        return None
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        thumbs = list(ex.map(_one_thumb, plan_rows or []))
+
     segs = []
-    for e in (plan_rows or []):
+    for e, thumb in zip(plan_rows or [], thumbs):
         if e.get('path'):
             label = Path(e['path']).name
-            thumb = _frame_thumb_b64(e['path'], e.get('start', 0))
         elif e.get('photo'):
             label = f"📷 {Path(e['photo']).name}（照片）"
-            thumb = _photo_thumb_b64(e['photo'])
         else:
             label = '（黑幕）'
-            thumb = None
         segs.append({
             'video': label,
             'start': e.get('start', 0),
             'dur': e.get('dur', 0),
             'why': e.get('why', ''),
             'thumb': thumb,
+            # SOT 跟數據卡的時長跟音軌/動畫鎖死，不能換
+            'editable': not str(e.get('why', '')).startswith(('🎤', '📊')),
         })
+    options = []
+    for cat in (catalogs or []):
+        vname = Path(str(cat['path'])).name
+        for s in cat.get('segments', []):
+            marks = [m for m in (s.get('subject'), s.get('shot')) if m]
+            options.append({
+                'path': str(cat['path']), 'name': vname,
+                'start': s.get('start', 0), 'end': s.get('end', 0),
+                'desc': (('【' + '|'.join(marks) + '】') if marks else '')
+                        + (s.get('description') or '')[:42],
+            })
     return {
         'title': script.get('title', ''),
         'hook': script.get('hook', ''),
@@ -171,6 +249,7 @@ def _build_preview(script: dict, subtitles: list, plan_rows: list,
         'narration': script.get('narration', ''),
         'subtitles': [s.get('text', '') for s in (subtitles or [])],
         'segments': segs,
+        'options': options,
         'factcheck': factcheck or [],
         'translit': translit_results or [],
     }
@@ -197,7 +276,8 @@ def _merge_tiny_plan_entries(plan: list) -> list:
     SOT 段（why 以 🎤 開頭）的時長跟音軌鎖死，絕不能被增減，只當「跳過」處理。
     """
     def is_sot(e):
-        return str(e.get('why', '')).startswith('🎤')
+        # 🎤 SOT 時長跟音軌鎖死；📊 數據卡時長跟渲染出的動畫鎖死——都不能被增減
+        return str(e.get('why', '')).startswith(('🎤', '📊'))
 
     out = list(plan)
     changed = True
@@ -324,8 +404,9 @@ _analysis: dict = {
 # 順序刻意「先分析素材、再寫腳本」（write to picture）：
 # 旁白要貼著現有畫面寫，配對才搭得起來
 STEPS = ['', '分析影片內容', '生成播報腳本', '生成旁白音訊', '寫字幕檔',
+         # 步驟6保留位置：冷開場改版後片頭卡取消（標題改疊主畫面），此步瞬時完成
          '旁白配對畫面',
-         '組裝片頭', '組裝主畫面', '組裝片尾', '串接輸出']
+         '冷開場（無片頭卡）', '組裝主畫面', '組裝片尾（2.8秒）', '串接輸出']
 
 
 def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str = "hsiaochen",
@@ -336,6 +417,11 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
     checkpoint=True 時，配對完成後會暫停等使用者確認分鏡，才進最後渲染。"""
     global _busy, _job
     voice = TTS_VOICES.get(voice_key, TTS_VOICES["hsiaochen"])
+    # 讓前端能還原「這個工作實際用的輸入」（重跑時產製頁清單要顯示重跑的素材，
+    # 不是使用者上次自己選的清單）
+    _job['input_videos'] = [v['path'] for v in videos]
+    _job['input_photos'] = list(photos or [])
+    _job['input_article'] = article
 
     t0 = time.time()
     job_id = str(uuid.uuid4())[:8]
@@ -456,9 +542,9 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         _job['hook'] = script.get('hook', '')
         _job['hashtags'] = script.get('hashtags', [])
 
-        # ── SOT 解析：把 GPT 選的原音引句對回逐字稿時間軸 ─────────────────────────
-        sot = None
-        for s0 in (script.get('sots') or [])[:1]:   # 最多一段，寧缺勿濫
+        # ── SOT 解析：把 GPT 選的原音引句對回逐字稿時間軸（最多 2 段）───────────────
+        sots = []
+        for s0 in (script.get('sots') or [])[:2]:
             try:
                 vi = int(str(s0.get('video', '')).strip().upper().lstrip('V')) - 1
                 if not (0 <= vi < len(transcripts)):
@@ -468,20 +554,35 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                     continue
                 st, en, _spansegs = span
                 dur_s = round(en - st, 2)
-                if dur_s > 16.0:
-                    continue   # 超過 16 秒的 SOT 太拖，寧缺勿濫（規則要求 5~15 秒）
-                if dur_s >= 3.0:
-                    sot = {'path': catalogs[vi]['path'], 'start': st, 'dur': dur_s,
-                           'display': (s0.get('display') or s0.get('quote') or '').strip(),
-                           'after_sentence': int(s0.get('after_sentence', 0) or 0),
-                           'label': f"V{vi+1}"}
+                if dur_s > 16.0 or dur_s < 3.0:
+                    continue   # 超過 16 秒太拖、不足 3 秒不成句，寧缺勿濫
+                spk_name = (s0.get('speaker_name') or '').strip()
+                spk_title = (s0.get('speaker_title') or '').strip()
+                cand = {'path': catalogs[vi]['path'], 'start': st, 'dur': dur_s,
+                        'display': (s0.get('display') or s0.get('quote') or '').strip(),
+                        'after_sentence': int(s0.get('after_sentence', 0) or 0),
+                        'label': f"V{vi+1}",
+                        # 受訪者名條：GPT 只在能明確判斷發言者時才給（掛錯人是事故）
+                        'spk_name': spk_name, 'spk_title': spk_title,
+                        'speaker': ('｜'.join(x for x in (spk_name, spk_title) if x))}
+                # 第二段防呆：同影片區間重疊（GPT 選了重複內容）或合計超過 22 秒就不收
+                if any(s['path'] == cand['path']
+                       and st < s['start'] + s['dur'] and s['start'] < en
+                       for s in sots):
+                    continue
+                if sum(s['dur'] for s in sots) + dur_s > 22.0:
+                    continue
+                sots.append(cand)
             except Exception:
                 continue
-        _job['sot'] = ({'label': sot['label'], 'dur': sot['dur'],
-                        'display': sot['display']} if sot else None)
+        sots.sort(key=lambda s: s['after_sentence'])
+        _job['sot'] = ([{'label': s['label'], 'dur': s['dur'], 'display': s['display'],
+                         'speaker': s.get('speaker', '')}
+                        for s in sots] or None)
 
         # 長度保險 A：GPT 沒守字數上限就退件縮寫（有 SOT 時額度要扣掉原音秒數）
-        nar_budget_sec = MAIN_SEC - (sot['dur'] if sot else 0)
+        sot_total = sum(s['dur'] for s in sots)
+        nar_budget_sec = MAIN_SEC - sot_total
         if len(script['narration']) > int(nar_budget_sec * 4.6):
             _job['msg'] = f"{STEPS[2]}（旁白 {len(script['narration'])} 字超限，縮寫中）"
             try:
@@ -492,16 +593,58 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                 _job['hashtags'] = script.get('hashtags', _job.get('hashtags', []))
             except Exception:
                 pass  # 縮寫失敗就用原稿，交給長度保險 B
+            # 縮寫後句數會變（GPT 被要求同步調整 after_sentence）→ 以縮寫後的值為準
+            if sots and script.get('sots'):
+                by_disp = {(x.get('display') or x.get('quote') or '').strip(): x
+                           for x in script['sots']}
+                for s in sots:
+                    x = by_disp.get(s['display'])
+                    if x:
+                        try:
+                            s['after_sentence'] = int(x.get('after_sentence') or s['after_sentence'])
+                        except Exception:
+                            pass
+                sots.sort(key=lambda s: s['after_sentence'])
 
-        # ── 查核 Agent：旁白（AI 改寫版）逐項比對記者原稿的硬事實，抓改錯的數字/
-        #    人名/地名/罪名等。新聞命脈，有出入在分鏡確認時標紅，讓人在渲染前就看到。
-        #    同一次呼叫順便抽出外國譯名 → 比對報社音譯總表（譯名核實，表唯讀）──
+        # SOT 內容去重：旁白不要先把原音要講的講一遍（實測 GPT 寫稿常犯——
+        # 旁白講完取消班次數字、原音又講同樣的事，觀眾聽兩遍）
+        if sots:
+            _job['msg'] = f"{STEPS[2]}（檢查旁白與原音重複）"
+            try:
+                new_nar, new_afters, dd_tokens = dedup_narration_vs_sots(
+                    script['narration'], [s['display'] for s in sots])
+                _add_tokens(dd_tokens)
+                if new_nar != script['narration']:
+                    script['narration'] = new_nar
+                    if len(new_afters) == len(sots):
+                        for s, k in zip(sots, new_afters):
+                            s['after_sentence'] = k
+                        sots.sort(key=lambda s: s['after_sentence'])
+            except Exception:
+                pass   # 去重是品質加分項，失敗用原稿
+
+        # 數據卡補判＋事實查核：兩個 GPT 呼叫互相獨立（旁白已定稿），並行發出省等待
         _job['msg'] = f"{STEPS[2]}（事實查核中）"
-        try:
-            fc_issues, fc_translits, fc_tokens = factcheck_narration(article, script['narration'])
-            _add_tokens(fc_tokens)
-        except Exception:
-            fc_issues, fc_translits = [], []
+        from concurrent.futures import ThreadPoolExecutor
+        need_stat = (not script.get('stat')
+                     and re.search(r'\d', script.get('narration', '')))
+        with ThreadPoolExecutor(max_workers=2) as _ex:
+            fut_fc = _ex.submit(factcheck_narration, article, script['narration'])
+            fut_st = (_ex.submit(extract_stat, script['narration'])
+                      if need_stat else None)
+            try:
+                fc_issues, fc_translits, fc_tokens = fut_fc.result()
+                _add_tokens(fc_tokens)
+            except Exception:
+                fc_issues, fc_translits = [], []
+            if fut_st is not None:
+                try:
+                    st, st_tokens = fut_st.result()
+                    _add_tokens(st_tokens)
+                    if st:
+                        script['stat'] = st
+                except Exception:
+                    pass
         _job['factcheck'] = fc_issues
         if fc_issues:
             highs = [i for i in fc_issues if i.get('severity') == 'high']
@@ -526,25 +669,78 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             _job['warning'] = ((_job.get('warning') + '\n' + tr_msg)
                                if _job.get('warning') else tr_msg)
 
-        # ── 依 SOT 插入點把旁白拆成前後兩塊（無 SOT 就是單塊，流程與過去一致）────
+        # ── Checkpoint A：旁白稿確認（TTS/配對前先讓人看稿＋查核結果，改稿成本最低）──
+        # 借鏡中央社流程：切角/旁白稿在早期就人工把關，稿不對後面全白跑
+        if checkpoint:
+            global _script_preview
+            _script_preview = {
+                'title': script.get('title', ''), 'hook': script.get('hook', ''),
+                'hashtags': script.get('hashtags', []),
+                'narration': script['narration'],
+                'sots': [{'label': s['label'], 'dur': s['dur'],
+                          'display': s['display'],
+                          'speaker': s.get('speaker', '')} for s in sots],
+                'stat': script.get('stat') or None,
+                'highlights': script.get('highlights') or [],
+                'factcheck': _job.get('factcheck') or [],
+                'translit': _job.get('translit') or [],
+            }
+            _script_edit[0] = None
+            _confirm_action[0] = 'go'
+            _confirm_event.clear()
+            _job['awaiting_script'] = True
+            _job['msg'] = '⏸ 等待旁白稿確認（配音前）'
+            got = _confirm_event.wait(timeout=1800)   # 最多等 30 分鐘，逾時視同取消
+            _job['awaiting_script'] = False
+            _script_preview = {}
+            if (not got) or _confirm_action[0] == 'cancel':
+                raise _Cancelled()
+            if _script_edit[0]:   # 使用者改過稿 → 後面全部用改過的版本
+                script['narration'] = _script_edit[0]
+
+        # ── 依 SOT 插入點把旁白拆成交錯時間軸（0~2 段 SOT → 最多 3 塊旁白）────────
+        # items 是成片音軌的實際順序：旁白塊與 SOT 段交錯；空旁白塊略過
+        # （兩段 SOT 背靠背也成立）。無 SOT 時就是單一旁白塊，流程與過去一致。
         sentences = _split_sentences(script['narration'])
-        if sot:
-            k = min(max(sot['after_sentence'], 1), len(sentences))
-            nar_parts = ["".join(sentences[:k]), "".join(sentences[k:])]
-            nar_parts = [t for t in nar_parts if t] or [script['narration']]
-            if len(nar_parts) == 1 and sot['after_sentence'] >= len(sentences):
-                pass   # SOT 收尾：nar_parts=[全文]，SOT 排最後
+        items = []
+        if sots:
+            cursor = 0
+            for s in sots:
+                kk = min(max(int(s['after_sentence']), 1), len(sentences))
+                kk = max(kk, cursor)   # 插入點保證遞增
+                txt = "".join(sentences[cursor:kk])
+                if txt:
+                    items.append({'type': 'nar', 'text': txt, 'nsent': kk - cursor})
+                items.append({'type': 'sot', 'sot': s})
+                cursor = kk
+            tail = "".join(sentences[cursor:])
+            if tail:
+                items.append({'type': 'nar', 'text': tail,
+                              'nsent': len(sentences) - cursor})
+            if not any(it['type'] == 'nar' for it in items):   # 極端防呆
+                items.insert(0, {'type': 'nar', 'text': script['narration'],
+                                 'nsent': len(sentences)})
         else:
-            k = None
-            nar_parts = [script['narration']]
+            items = [{'type': 'nar', 'text': script['narration'],
+                      'nsent': len(sentences)}]
+        nar_parts = [it['text'] for it in items if it['type'] == 'nar']
 
         p(3)
-        part_paths, part_bounds, part_secs = [], [], []
-        for pi, text in enumerate(nar_parts):
-            pp = TMP / f"_narration_p{pi}.mp3"
-            b = generate_tts(text, pp, voice=voice)
-            part_paths.append(pp); part_bounds.append(b)
-            part_secs.append(_probe_duration(pp))
+        def _tts_all(rate=None):
+            """各段旁白並行合成（edge-tts 網路服務，並行純省等待、輸出不變）"""
+            def one(pi_text):
+                pi, text = pi_text
+                pp = TMP / f"_narration_p{pi}.mp3"
+                kw = {'voice': voice}
+                if rate:
+                    kw['rate'] = rate
+                b = generate_tts(text, pp, **kw)
+                return pp, b, _probe_duration(pp)
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                res = list(ex.map(one, list(enumerate(nar_parts))))
+            return ([r[0] for r in res], [r[1] for r in res], [r[2] for r in res])
+
+        part_paths, part_bounds, part_secs = _tts_all()
         nar_total = sum(part_secs)
 
         # 長度保險 B：唸完還是太長 → 按比例加快語速重唸（上限 +20%）
@@ -553,57 +749,88 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             need = 1.08 * nar_total / (nar_budget_sec + 1)
             pct = min(int(round((need - 1) * 100)), 20)
             _job['msg'] = f"{STEPS[3]}（旁白 {nar_total:.0f}s 過長，以 +{pct}% 語速重唸）"
-            part_paths, part_bounds, part_secs = [], [], []
-            for pi, text in enumerate(nar_parts):
-                pp = TMP / f"_narration_p{pi}.mp3"
-                b = generate_tts(text, pp, voice=voice, rate=f"+{pct}%")
-                part_paths.append(pp); part_bounds.append(b)
-                part_secs.append(_probe_duration(pp))
+            part_paths, part_bounds, part_secs = _tts_all(rate=f"+{pct}%")
             nar_total = sum(part_secs)
 
-        # 音軌組裝：旁白（＋SOT 原音）串成單一音軌；SOT 位置在 part0 之後
-        sot_dur = sot['dur'] if sot else 0.0
-        if sot:
-            sot_audio = TMP / "_sot_audio.m4a"
-            extract_audio_clip(Path(sot['path']), sot['start'], sot['dur'], sot_audio)
-            audio_files = [part_paths[0], sot_audio] + part_paths[1:]
-        else:
-            audio_files = list(part_paths)
+        # 音軌組裝：照 items 順序把旁白塊與 SOT 原音串成單一音軌
+        audio_files = []
+        ni = 0
+        for ii, it in enumerate(items):
+            if it['type'] == 'nar':
+                audio_files.append(part_paths[ni])
+                ni += 1
+            else:
+                s = it['sot']
+                sa = TMP / f"_sot_audio_{ii}.m4a"
+                extract_audio_clip(Path(s['path']), s['start'], s['dur'], sa)
+                audio_files.append(sa)
         concat_audio(audio_files, tts_path)
 
-        main_sec = round(min(max(nar_total + sot_dur + 0.4, 15.0), 90.0), 1)
+        main_sec = round(min(max(nar_total + sot_total + 0.4, 15.0), 90.0), 1)
         _job['main_sec'] = main_sec
 
         p(4)
-        # 每塊旁白各自逐字對齊，再平移到成片時間軸；SOT 字幕用校正後引句按比例分配
-        offsets_nar = [0.0]                       # 每塊旁白在成片的起點
-        if sot and len(nar_parts) == 2:
-            offsets_nar = [0.0, part_secs[0] + sot_dur]
-        elif sot:   # SOT 收尾
-            offsets_nar = [0.0]
+        # 走一遍 items 累計成片時間軸：每塊旁白各自逐字對齊再平移；
+        # SOT 字幕用校正後引句按比例分配。順便在「純旁白時間軸」上定位
+        # 數據卡的插入時間（旁白唸到 stat 數字的那一句）
+        stat = script.get('stat') if isinstance(script.get('stat'), dict) else None
+        stat_digits = re.sub(r'[^0-9.]', '', str(stat.get('value', ''))) if stat else ''
+        stat_t = None
+        straps = []    # 受訪者名條 [{png, start, end}]（成片時間軸）
         subtitles = []
         align_ok = True
-        for pi, text in enumerate(nar_parts):
-            subs_p = _build_subtitles(text)
-            aligned = align_subtitles_to_boundaries(subs_p, part_bounds[pi]) if part_bounds[pi] else []
-            if not aligned:
-                align_ok = False
-                aligned = rescale_subtitles(subs_p, float(MAIN_SEC), part_secs[pi])
-            subtitles += shift_subtitles(aligned, offsets_nar[pi] if pi < len(offsets_nar) else 0.0)
-        if sot:
-            sot_t0 = part_secs[0] if len(nar_parts) >= 1 else 0.0
-            if len(nar_parts) == 1 and sot['after_sentence'] >= len(sentences):
-                sot_t0 = nar_total   # 收尾
-            subtitles += build_sot_subtitles(sot['display'], sot_t0, sot_dur)
-            subtitles.sort(key=lambda s: s['start'])
+        t_axis = 0.0     # 成片時間軸（含 SOT）
+        nar_axis = 0.0   # 純旁白時間軸（配對計畫用的座標系）
+        ni = 0
+        for it in items:
+            if it['type'] == 'nar':
+                text = it['text']
+                subs_p = _build_subtitles(text)
+                aligned = (align_subtitles_to_boundaries(subs_p, part_bounds[ni])
+                           if part_bounds[ni] else [])
+                if not aligned:
+                    align_ok = False
+                    aligned = rescale_subtitles(subs_p, float(MAIN_SEC), part_secs[ni])
+                if stat_digits and stat_t is None:
+                    from produce import _ts_to_sec
+                    for sb in aligned:
+                        if stat_digits in re.sub(r'[,，]', '', str(sb.get('text', ''))):
+                            # 字幕 start 是 SRT 時間字串（00:00:05,976），要轉秒數
+                            stat_t = round(nar_axis + _ts_to_sec(sb['start']), 2)
+                            break
+                subtitles += shift_subtitles(aligned, t_axis)
+                t_axis += part_secs[ni]
+                nar_axis += part_secs[ni]
+                ni += 1
+            else:
+                s = it['sot']
+                subtitles += build_sot_subtitles(s['display'], t_axis, s['dur'])
+                if s.get('speaker'):   # 受訪者名條圖卡：原音開始 0.3 秒後進、最多掛 5 秒
+                    try:
+                        from produce import make_strap_png
+                        strap_png = TMP / f"_strap_{len(straps)}.png"
+                        make_strap_png(s.get('spk_name') or s['speaker'],
+                                       s.get('spk_title', ''), strap_png)
+                        straps.append({'png': str(strap_png),
+                                       'start': round(t_axis + 0.3, 2),
+                                       'end': round(t_axis + min(s['dur'], 5.3), 2)})
+                    except Exception:
+                        pass   # 名條是加分項，畫不出來不擋產製
+                t_axis += s['dur']
+        subtitles.sort(key=lambda x: x['start'])
         _job['sub_align'] = '逐字對齊' if align_ok else '等比縮放(fallback)'
 
         # segments（配畫面用）：按塊精算再平移（只涵蓋旁白時間，SOT 是固定畫面不用配）
-        if sot and k is not None and len(nar_parts) == 2:
-            segsA, segsB = _split_gpt_segments(script.get('segments', []), k)
-            gpt_seg_parts = [segsA, segsB]
-        else:
-            gpt_seg_parts = [script.get('segments', [])]
+        # GPT 的 segments 依各旁白塊的句數依序切分
+        gpt_seg_parts = []
+        rem_segs = script.get('segments', [])
+        for it in items:
+            if it['type'] != 'nar':
+                continue
+            part_segs, rem_segs = _split_gpt_segments(rem_segs, it['nsent'])
+            gpt_seg_parts.append(part_segs)
+        if gpt_seg_parts and rem_segs:   # 句數統計誤差的剩餘 → 併進最後一塊
+            gpt_seg_parts[-1] = gpt_seg_parts[-1] + rem_segs
         segments = []
         nar_off = 0.0    # 在「純旁白時間軸」上的偏移（不含 SOT）
         seg_ok = True
@@ -620,7 +847,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                                  'end': round(sgp['end'] + nar_off, 1)})
             nar_off += part_secs[pi]
         _job['seg_align'] = '逐字精算' if seg_ok else '文字比例(fallback)'
-        write_ass(subtitles, ass_path)
+        write_ass(subtitles, ass_path, highlights=script.get('highlights') or [])
 
         # ── 步驟5：旁白配畫面（配的是「純旁白時間軸」，配完在 SOT 點切開插入原音段）──
         # 沒有影片但有照片 → 圖輯式模式：整支用照片輪播（Ken Burns）配旁白
@@ -634,26 +861,75 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             p(5)
             try:
                 sot_note = None
-                if sot:
-                    sot_note = (f"成片會在旁白中段插入 {sot['label']} 的 "
-                                f"{sot['start']}~{round(sot['start']+sot['dur'],1)} 秒受訪原音段，"
-                                "請不要把該影片的這個區間再拿來當配音底圖")
+                if sots:
+                    spans = "；".join(
+                        f"{s['label']} 的 {s['start']}~{round(s['start']+s['dur'],1)} 秒"
+                        for s in sots)
+                    sot_note = (f"成片會在旁白中插入受訪原音段：{spans}，"
+                                "請不要把這些影片區間再拿來當配音底圖")
                 plan, match_tokens = match_narration_to_clips(
                     segments, catalogs, round(nar_total, 1),
                     photos=photo_items, notes=sot_note)
                 _add_tokens(match_tokens)
 
-                # 在 SOT 插入點把配對時間軸切開，插進原音段（畫面=原影片、聲音已在音軌裡）
-                if sot and len(nar_parts) == 2:
-                    planA, planB = _split_plan_at(plan, part_secs[0])
-                    sot_entry = {'path': sot['path'], 'photo': None,
-                                 'start': sot['start'], 'dur': sot_dur,
-                                 'why': f"🎤 SOT 受訪原音：{sot['display'][:40]}"}
-                    plan = _merge_tiny_plan_entries(planA + [sot_entry] + planB)
-                elif sot:   # SOT 收尾
-                    plan = plan + [{'path': sot['path'], 'photo': None,
-                                    'start': sot['start'], 'dur': sot_dur,
-                                    'why': f"🎤 SOT 受訪原音：{sot['display'][:40]}"}]
+                # 數據動態字卡：旁白唸到關鍵數字時，換上 2.8 秒動畫數字卡（1:1 換掉
+                # 原本配的畫面，總長不變，所以不影響後面的 SOT 插入座標）
+                if stat and stat_t is not None and plan:
+                    try:
+                        import hashlib as _hl
+                        import statcard
+                        # 同內容的數據卡有快取：重跑/取消再來不用重畫（省 ~20 秒）
+                        card_key = _hl.md5(json.dumps(stat, sort_keys=True,
+                                                      ensure_ascii=False).encode()
+                                           ).hexdigest()[:12]
+                        card_path = TMP / f"_statcard_{card_key}.mp4"
+                        if not card_path.exists():
+                            _job['msg'] = f"{STEPS[5]}（渲染數據卡中）"
+                        if card_path.exists() or statcard.render_stat_card(stat, card_path):
+                            plan_total = sum(float(e.get('dur', 0) or 0) for e in plan)
+                            card_dur = round(min(statcard.DUR, plan_total - stat_t), 2)
+                            if card_dur >= 1.5:
+                                pA, pB = _split_plan_at(plan, stat_t)
+                                _consumed, pRest = _split_plan_at(pB, card_dur)
+                                plan = pA + [{'path': str(card_path), 'photo': None,
+                                              'start': 0.0, 'dur': card_dur,
+                                              'why': (f"📊 數據卡：{stat.get('label', '')} "
+                                                      f"{stat.get('value', '')}{stat.get('unit', '')}")}] + pRest
+                                _job['stat'] = stat
+                    except Exception:
+                        pass   # 插卡是加分項，失敗不擋產製
+
+                # 黑幕兜底：GPT 配不到畫面的段落，有照片就用照片（Ken Burns）不留黑
+                if photo_items and plan:
+                    ph_i = 0
+                    for e in plan:
+                        if e.get('path') or e.get('photo'):
+                            continue
+                        e['photo'] = photo_items[ph_i % len(photo_items)]['path']
+                        e['why'] = (e.get('why') or '') + '（照片補黑幕）'
+                        ph_i += 1
+
+                # 照 items 順序在各 SOT 插入點把配對時間軸切開，插進原音段
+                # （畫面=原影片、聲音已在音軌裡）；配對時間軸是「純旁白時間軸」
+                if sots:
+                    assembled, rest = [], plan
+                    nar_acc = 0.0   # 純旁白時間軸累計
+                    cut_acc = 0.0   # rest 已消耗掉的起點
+                    ni2 = 0
+                    for it in items:
+                        if it['type'] == 'nar':
+                            nar_acc += part_secs[ni2]
+                            ni2 += 1
+                        else:
+                            s = it['sot']
+                            a, rest = _split_plan_at(rest, nar_acc - cut_acc)
+                            cut_acc = nar_acc
+                            assembled += a + [{'path': s['path'], 'photo': None,
+                                               'start': s['start'], 'dur': s['dur'],
+                                               'why': f"🎤 SOT 受訪原音：{s['display'][:40]}"}]
+                    plan = _merge_tiny_plan_entries(assembled + rest)
+                elif _job.get('stat'):   # 沒 SOT 但插了數據卡 → 一樣收掉切出的碎片
+                    plan = _merge_tiny_plan_entries(plan)
 
                 _job['plan'] = [
                     {'video': (Path(e['path']).name if e.get('path')
@@ -678,30 +954,61 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         if checkpoint:
             global _preview
             _preview = _build_preview(script, subtitles, plan or [],
-                                      _job.get('factcheck'), _job.get('translit'))
+                                      _job.get('factcheck'), _job.get('translit'),
+                                      catalogs)
+            # 給快速預覽用的渲染上下文（分鏡確認暫停期間有效）
+            global _pending_ctx
+            _pending_ctx = {'plan': plan or [], 'tts': str(tts_path),
+                            'ass': str(ass_path), 'main_sec': main_sec,
+                            'hook': _job.get('hook'), 'straps': straps,
+                            'title': _job.get('title') or script.get('title', ''),
+                            'cat_paths': {str(c['path']) for c in catalogs}}
             _confirm_action[0] = 'go'
+            _confirm_edits[0] = None
             _confirm_event.clear()
             _job['awaiting_confirm'] = True
             _job['msg'] = '⏸ 等待分鏡確認（渲染前）'
             got = _confirm_event.wait(timeout=1800)   # 最多等 30 分鐘，逾時視同取消
             _job['awaiting_confirm'] = False
             _preview = {}
+            _pending_ctx = {}
             if (not got) or _confirm_action[0] == 'cancel':
                 raise _Cancelled()
 
+            # 套用分鏡站的人工換片段：只換畫面來源與起始秒，時長/時間軸不動
+            edits = _confirm_edits[0] or []
+            _confirm_edits[0] = None
+            if edits and plan:
+                plan, applied = _apply_plan_edits(
+                    plan, edits, {str(c['path']) for c in catalogs})
+                if applied:
+                    _job['plan'] = [
+                        {'video': (Path(e['path']).name if e.get('path')
+                                   else (f"📷 {Path(e['photo']).name}" if e.get('photo') else '（黑幕）')),
+                         'start': e.get('start', 0), 'dur': e['dur'],
+                         'why': e.get('why', '')}
+                        for e in plan
+                    ]
+                    _job['msg'] = f'已套用 {applied} 處人工換片段，開始渲染'
+
         p(6)
-        intro = make_intro(script)
+        # 冷開場改版（2026-07）：不再做 3 秒片頭卡——研究指出 50~60% 流失發生在
+        # 前 3 秒；標題改成疊在主畫面最前 TITLE_SEC 秒的標題條（與 Hook 同組）
+        intro = None
 
         p(7)
         # 用 _job['hook']（不是 script.get('hook')）：長度保險 A 觸發縮寫時，
         # GPT 縮寫後的 JSON 偶爾會漏帶 hook 欄位，_job['hook'] 有防呆保留舊值，
         # 兩處讀不同來源會導致「/logs 顯示有 hook、但實際影片沒燒進去」的落差
         hook = _job.get('hook')
+        title = _job.get('title') or script.get('title', '')
         if plan:
             _enrich_subject_pos(plan, catalogs)   # 每段查主體位置，供直式裁切偏移
-            main_clip, length_info = make_main_plan(tts_path, ass_path, plan, main_sec, hook=hook)
+            main_clip, length_info = make_main_plan(tts_path, ass_path, plan, main_sec,
+                                                    hook=hook, straps=straps, title=title)
         else:
-            main_clip, length_info = make_main(tts_path, ass_path, videos, main_sec, hook=hook)
+            main_clip, length_info = make_main(tts_path, ass_path, videos, main_sec,
+                                               hook=hook, title=title)
         if length_info.get("insufficient"):
             short_msg = (
                 f"來源畫面只涵蓋 {length_info['covered_sec']} 秒，"
@@ -722,7 +1029,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         out_dir = OUTPUT / datetime.datetime.now().strftime('%y%m%d')   # 依產製日期分資料夾
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / name
-        concat([intro, main_clip, outro], out_path)
+        concat([c for c in (intro, main_clip, outro) if c], out_path)
         output_name = name
         step_durations[STEPS[9]] = round(time.time() - _last_step_t[0], 1)
 
@@ -744,7 +1051,8 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             except Exception:
                 pass
         _job.update({'done': True, 'cancelled': True, 'awaiting_confirm': False,
-                     'msg': '已取消（分鏡未通過，未渲染）',
+                     'awaiting_script': False,
+                     'msg': '已取消（確認未通過，未渲染）',
                      'elapsed_sec': round(time.time() - t0, 1),
                      'step_durations': dict(step_durations)})
 
@@ -780,6 +1088,8 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             "sub_align":          _job.get('sub_align', ''),
             "seg_align":          _job.get('seg_align', ''),
             "sot":                _job.get('sot'),
+            "stat":               _job.get('stat'),
+            "photos":             photos or [],
             "factcheck":          _job.get('factcheck'),
             "translit":           _job.get('translit'),
             "main_sec":           _job.get('main_sec', 0),
@@ -863,6 +1173,7 @@ GALLERY_HTML = """<!doctype html>
 <title>成片庫 — VideoAI</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
+html{font-size:17px}
 body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f3f4f6;color:#111;padding:24px}
 .nav{display:flex;gap:6px;align-items:center;margin-bottom:20px}
 .nav h1{font-size:1.2rem;font-weight:700;margin-right:auto}
@@ -914,6 +1225,20 @@ body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f3f4f
 let _all = [];
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200);}
+function askConfirm(msg,onYes){
+  const ov=document.createElement('div');
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:300;display:flex;align-items:center;justify-content:center';
+  ov.innerHTML=`<div style="background:#fff;border-radius:12px;padding:20px 22px;max-width:360px;width:90%;box-shadow:0 10px 40px rgba(0,0,0,.3)">
+    <div style="font-size:.92rem;color:#111;line-height:1.65">${msg}</div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button class="ok" style="flex:1;padding:9px;border:0;border-radius:8px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer">確定</button>
+      <button class="no" style="flex:1;padding:9px;border:1px solid #d1d5db;border-radius:8px;background:#fff;color:#374151;cursor:pointer">取消</button>
+    </div></div>`;
+  ov.querySelector('.ok').onclick=()=>{ov.remove();onYes();};
+  ov.querySelector('.no').onclick=()=>ov.remove();
+  ov.onclick=e=>{if(e.target===ov)ov.remove();};
+  document.body.appendChild(ov);
+}
 
 async function load(){
   _all = await (await fetch('/api/gallery')).json();
@@ -932,7 +1257,7 @@ function render(){
     const ts = (r.timestamp||'').replace('T',' ').slice(0,16);
     const tags = (r.hashtags||[]).join(' ');
     const fc = (r.factcheck&&r.factcheck.length)?`<div class="fc">🔍 查核有 ${r.factcheck.length} 處出入（未修）</div>`:'';
-    const sot = r.sot?`<div class="meta">🎤 含受訪原音</div>`:'';
+    const sot = r.sot?`<div class="meta">🎤 含受訪原音${(Array.isArray(r.sot)&&r.sot.length>1)?' ×'+r.sot.length:''}</div>`:'';
     return `<div class="card">
       <video src="${vurl}" data-poster="/api/thumb/${encodeURIComponent(r.filename)}" preload="none" controls playsinline></video>
       <div class="body">
@@ -973,20 +1298,22 @@ function lazyPosters(){
   document.querySelectorAll('.card video[data-poster]').forEach(v=>_po.observe(v));
 }
 function toggleDetail(i){document.getElementById('d'+i).classList.toggle('show');}
-async function rerun(fn){
-  if(!confirm('用這支的原始新聞稿＋影片重新產製一支？（分析有快取，會很快）'))return;
-  const d = await (await fetch('/api/rerun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:fn})})).json();
-  if(d.error){toast('重跑失敗：'+d.error);return;}
-  let msg='已開始重跑，到「產製」頁看進度';
-  if(d.videos_found<d.videos_expected)msg+=`（${d.videos_expected}支素材只找到${d.videos_found}支，其餘可能已刪）`;
-  toast(msg);
-  setTimeout(()=>location.href='/',1500);
+function rerun(fn){
+  askConfirm('用這支的原始新聞稿＋影片重新產製一支？<br><span style="color:#6b7280;font-size:.82rem">（分析有快取，會很快）</span>', async()=>{
+    const d = await (await fetch('/api/rerun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:fn})})).json();
+    if(d.error){toast('重跑失敗：'+d.error);return;}
+    let msg='已開始重跑，到「產製」頁看進度';
+    if(d.videos_found<d.videos_expected)msg+=`（${d.videos_expected}支素材只找到${d.videos_found}支，其餘可能已刪）`;
+    toast(msg);
+    setTimeout(()=>location.href='/',1500);
+  });
 }
-async function del(fn){
-  if(!confirm('確定刪除這支成片？此動作無法復原'))return;
-  const d = await (await fetch('/api/gallery/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:fn})})).json();
-  if(d.error){toast('刪除失敗：'+d.error);return;}
-  toast('已刪除');load();
+function del(fn){
+  askConfirm('確定刪除這支成片？<br><span style="color:#b91c1c;font-size:.82rem">此動作無法復原</span>', async()=>{
+    const d = await (await fetch('/api/gallery/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:fn})})).json();
+    if(d.error){toast('刪除失敗：'+d.error);return;}
+    toast('已刪除');load();
+  });
 }
 load();
 </script>
@@ -1002,6 +1329,7 @@ LOGS_HTML = """<!doctype html>
 <title>使用記錄 — VideoAI</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
+html{font-size:17px}
 body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f3f4f6;color:#111;padding:24px}
 h1{font-size:1.15rem;font-weight:700;margin-bottom:18px}
 .back{font-size:.82rem;color:#6b7280;text-decoration:none;margin-right:14px}
@@ -1197,14 +1525,40 @@ function toggleDetail(i) {
   if (el) el.style.display = el.style.display === 'none' ? '' : 'none';
 }
 
-async function rerunJob(id) {
-  if (!confirm('用這筆的原始新聞稿＋影片重新產製？（分析有快取，會很快）')) return;
-  try {
-    const d = await (await fetch('/api/rerun', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id})})).json();
-    if (d.error) { alert('重跑失敗：' + d.error); return; }
-    alert('已開始重跑，前往「產製」頁看進度');
-    location.href = '/';
-  } catch(e) { alert('重跑失敗：' + e.message); }
+function toast(m){
+  let t = document.getElementById('toast2');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'toast2';
+    t.style.cssText = 'position:fixed;bottom:30px;left:50%;transform:translateX(-50%);background:#111;color:#fff;padding:10px 18px;border-radius:8px;font-size:.85rem;z-index:400;opacity:0;transition:opacity .3s;pointer-events:none';
+    document.body.appendChild(t);
+  }
+  t.textContent = m; t.style.opacity = '1';
+  setTimeout(() => t.style.opacity = '0', 2200);
+}
+function askConfirm(msg, onYes){
+  const ov = document.createElement('div');
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:300;display:flex;align-items:center;justify-content:center';
+  ov.innerHTML = `<div style="background:#fff;border-radius:12px;padding:20px 22px;max-width:360px;width:90%;box-shadow:0 10px 40px rgba(0,0,0,.3)">
+    <div style="font-size:.92rem;color:#111;line-height:1.65">${msg}</div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button class="ok" style="flex:1;padding:9px;border:0;border-radius:8px;background:#7c3aed;color:#fff;font-weight:700;cursor:pointer">確定</button>
+      <button class="no" style="flex:1;padding:9px;border:1px solid #d1d5db;border-radius:8px;background:#fff;color:#374151;cursor:pointer">取消</button>
+    </div></div>`;
+  ov.querySelector('.ok').onclick = () => { ov.remove(); onYes(); };
+  ov.querySelector('.no').onclick = () => ov.remove();
+  ov.onclick = e => { if (e.target === ov) ov.remove(); };
+  document.body.appendChild(ov);
+}
+function rerunJob(id) {
+  askConfirm('用這筆的原始新聞稿＋影片重新產製？<br><span style="color:#6b7280;font-size:.82rem">（分析有快取，會很快）</span>', async () => {
+    try {
+      const d = await (await fetch('/api/rerun', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id})})).json();
+      if (d.error) { toast('重跑失敗：' + d.error); return; }
+      toast('已開始重跑，前往「產製」頁看進度');
+      setTimeout(() => location.href = '/', 1500);
+    } catch(e) { toast('重跑失敗：' + e.message); }
+  });
 }
 
 function detailHtml(r) {
@@ -1298,6 +1652,7 @@ HTML = """<!doctype html>
 <title>短影音產製</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
+html{font-size:17px}
 body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f3f4f6;color:#111;padding:28px 24px}
 h1{font-size:1.25rem;font-weight:700;margin-bottom:22px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:980px}
@@ -1313,7 +1668,7 @@ textarea,input[type=text],input[type=number]{
 }
 textarea:focus,input:focus{outline:none;border-color:#2563eb;background:#fff}
 textarea{resize:vertical;min-height:210px}
-.hint{font-size:.76rem;color:#aaa;margin-top:3px}
+.hint{font-size:.8rem;color:#999;margin-top:3px}
 .btn{
   display:block;width:100%;margin-top:18px;padding:12px;
   background:#2563eb;color:#fff;border:none;border-radius:7px;
@@ -1397,6 +1752,11 @@ textarea{resize:vertical;min-height:210px}
   font-size:1rem;padding:2px 6px;line-height:1
 }
 .video-item .btn-remove:hover{color:#b91c1c}
+.video-item .btn-preview{
+  background:none;border:1px solid #d1d5db;border-radius:6px;color:#374151;
+  cursor:pointer;font-size:.72rem;padding:2px 8px;line-height:1.4;flex-shrink:0
+}
+.video-item .btn-preview:hover{border-color:#374151;background:#f3f4f6}
 .video-item .vanalysis{margin-top:6px;padding-left:28px;font-size:.78rem}
 .ana-loading{color:#7c3aed}
 .ana-err{color:#b91c1c}
@@ -1565,12 +1925,8 @@ textarea{resize:vertical;min-height:210px}
     <textarea id="article" placeholder="貼上新聞稿全文…"></textarea>
     <div id="import-keywords" style="display:none;font-size:.76rem;color:#6b7280;margin-top:-8px;margin-bottom:12px"></div>
 
-    <label>影片（可瀏覽選取多支，依序銜接補滿主畫面秒數）</label>
-    <div style="display:flex;gap:8px">
-      <button class="btn-browse" style="flex:1;padding:11px" onclick="openBrowse()">&#128193; 瀏覽並選取影片</button>
-      <button class="btn-browse" style="padding:11px 14px" onclick="clearVideoList()" title="清空目前的影片清單">&#128465; 重整</button>
-    </div>
-    <p class="hint">選取後按「加入選取」，每支會自動跑智慧分析，結果顯示在檔名下方（分析過的有快取不重複收費）；產製完成後清單會保留，要換下一則新聞才按「重整」清空</p>
+    <label>影片素材（從上方「後臺影音清單」按「📥 匯入」自動帶入；換匯下一則會整組換新）</label>
+    <p class="hint">匯入後每支影片自動跑智慧分析，結果顯示在檔名下方（分析過的有快取不重複收費）</p>
 
     <div id="video-list" class="video-list"></div>
 
@@ -1582,7 +1938,8 @@ textarea{resize:vertical;min-height:210px}
 
     <label style="display:flex;align-items:center;gap:8px;margin-top:14px;cursor:pointer;font-weight:400">
       <input type="checkbox" id="checkpoint" checked style="width:16px;height:16px">
-      <span>渲染前先讓我確認分鏡（旁白／配對畫面／字幕都 OK 才輸出，避免整支跑完才發現要重來）</span>
+      <span>產製途中停站讓我確認（<b>旁白稿站</b>：看稿改稿、查核譯名警示 →
+      <b>分鏡站</b>：換畫面、快速預覽）——取消勾選＝全自動一路跑完不停站（批次/過夜用）</span>
     </label>
 
     <button class="btn" id="btn" onclick="startJob()">開始產製</button>
@@ -1604,18 +1961,34 @@ textarea{resize:vertical;min-height:210px}
       <li id="s3"><div class="step-row"><span class="icon">○</span>生成旁白音訊<span class="step-time" id="t3"></span></div><div class="step-mini"><div class="step-mini-bar" id="m3"></div></div></li>
       <li id="s4"><div class="step-row"><span class="icon">○</span>寫字幕檔<span class="step-time" id="t4"></span></div><div class="step-mini"><div class="step-mini-bar" id="m4"></div></div></li>
       <li id="s5"><div class="step-row"><span class="icon">○</span>旁白配對畫面<span class="step-time" id="t5"></span></div><div class="step-mini"><div class="step-mini-bar" id="m5"></div></div></li>
-      <li id="s6"><div class="step-row"><span class="icon">○</span>組裝片頭（3 秒）<span class="step-time" id="t6"></span></div><div class="step-mini"><div class="step-mini-bar" id="m6"></div></div></li>
+      <li id="s6"><div class="step-row"><span class="icon">○</span>冷開場（標題疊主畫面）<span class="step-time" id="t6"></span></div><div class="step-mini"><div class="step-mini-bar" id="m6"></div></div></li>
       <li id="s7"><div class="step-row"><span class="icon">○</span>組裝主畫面（長度隨旁白）<span class="step-time" id="t7"></span></div><div class="step-mini"><div class="step-mini-bar" id="m7"></div></div></li>
       <li id="s8"><div class="step-row"><span class="icon">○</span>組裝片尾（5 秒）<span class="step-time" id="t8"></span></div><div class="step-mini"><div class="step-mini-bar" id="m8"></div></div></li>
       <li id="s9"><div class="step-row"><span class="icon">○</span>串接輸出<span class="step-time" id="t9"></span></div><div class="step-mini"><div class="step-mini-bar" id="m9"></div></div></li>
     </ul>
+
+    <!-- 旁白稿確認 checkpoint 面板（配音前，改稿成本最低的時點） -->
+    <div id="script-box" style="display:none;margin-top:14px;padding:14px;border:2px solid #3b82f6;border-radius:10px;background:#eff6ff">
+      <p style="font-weight:700;color:#1e40af;margin:0 0 4px">⏸ 旁白稿確認（配音前）</p>
+      <p style="font-size:.78rem;color:#1e3a8a;margin:0 0 10px">先看稿再配音：稿不對就直接改（或取消重跑），省下後面配音＋配畫面的時間。查核與譯名結果已列出。</p>
+      <div id="sp-content" style="font-size:.82rem;color:#333"></div>
+      <div style="margin-top:8px"><b style="font-size:.82rem">旁白全文（可直接修改）：</b>
+        <textarea id="sp-nar" style="width:100%;min-height:130px;margin-top:4px;padding:8px;border:1px solid #cbd5e1;border-radius:6px;font-size:.85rem;line-height:1.7;font-family:inherit"></textarea>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:12px">
+        <button class="btn" style="flex:1;background:#16a34a" onclick="confirmScript('go')">✅ 稿 OK，開始配音</button>
+        <button class="btn" style="flex:1;background:#9ca3af" onclick="confirmScript('cancel')">✖ 取消</button>
+      </div>
+    </div>
 
     <!-- 分鏡確認 checkpoint 面板 -->
     <div id="checkpoint-box" style="display:none;margin-top:14px;padding:14px;border:2px solid #f59e0b;border-radius:10px;background:#fffbeb">
       <p style="font-weight:700;color:#92400e;margin:0 0 4px">⏸ 渲染前分鏡確認</p>
       <p style="font-size:.78rem;color:#78350f;margin:0 0 10px">下面是這支的旁白、Hook、每段配到的畫面與字幕。確認沒問題再渲染；覺得不對就取消、調整後重跑（省下整支渲染時間）。</p>
       <div id="cp-content" style="font-size:.82rem;color:#333"></div>
+      <div id="draft-area" style="margin-top:10px"></div>
       <div style="display:flex;gap:10px;margin-top:14px">
+        <button class="btn" style="flex:1;background:#0ea5e9" onclick="draftPreview()" id="draft-btn">🎬 快速預覽（低畫質）</button>
         <button class="btn" style="flex:1;background:#16a34a" onclick="confirmJob('go')">✅ 確認，開始渲染</button>
         <button class="btn" style="flex:1;background:#9ca3af" onclick="confirmJob('cancel')">✖ 取消</button>
       </div>
@@ -1694,15 +2067,25 @@ async function startJob() {
 
 const STEP_NAMES = ['', '分析影片內容', '生成播報腳本', '生成旁白音訊', '寫字幕檔',
                      '旁白配對畫面',
-                     '組裝片頭', '組裝主畫面', '組裝片尾', '串接輸出'];
+                     '冷開場（無片頭卡）', '組裝主畫面', '組裝片尾（2.8秒）', '串接輸出'];
 const N_STEPS = 9;
 let cpShown = false;     // 分鏡確認面板是否已顯示（避免每次輪詢重抓 preview）
 let cpDecided = false;   // 使用者已按過確認/取消（避免 server 尚未清旗標時面板閃回）
+let spShown = false;     // 旁白稿確認面板（Checkpoint A）
+let spDecided = false;
 
 async function poll() {
   try {
     const d = await (await fetch('/api/status')).json();
     renderSteps(d);
+    if (d.awaiting_script && !spDecided) {
+      if (!spShown) { spShown = true; showScriptCheckpoint(); }
+      return;   // 等旁白稿確認
+    }
+    if (spShown && !d.awaiting_script) {
+      spShown = false;
+      document.getElementById('script-box').style.display = 'none';
+    }
     if (d.awaiting_confirm && !cpDecided) {
       if (!cpShown) { cpShown = true; showCheckpoint(); }
       return;   // 暫停中，等使用者按確認/取消，不當作完成
@@ -1720,6 +2103,73 @@ async function poll() {
   } catch(_) {}
 }
 
+async function showScriptCheckpoint() {
+  try {
+    const pv = await (await fetch('/api/script_preview')).json();
+    renderScriptCheckpoint(pv);
+    document.getElementById('script-box').style.display = 'block';
+    document.getElementById('script-box').scrollIntoView({behavior:'smooth', block:'nearest'});
+  } catch(_) {}
+}
+
+function renderScriptCheckpoint(pv) {
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  let html = '';
+  // 查核／譯名警示沿用分鏡面板的樣式（在改稿階段看到最有用）
+  if (pv.factcheck && pv.factcheck.length) {
+    const rows = pv.factcheck.map(f => {
+      const sev = f.severity === 'high'
+        ? '<span style="color:#b91c1c;font-weight:700">●高</span>'
+        : '<span style="color:#b45309;font-weight:700">●中</span>';
+      return `<div style="margin:4px 0;padding:6px 8px;background:#fff;border-radius:5px">
+        ${sev} <b>${esc(f.field)}</b>：旁白說「${esc(f.narration_says)}」，但原稿是「${esc(f.article_says)}」</div>`;
+    }).join('');
+    html += `<div style="margin-bottom:10px;padding:10px 12px;background:#fef2f2;border:2px solid #fca5a5;border-radius:8px">
+      <div style="color:#991b1b;font-weight:700;margin-bottom:6px">🔍 事實查核：${pv.factcheck.length} 處與原稿不符——可直接在下面稿子裡改掉</div>
+      ${rows}</div>`;
+  }
+  if (pv.translit && pv.translit.length) {
+    const mis = pv.translit.filter(t => t.status === 'mismatch');
+    if (mis.length) {
+      html += `<div style="margin-bottom:10px;padding:8px 12px;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;font-size:.8rem">
+        🈯 譯名：${mis.map(t=>`「<b>${esc(t.chinese)}</b>」應為「<b style="color:#166534">${esc(t.expected)}</b>」`).join('；')}</div>`;
+    }
+  }
+  html += `<div style="margin-bottom:6px"><b>標題：</b>${esc(pv.title)}　<b>Hook：</b>${esc(pv.hook)}</div>`;
+  html += `<div style="margin-bottom:6px"><b>Hashtags：</b>${esc((pv.hashtags||[]).join(' ')||'（無）')}</div>`;
+  if (pv.sots && pv.sots.length) {
+    html += `<div style="margin-bottom:6px;padding:8px 10px;background:#fff;border-radius:6px">
+      <b>🎤 受訪原音安排（${pv.sots.length} 段）：</b>${pv.sots.map(s =>
+        `<div style="margin-top:4px;font-size:.8rem;color:#444">${esc(s.label)}・${s.dur}s：「${esc(s.display)}」${s.speaker?`<div style="color:#1d4ed8">📛 名條：${esc(s.speaker)}</div>`:`<div style="color:#92400e">（無法確認發言者，不掛名條）</div>`}</div>`).join('')}</div>`;
+  }
+  if (pv.stat && pv.stat.value) {
+    html += `<div style="margin-bottom:6px;padding:8px 10px;background:#fff;border-radius:6px;font-size:.8rem">
+      📊 數據動態卡：<b>${esc(pv.stat.label||'')} ${esc(pv.stat.value)}${esc(pv.stat.unit||'')}</b>（旁白唸到此數字時插入 2.8 秒動畫卡）</div>`;
+  }
+  if (pv.highlights && pv.highlights.length) {
+    html += `<div style="margin-bottom:6px;padding:8px 10px;background:#fff;border-radius:6px;font-size:.8rem">
+      🖍 字幕標色關鍵詞：${pv.highlights.map(h=>`<span style="background:#fef08a;padding:1px 6px;border-radius:4px;margin-right:4px">${esc(h)}</span>`).join('')}（數字一律自動標色）</div>`;
+  }
+  document.getElementById('sp-content').innerHTML = html;
+  document.getElementById('sp-nar').value = pv.narration || '';
+}
+
+async function confirmScript(action) {
+  const box = document.getElementById('script-box');
+  box.querySelectorAll('button').forEach(b => b.disabled = true);
+  spDecided = true;
+  try {
+    await fetch('/api/confirm_script', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action, narration: document.getElementById('sp-nar').value}),
+    });
+  } catch(_) {}
+  box.querySelectorAll('button').forEach(b => b.disabled = false);
+  spShown = false;
+  box.style.display = 'none';
+}
+
 async function showCheckpoint() {
   try {
     const pv = await (await fetch('/api/preview')).json();
@@ -1729,7 +2179,47 @@ async function showCheckpoint() {
   } catch(_) {}
 }
 
+let planEdits = {};      // 分鏡站的人工換片段 {rowIndex: {index, path, start}}
+let pvOptions = [];      // 素材庫全部片段（換片段下拉的資料來源）
+
+function escH(s) {
+  return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+function toggleSwap(i) {
+  const d = document.getElementById('swap' + i);
+  if (d.style.display === 'none') {
+    if (!d.innerHTML) {
+      const opts = pvOptions.map((o, j) =>
+        `<option value="${j}">${escH(o.name)}　${o.start}~${o.end}s　${escH(o.desc)}</option>`).join('');
+      d.innerHTML = `<select onchange="applySwap(${i}, this.value)" style="width:100%;font-size:.74rem;padding:5px;border:1px solid #cbd5e1;border-radius:5px">
+        <option value="">— 選擇要換成哪個片段（維持原時長）—</option>${opts}</select>`;
+    }
+    d.style.display = 'block';
+  } else {
+    d.style.display = 'none';
+  }
+}
+
+function applySwap(i, j) {
+  const row = document.getElementById('cprow' + i);
+  const label = document.getElementById('swaplabel' + i);
+  if (j === '') {
+    delete planEdits[i];
+    row.style.outline = '';
+    label.textContent = '';
+    return;
+  }
+  const o = pvOptions[Number(j)];
+  planEdits[i] = {index: i, path: o.path, start: o.start};
+  row.style.outline = '2px solid #2563eb';
+  label.textContent = '👤 已改選：' + o.name + ' 第' + o.start + 's 起';
+}
+
 function renderCheckpoint(pv) {
+  planEdits = {};
+  pvOptions = pv.options || [];
+  document.getElementById('draft-area').innerHTML = '';
   const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
   const tags = (pv.hashtags && pv.hashtags.length) ? pv.hashtags.join(' ') : '（無）';
   let html = '';
@@ -1770,19 +2260,26 @@ function renderCheckpoint(pv) {
   html += `<div style="margin-bottom:8px"><b>Hashtags：</b>${esc(tags)}</div>`;
   html += `<div style="margin-bottom:8px"><b>旁白全文：</b><div style="white-space:pre-wrap;line-height:1.7;margin-top:4px;background:#fff;padding:8px;border-radius:6px">${esc(pv.narration)}</div></div>`;
   if (pv.segments && pv.segments.length) {
-    html += `<div style="margin-bottom:6px"><b>配對畫面（每段配到什麼）：</b></div>`;
+    html += `<div style="margin-bottom:6px"><b>配對畫面（每段配到什麼）：</b><span style="font-size:.74rem;color:#92400e">　覺得某段配錯 → 按「🔄 換」直接改選素材庫其他片段</span></div>`;
     let at = 0;
-    html += pv.segments.map(s => {
+    html += pv.segments.map((s, i) => {
       const from = at.toFixed(0); at += (s.dur || 0); const to = at.toFixed(0);
       const img = s.thumb
         ? `<img src="data:image/jpeg;base64,${s.thumb}" style="width:90px;border-radius:6px;flex-shrink:0">`
         : `<div style="width:90px;height:60px;background:#111;border-radius:6px;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#888;font-size:.7rem">黑幕</div>`;
-      return `<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;background:#fff;padding:6px;border-radius:6px">
-        ${img}
-        <div style="font-size:.76rem;line-height:1.5">
-          <div style="color:#92400e;font-weight:600">${from}-${to}s ← ${esc(s.video)}${s.start ? ' 第'+s.start+'s起' : ''}</div>
-          <div style="color:#666">${esc(s.why)}</div>
+      const swapBtn = s.editable
+        ? `<button onclick="toggleSwap(${i})" style="margin-left:8px;font-size:.7rem;padding:1px 8px;border:1px solid #d1d5db;border-radius:5px;background:#fff;cursor:pointer">🔄 換</button>`
+        : '';
+      return `<div id="cprow${i}" style="margin-bottom:8px;background:#fff;padding:6px;border-radius:6px">
+        <div style="display:flex;gap:10px;align-items:center">
+          ${img}
+          <div style="font-size:.76rem;line-height:1.5;min-width:0">
+            <div style="color:#92400e;font-weight:600">${from}-${to}s ← ${esc(s.video)}${s.start ? ' 第'+s.start+'s起' : ''}${swapBtn}</div>
+            <div style="color:#666">${esc(s.why)}</div>
+            <div id="swaplabel${i}" style="color:#1d4ed8;font-weight:600"></div>
+          </div>
         </div>
+        <div id="swap${i}" style="display:none;margin-top:6px"></div>
       </div>`;
     }).join('');
   }
@@ -1790,6 +2287,38 @@ function renderCheckpoint(pv) {
     html += `<div style="margin-top:8px"><b>字幕分段（${pv.subtitles.length} 句）：</b><div style="color:#555;margin-top:4px;line-height:1.8">${pv.subtitles.map(esc).join(' ／ ')}</div></div>`;
   }
   document.getElementById('cp-content').innerHTML = html;
+}
+
+async function draftPreview() {
+  // 用目前分鏡（含尚未確認的換片段）渲染 480p 草稿：字幕/名條/數據卡/BGM 全都在
+  const area = document.getElementById('draft-area');
+  const btn = document.getElementById('draft-btn');
+  btn.disabled = true;
+  area.innerHTML = '<div style="font-size:.8rem;color:#92400e">⏳ 預覽渲染中（約 10~20 秒）…</div>';
+  try {
+    const r = await fetch('/api/draft', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({plan_edits: Object.values(planEdits)}),
+    });
+    const d = await r.json();
+    if (d.error) { area.innerHTML = '<div style="color:#b91c1c;font-size:.8rem">預覽失敗：' + d.error + '</div>'; btn.disabled = false; return; }
+    const timer = setInterval(async () => {
+      const s = await (await fetch('/api/draft_status')).json();
+      if (s.running) return;
+      clearInterval(timer);
+      btn.disabled = false;
+      if (s.error || !s.ready) {
+        area.innerHTML = '<div style="color:#b91c1c;font-size:.8rem">預覽失敗：' + (s.error || '未知原因') + '</div>';
+        return;
+      }
+      area.innerHTML =
+        '<video controls playsinline autoplay muted style="width:100%;max-height:430px;border-radius:8px;background:#000" src="/api/draft_video?ts=' + Date.now() + '"></video>' +
+        '<div style="font-size:.74rem;color:#92400e;margin-top:4px">此為低畫質預覽（480p）；正式渲染為完整畫質。換了片段可再按一次預覽。</div>';
+    }, 1500);
+  } catch(e) {
+    area.innerHTML = '<div style="color:#b91c1c;font-size:.8rem">預覽失敗：' + e.message + '</div>';
+    btn.disabled = false;
+  }
 }
 
 async function confirmJob(action) {
@@ -1800,7 +2329,7 @@ async function confirmJob(action) {
     await fetch('/api/confirm', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action}),
+      body: JSON.stringify({action, plan_edits: Object.values(planEdits)}),
     });
   } catch(_) {}
   box.querySelectorAll('button').forEach(b => b.disabled = false);
@@ -1824,11 +2353,29 @@ function handleJobDone(d) {
 
 // 換分頁/視窗、或重新整理頁面後，自動接上仍在跑（或剛跑完還沒看過結果）的工作；
 // 已經看過結果的舊工作不會重複跳出來
+function syncInputsFromJob(d) {
+  // 接上進行中的工作（含重跑）時，把左側清單/文稿/照片換成「這個工作實際用的輸入」
+  // 文稿獨立同步——不能因為影片清單剛好一致就連文稿一起跳過（踩過：影片有貼回、文章沒貼回）
+  if (d.input_article) {
+    const art = document.getElementById('article');
+    if (art.value.trim() !== d.input_article.trim()) art.value = d.input_article;
+  }
+  if (!d.input_videos || !d.input_videos.length) return;
+  const cur = videoList.map(v => v.path).join(';');
+  if (cur === d.input_videos.join(';')) return;   // 清單已一致就不動
+  videoList = d.input_videos.map(p => ({path: p, start: 0, analyzing: false, analysis: null}));
+  importedPhotos = d.input_photos || [];
+  renderVideoList();
+  renderPhotoStrip();
+  analyzeQueued(videoList.slice());   // 分析有快取，只是把分類/描述補回畫面
+}
+
 async function resumeIfRunning() {
   try {
     const d = await (await fetch('/api/status')).json();
     if (!d.done) {
       document.getElementById('btn').disabled = true;
+      syncInputsFromJob(d);
       renderSteps(d);
       timer = setInterval(poll, 1000);
     } else if ((d.filename || d.error) && d.started_at &&
@@ -1970,8 +2517,12 @@ function resetUI() {
   document.getElementById('plan-box').style.display = 'none';
   const cp = document.getElementById('checkpoint-box');
   if (cp) cp.style.display = 'none';
+  const sp = document.getElementById('script-box');
+  if (sp) sp.style.display = 'none';
   cpShown = false;
   cpDecided = false;
+  spShown = false;
+  spDecided = false;
   document.getElementById('preview-video').removeAttribute('src');
   document.getElementById('progress-bar').style.width = '0%';
   document.getElementById('progress-pct').textContent = '0%';
@@ -2012,7 +2563,8 @@ function renderPhotoStrip() {
   const strip = document.getElementById('photo-strip');
   strip.innerHTML = importedPhotos.map((p, i) =>
     `<div class="photo-thumb">
-       <img src="/api/photo?path=${encodeURIComponent(p)}" alt="">
+       <img src="/api/photo?path=${encodeURIComponent(p)}" alt="" loading="lazy"
+            style="cursor:zoom-in" onclick="showPhotoLarge(${i})">
        <button class="rm" onclick="removePhoto(${i})" title="移除">&times;</button>
      </div>`).join('');
   // 沒影片但有照片 → 圖輯式模式提示
@@ -2059,6 +2611,12 @@ function renderVideoList() {
     name.textContent = v.path;
     name.title = v.path;
 
+    const pv = document.createElement('button');
+    pv.className = 'btn-preview';
+    pv.textContent = '▶';
+    pv.title = '預覽影片';
+    pv.onclick = () => previewVideo(v.path);
+
     const btn = document.createElement('button');
     btn.className = 'btn-remove';
     btn.textContent = '✕';
@@ -2066,6 +2624,7 @@ function renderVideoList() {
 
     top.appendChild(idx);
     top.appendChild(name);
+    top.appendChild(pv);
     top.appendChild(btn);
     row.appendChild(top);
 
@@ -2146,29 +2705,20 @@ async function analyzeQueued(items) {
 
 // ─── 記住上次設定 ──────────────────────────────────────────────────────────
 function saveLastSettings() {
-  // 分析結果只存分類/描述（不含 error 物件裡可能的大型內容），避免 localStorage 爆量
-  const slim = videoList.map(v => ({
-    path: v.path, start: v.start,
-    analysis: v.analysis ? {category: v.analysis.category, description: v.analysis.description,
-                             duration: v.analysis.duration, error: v.analysis.error} : null
-  }));
-  localStorage.setItem('videoai_video_list', JSON.stringify(slim));
+  // 只存「設定類」偏好；素材（影片清單/照片）刻意不存——
+  // 使用者指定：重新整理＝乾淨的開始，舊素材通通清掉（2026-07-10）
   localStorage.setItem('videoai_last_browse_dir', localStorage.getItem('videoai_last_browse_dir') || '');
-  localStorage.setItem('videoai_checkpoint', document.getElementById('checkpoint').checked ? '1' : '0');
-  localStorage.setItem('videoai_photos', JSON.stringify(importedPhotos));
+  // 鍵名 v2：確認站語意已從「單一分鏡確認」升級為「兩站確認」，舊偏好作廢重新預設勾選
+  localStorage.setItem('videoai_checkpoint2', document.getElementById('checkpoint').checked ? '1' : '0');
 }
 
 function restoreLastSettings() {
-  localStorage.removeItem('videoai_voice');  // 舊版留下的設定，聲音已固定預設不再需要
-  try {
-    const saved = JSON.parse(localStorage.getItem('videoai_video_list') || '[]');
-    if (Array.isArray(saved)) videoList = saved;
-  } catch(_) { videoList = []; }
-  try {
-    const ph = JSON.parse(localStorage.getItem('videoai_photos') || '[]');
-    if (Array.isArray(ph)) importedPhotos = ph;
-  } catch(_) { importedPhotos = []; }
-  const cpPref = localStorage.getItem('videoai_checkpoint');
+  // 清掉舊版存過的素材/設定鍵（現制：素材不跨重新整理保留）
+  ['videoai_voice', 'videoai_video_list', 'videoai_photos', 'videoai_checkpoint']
+    .forEach(k => localStorage.removeItem(k));
+  videoList = [];
+  importedPhotos = [];
+  const cpPref = localStorage.getItem('videoai_checkpoint2');
   if (cpPref !== null) document.getElementById('checkpoint').checked = (cpPref === '1');
   renderVideoList();
   renderPhotoStrip();
@@ -2292,6 +2842,8 @@ async function importBacklogItem(articleNo) {
     if (d.error) { alert('匯入失敗：' + d.error); btn.disabled = false; btn.textContent = '📥 匯入'; return; }
 
     document.getElementById('article').value = d.content || '';
+    // 匯入完成直接帶使用者到「輸入資料」的新聞稿區（不用自己往下捲）
+    document.getElementById('article').scrollIntoView({behavior: 'smooth', block: 'start'});
     importedPhotos = d.photos || [];   // 換新聞就換配圖，不累積上一篇的
     const kwBox = document.getElementById('import-keywords');
     const kwParts = [];
@@ -2307,7 +2859,9 @@ async function importBacklogItem(articleNo) {
       alert('部分影片下載失敗：\\n' + d.errors.join('\\n'));
     }
 
-    // 下載好的影片直接加進選取清單，比照「加入選取」流程自動跑智慧分析
+    // 換新聞＝換素材：上一則還沒產製就匯入下一則時，影片清單整組換新不累積
+    // （照片在上面已同樣處理），下載好的影片自動跑智慧分析
+    videoList = [];
     const newItems = [];
     (d.downloaded || []).forEach(path => {
       if (!videoList.some(v => v.path === path)) {
@@ -2468,8 +3022,69 @@ function browseMsg(text) {
   return div;
 }
 
+// ─── 照片放大檢視（照片素材列點圖開燈箱，← → 鍵或畫面箭頭切換）──────────────
+let lightboxIdx = 0;
+function showPhotoLarge(i) {
+  lightboxIdx = i;
+  document.getElementById('photo-lightbox-img').src =
+    '/api/photo?path=' + encodeURIComponent(importedPhotos[i]);
+  document.getElementById('photo-lightbox-count').textContent =
+    (importedPhotos.length > 1) ? (i + 1) + ' / ' + importedPhotos.length : '';
+  document.getElementById('photo-lightbox').style.display = 'flex';
+}
+function stepPhoto(dir) {
+  if (!importedPhotos.length) return;
+  showPhotoLarge((lightboxIdx + dir + importedPhotos.length) % importedPhotos.length);
+}
+document.addEventListener('keydown', e => {
+  const box = document.getElementById('photo-lightbox');
+  if (!box || box.style.display !== 'flex') return;
+  if (e.key === 'ArrowLeft') stepPhoto(-1);
+  else if (e.key === 'ArrowRight') stepPhoto(1);
+  else if (e.key === 'Escape') box.style.display = 'none';
+});
+
+// ─── 素材影片預覽 ───────────────────────────────────────────────────────────
+function previewVideo(path) {
+  const m = document.getElementById('pv-modal');
+  const v = document.getElementById('pv-video');
+  v.src = '/api/src_video?path=' + encodeURIComponent(path);
+  const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf(String.fromCharCode(92)));
+  document.getElementById('pv-name').textContent = path.substring(cut + 1);
+  m.style.display = 'flex';
+  v.play().catch(() => {});
+}
+function closePreviewVideo(ev) {
+  if (ev && ev.target.id === 'pv-video') return;
+  const v = document.getElementById('pv-video');
+  v.pause(); v.removeAttribute('src'); v.load();
+  document.getElementById('pv-modal').style.display = 'none';
+}
 
 </script>
+
+<div id="photo-lightbox" onclick="this.style.display='none'"
+     style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:210;
+            align-items:center;justify-content:center;cursor:zoom-out">
+  <span style="position:absolute;top:14px;right:22px;font-size:26px;color:#fff">✕</span>
+  <span id="photo-lightbox-count" style="position:absolute;top:18px;left:22px;font-size:15px;color:#d1d5db"></span>
+  <button onclick="event.stopPropagation();stepPhoto(-1)"
+     style="position:absolute;left:14px;top:50%;transform:translateY(-50%);font-size:30px;color:#fff;
+            background:rgba(0,0,0,.45);border:0;border-radius:50%;width:52px;height:52px;cursor:pointer">‹</button>
+  <button onclick="event.stopPropagation();stepPhoto(1)"
+     style="position:absolute;right:14px;top:50%;transform:translateY(-50%);font-size:30px;color:#fff;
+            background:rgba(0,0,0,.45);border:0;border-radius:50%;width:52px;height:52px;cursor:pointer">›</button>
+  <img id="photo-lightbox-img" style="max-width:88vw;max-height:92vh;border-radius:8px">
+</div>
+
+<div id="pv-modal" onclick="closePreviewVideo(event)"
+     style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:200;
+            align-items:center;justify-content:center;flex-direction:column">
+  <span style="position:absolute;top:14px;right:22px;font-size:26px;color:#fff;cursor:pointer">✕</span>
+  <video id="pv-video" controls playsinline
+         style="max-width:92vw;max-height:80vh;border-radius:10px;background:#000"></video>
+  <div id="pv-name" style="color:#d1d5db;font-size:.82rem;margin-top:10px;font-family:monospace"></div>
+</div>
 
 </body>
 </html>"""
@@ -2555,6 +3170,59 @@ def api_status():
     return jsonify(d)
 
 
+@app.route('/api/script_preview')
+def api_script_preview():
+    """旁白稿確認 checkpoint 的預覽 payload（稿＋SOT 安排＋查核＋譯名＋數據卡）"""
+    return jsonify(_script_preview)
+
+
+@app.route('/api/confirm_script', methods=['POST'])
+def api_confirm_script():
+    """旁白稿確認：go（可附修改後的旁白）/ cancel"""
+    data = request.get_json(silent=True) or {}
+    action = data.get('action')
+    if action not in ('go', 'cancel'):
+        return jsonify({'error': 'bad action'}), 400
+    if not _job.get('awaiting_script'):
+        return jsonify({'error': '目前沒有等待中的旁白稿確認'}), 409
+    nar = (data.get('narration') or '').strip()
+    _script_edit[0] = nar or None
+    _confirm_action[0] = action
+    _confirm_event.set()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/draft', methods=['POST'])
+def api_draft():
+    """快速預覽：分鏡確認暫停期間，用目前分鏡（含未確認的換片段）渲染 480p 草稿"""
+    if not _job.get('awaiting_confirm'):
+        return jsonify({'error': '預覽只在分鏡確認時可用'}), 409
+    if _draft['running']:
+        return jsonify({'error': '預覽已在渲染中'}), 429
+    data = request.get_json(silent=True) or {}
+    _draft.update({'running': True, 'error': None})
+    threading.Thread(target=_render_draft,
+                     args=(data.get('plan_edits') or [],), daemon=True).start()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/draft_status')
+def api_draft_status():
+    return jsonify({'running': _draft['running'], 'error': _draft['error'],
+                    'ready': bool(_draft['file'] and not _draft['running']
+                                  and not _draft['error'])})
+
+
+@app.route('/api/draft_video')
+def api_draft_video():
+    f = _draft.get('file')
+    if not f or not Path(f).exists():
+        return 'no draft', 404
+    resp = send_file(f, mimetype='video/mp4', conditional=True)
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
 @app.route('/api/preview')
 def api_preview():
     """分鏡確認暫停時，前端一次性抓取的預覽內容（旁白/Hook/配對縮圖/字幕）"""
@@ -2566,6 +3234,7 @@ def api_confirm():
     """使用者在分鏡確認 checkpoint 的決定：go=繼續渲染、cancel=放棄"""
     data = request.json or {}
     action = 'cancel' if data.get('action') == 'cancel' else 'go'
+    _confirm_edits[0] = data.get('plan_edits') or None
     if not _job.get('awaiting_confirm'):
         return jsonify({'error': '目前沒有等待確認的工作'}), 409
     _confirm_action[0] = action
@@ -2689,7 +3358,9 @@ def api_backlog_import():
     photo_paths = []
     if article.get('photo_url'):
         try:
-            photo_paths.append(ltn_api.download_photo(article['photo_url'], article_no))
+            # LTN 圖檔編號遞增，API 只回第一張——探測抓出同篇全部配圖
+            for pi, purl in enumerate(ltn_api.discover_photos(article['photo_url']), 1):
+                photo_paths.append(ltn_api.download_photo(purl, article_no, pi))
         except Exception as e:
             errors.append(f"配圖下載失敗：{e}")
 
@@ -2740,6 +3411,21 @@ def api_video(filename):
     if not path:
         return 'File not found', 404
     return send_file(str(path), mimetype='video/mp4', conditional=True)
+
+
+@app.route('/api/src_video')
+def api_src_video():
+    """預覽素材影片（素材清單的 ▶ 按鈕用；限 input/ 底下，防目錄穿越）"""
+    raw = request.args.get('path', '')
+    input_dir = (BASE / 'input').resolve()
+    try:
+        p = Path(raw).resolve()
+        p.relative_to(input_dir)
+    except Exception:
+        return 'forbidden', 403
+    if not p.is_file():
+        return 'not found', 404
+    return send_file(str(p), mimetype='video/mp4', conditional=True)
 
 
 @app.route('/api/thumb/<filename>')
@@ -2856,9 +3542,10 @@ def api_rerun():
                 'error': None, 'filename': None, 'title': None, 'warning': None,
                 'plan': None, 'started_at': time.time(), 'step_started_at': time.time(),
                 'elapsed_sec': 0, 'step_elapsed_sec': 0}
+    photos = [p for p in (src.get('photos') or []) if Path(p).exists()]
     t = threading.Thread(target=run_job,
                          args=(article, videos, src.get('output_file', '').rsplit('.', 1)[0],
-                               'hsiaochen', True, []),
+                               'hsiaochen', True, photos),
                          daemon=True)
     t.start()
     return jsonify({'ok': True, 'videos_found': len(videos), 'videos_expected': len(vpaths)})
