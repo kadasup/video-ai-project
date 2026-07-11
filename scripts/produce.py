@@ -96,6 +96,24 @@ def apply_pronounce(text: str) -> str:
     return text
 
 
+def _tts_normalize_punct(text: str) -> str:
+    """
+    TTS 專用標點正規化（只影響發音，不影響字幕顯示）：把會讓 edge-tts 唸得
+    卡頓或怪異的裝飾性標點清掉或換成自然停頓。實測踩過：標題外框的引號、
+    書名號、波浪號夾在句中會讓語音突然斷掉或怪腔。
+    去標點後的中文/英數字數不變 → 時間軸對齊（用去標點字數）完全不受影響。
+    """
+    text = re.sub(r"[「」『』﹁﹂﹃﹄“”‘’]", "", text)      # 引號外框 → 靜音移除，句子連貫唸
+    text = re.sub(r"[《〈]", "", text)                      # 書名號/篇名號開 → 移除
+    text = re.sub(r"[》〉]", "、", text)                    # 書名號閉 → 頓號（並列曲目/作品分隔）
+    text = re.sub(r"[～〜]", "、", text)                    # 波浪號（裝飾性連接）→ 頓號停頓
+    text = re.sub(r"、+", "、", text)                       # 收斂重複頓號
+    text = re.sub(r"、(?=[，。！？、：])", "", text)         # 頓號後緊接其他句讀 → 去掉頓號
+    text = re.sub(r"(?<=[，。！？：])、", "", text)          # 句讀後緊接頓號 → 去掉頓號
+    text = re.sub(r"^[、，]+", "", text)                    # 行首多餘停頓
+    return text
+
+
 # ── 數字轉中文讀法（只給 TTS 用，字幕照樣顯示阿拉伯數字）────────────────────
 # edge-tts 對阿拉伯數字常逐字唸（760 唸成「七六〇」），轉成中文數字才會唸「七百六十」。
 # 字幕/TTS 字數差由對齊端的比例縮放吸收（跟 apply_pronounce 同一套機制）。
@@ -163,6 +181,7 @@ def num2zh(text: str) -> str:
             return _int_to_zh(a) + "點" + _digits_to_zh(b)
         return _int_to_zh(s)
 
+    text = re.sub(r"(?<=\d),(?=\d)", "", text)   # 千分位逗號先拿掉（1,200 → 1200），否則會唸成「一,兩百」
     text = re.sub(r"(\d+(?:\.\d+)?)\s*[%％]", lambda m: "百分之" + num2zh(m.group(1)), text)
     return re.sub(r"\d+(?:\.\d+)?", _num, text)
 
@@ -193,6 +212,11 @@ def _chunk_narration(text: str, max_len: int = 16) -> list[str]:
     start = 0
     for idx, ch in enumerate(text):
         if ch in punct:
+            # 半形句點/逗號夾在數字中間是小數點/千分位（25.9公里、1,000），
+            # 不是標點，切下去會把數字劈成兩張字幕
+            if (ch in ".," and 0 < idx < len(text) - 1
+                    and text[idx - 1].isdigit() and text[idx + 1].isdigit()):
+                continue
             clauses.append(text[start:idx + 1])
             start = idx + 1
     if start < len(text):
@@ -260,9 +284,13 @@ def _seg_words(text: str) -> list[str] | None:
             out.append(text[pos:pos + len(w)])
             pos += len(w)
         # 數字/序數詞跟後面的詞黏著成一個單位（第二+航廈、760+架次）——
-        # 這種組合被拆開跨卡/跨行會很難讀（「…前往第二 ‖ 航廈車道…」）
+        # 這種組合被拆開跨卡/跨行會很難讀（「…前往第二 ‖ 航廈車道…」）。
+        # 也要吃得下小數/千分位（25.9公里、1,000）：jieba 會把「25.9」切成
+        # 25/./9 三塊，黏著時「25」「25.」「25.9」都得算數字才能接著黏
         glued: list[str] = []
-        numish = re.compile(r"第?[0-9０-９零一二兩三四五六七八九十百千]+$")
+        numish = re.compile(
+            r"第?[0-9０-９零一二兩三四五六七八九十百千]+"
+            r"(?:[\.．,][0-9０-９]+)*[\.．,]?$")
         for w in out:
             if glued and numish.fullmatch(glued[-1]):
                 glued[-1] += w
@@ -394,8 +422,8 @@ def generate_script(article: str, footage_notes: str | None = None,
 "stat"（數據動態字卡）規則：
 - 只在新聞裡有「一個」具衝擊力的關鍵數字時才給（金額、人數、次數、百分比等），
   成片會在旁白唸到它時插入 2.8 秒的動態數字卡強化記憶點
-- value 必須是阿拉伯數字（可含小數點），且**旁白裡要用同樣的阿拉伯數字寫法**唸出這個數字
-  （程式靠字面比對找插卡時間點）；label 6 字內；note 12 字內可省略
+- value 必須與**旁白中該數字的字面寫法完全一致**（程式靠字面比對找插卡時間點）：
+  旁白寫「760」就給 "760"、寫「1萬1400」就給 "1萬1400"（可含萬/億）；label 6 字內；note 12 字內可省略
 - 沒有適合的數字、或數字不是新聞重點時，"stat" 給 null，寧缺勿濫
 
 "highlights"（字幕關鍵詞標色）規則：
@@ -414,6 +442,13 @@ hook／hashtag 規則：
 - ⚠️ 字數硬規定：{int(MAIN_SEC * 4.2)}~{int(MAIN_SEC * 4.5)} 字（含標點），寫完務必數一次。
   低於 {int(MAIN_SEC * 4.2)} 字結尾會有長段無聲空景、高於 {int(MAIN_SEC * 4.5)} 字會被截斷，
   兩種都算不合格；寫完若不在區間內，自行增刪到符合再輸出
+- ⚠️ 忠於記者原稿：旁白是把新聞稿「刪減」到字數區間，不是讀完後自己重寫一篇。
+  能沿用原稿的字句就照抄沿用，壓字數靠刪掉次要細節與重複資訊，不靠換句話說；
+  絕不自創原稿沒有的形容詞、動詞或情境描寫。只有四種情況才改動原稿用字：
+  ①書面語唸不順（括號補充、倒裝書面句、「（記者○○○報導）」這類）
+  ②違反本清單其他規則（數字唸法、匿名原則、句號節奏、AI 腔）
+  ③破題句需要重組出「時間＋地點＋事件」
+  ④相鄰兩段被刪掉中間內容後需要最小限度的銜接詞
 - 第一句先破題：時間＋地點＋發生什麼事，一句話講完
 - 結構：破題 → 經過細節 → 傷亡損失 → 警方處置 → 收尾（後續發展）
 - ⚠️ 句號要省著用：實測 TTS 在句號／驚嘆號／問號後會停頓約 0.85 秒，逗號只停頓約 0.3 秒，
@@ -553,27 +588,37 @@ def dedup_narration_vs_sots(narration: str,
     return new_nar, afters, usage
 
 
-def extract_stat(narration: str) -> tuple[dict | None, dict]:
+def extract_card(narration: str) -> tuple[dict | None, dict]:
     """
-    數據卡補判：generate_script 對 stat 的判斷不穩定（同一篇稿有時給有時不給），
-    旁白裡明明有數字時再單獨判一次，讓數據卡穩定出現。回傳 (stat|None, tokens)。
+    資訊卡補判（四型選一）：generate_script 沒給 stat 時，再判斷這支旁白適合哪種
+    動畫資訊卡——stat 數據卡 / timeline 時序卡 / alert 警示卡 / chart 圖表卡。
+    一支影片最多一張，選資訊力最強的。回傳 (card|None, tokens)。
     """
     prompt = (
-        "你是新聞影音編輯。以下旁白若有「一個」最具衝擊力的關鍵數字，適合做 2.8 秒的"
-        "動態數字卡強化記憶點（金額、人數、架次、百分比等，且必須是這則新聞的重點數字），"
-        "請挑出來。\n"
-        "- value 必須跟旁白裡的阿拉伯數字寫法完全一致（程式靠字面比對找插卡時間）\n"
-        "- label 6 字內、note 12 字內（note 可省略）\n"
-        "- 旁白沒有數字、或數字都不是重點時回 null，寧缺勿濫\n\n"
+        "你是新聞影音編輯。判斷以下旁白適不適合插入「一張」動畫資訊卡（四選一或不插）：\n"
+        "1. stat 數據卡＝有單一衝擊性關鍵數字 →\n"
+        '   {"type":"stat","value":"760","unit":"架次","label":"航班取消","note":"週六停飛"}\n'
+        "2. timeline 時序卡＝事件有清楚的 3~4 步經過（案發→逃逸→落網）→\n"
+        '   {"type":"timeline","title":"事件經過","steps":["23:40 酒駕連撞4車","駕駛棄車逃逸","1小時後落網"]}\n'
+        "3. alert 警示卡＝颱風/豪雨/地震等警報、停班停課類訊息 →\n"
+        '   {"type":"alert","icon":"颱風","headline":"海陸警報齊發","sub":"暴風圈今晚觸陸"}\n'
+        "   icon 限：颱風/豪雨/雷雨/地震/火災/警報/強風/大浪/停電/低溫\n"
+        "4. chart 圖表卡＝旁白出現 3 筆以上同類數字（各時段雨量、各地災情數）→\n"
+        '   {"type":"chart","title":"時雨量","unit":"毫米","points":[{"label":"9時","value":58},{"label":"10時","value":96}]}\n\n'
+        "規則：\n"
+        "- 每張卡都要給 \"anchor\"：從旁白**原文複製**的一小段（8~14 字），卡片會在旁白唸到"
+        "這句時出現——必須字面一致，程式靠它定位\n"
+        "- stat 的 value 必須與旁白字面寫法完全一致（旁白寫「1萬1400」就給「1萬1400」）\n"
+        "- label/title/headline ≤8 字；steps 每步 ≤12 字；sub/note ≤14 字\n"
+        "- 都不適合就回 {\"card\": null}，寧缺勿濫\n\n"
         f"旁白：{narration}\n\n"
-        '回傳 JSON：{"stat": {"value": "760", "unit": "架次", "label": "航班取消", '
-        '"note": "颱風影響桃園機場"}} 或 {"stat": null}'
+        '回傳 JSON：{"card": {...含 type 與 anchor...}} 或 {"card": null}'
     )
     resp = _client().chat.completions.create(
         model=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2"),
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
-        max_completion_tokens=200,
+        max_completion_tokens=500,
     )
     data = json.loads(resp.choices[0].message.content)
     usage = {}
@@ -581,9 +626,9 @@ def extract_stat(narration: str) -> tuple[dict | None, dict]:
         usage = {"prompt_tokens": resp.usage.prompt_tokens,
                  "completion_tokens": resp.usage.completion_tokens,
                  "total_tokens": resp.usage.total_tokens}
-    stat = data.get("stat")
-    if isinstance(stat, dict) and str(stat.get("value", "")).strip():
-        return stat, usage
+    card = data.get("card")
+    if isinstance(card, dict) and card.get("type") in ("stat", "timeline", "alert", "chart"):
+        return card, usage
     return None, usage
 
 
@@ -665,7 +710,8 @@ async def _tts_async(text: str, path: Path, voice: str, rate: str, pitch: str) -
     回傳 boundaries 供字幕逐字對齊。offset/duration 單位是 100ns ticks。
     edge-tts 免費服務偶爾會暫時性失敗（如 'No audio was received'），重試 3 次再放棄。
     """
-    tts_text = num2zh(apply_pronounce(text))   # 發音修正＋數字轉中文讀法（字幕不受影響）
+    # 標點正規化＋發音修正＋數字轉中文讀法（都只影響 TTS 發音，字幕不受影響）
+    tts_text = num2zh(apply_pronounce(_tts_normalize_punct(text)))
     last_err = None
     for attempt in range(3):
         boundaries: list[dict] = []
@@ -999,7 +1045,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
         """
         text = text.replace("\n", "")
         text = text.strip(_PUNCT)
-        text = re.sub(f"[{re.escape(_PUNCT)}]+", " ", text)
+        # 夾在數字中間的半形句點/逗號是小數點/千分位（25.9、1,200），要留著顯示
+        text = re.sub(f"(?<!\\d)[{re.escape(_PUNCT)}]+|[{re.escape(_PUNCT)}]+(?!\\d)"
+                      f"|[{re.escape('，。、；：！？;:!?')}]+", " ", text)
         return re.sub(r"\s+", " ", text).strip()
 
     # 斷行語感：只在「詞的邊界」斷（結巴斷詞），介詞後面優先、數字絕不拆；
@@ -1036,8 +1084,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
                 score += 2                        # 介詞/連接詞後面是自然停頓
             if nxt in _BREAK_AFTER:
                 score -= 2                        # 下一行用「的/了…」開頭很難讀
-            if prev.isdigit() and nxt.isdigit():
-                score -= 5                        # 數字絕不能拆（760 → 7／60）
+            if ((prev.isdigit() or prev in ".,") and
+                    (nxt.isdigit() or nxt in ".,")):
+                score -= 5                        # 數字絕不能拆（760 → 7／60；25.9 → 25.／9）
             if score > best_score:
                 best_score, best_j = score, j
         a, b = text[:best_j].rstrip(), text[best_j:].lstrip()
@@ -1231,9 +1280,9 @@ def _hook_filter(hook: str | None) -> str:
     fp = font_path()
     font_arg = f":fontfile='{fp}'" if fp else ""
     return (
-        f"drawtext=text='{text}'{font_arg}:fontsize=56:fontcolor=white"
-        f":x=(w-text_w)/2:y=280:shadowcolor=black:shadowx=2:shadowy=2"
-        f":box=1:boxcolor=black@0.45:boxborderw=20"
+        f"drawtext=text='{text}'{font_arg}:fontsize=38:fontcolor=0x0A1B33"
+        f":x=(w-text_w)/2:y=185"
+        f":box=1:boxcolor=0xFFD640@0.95:boxborderw=14"
         f":enable='between(t,0,{HOOK_SEC})'"
     )
 
@@ -1250,9 +1299,9 @@ def _title_filter(title: str | None) -> str:
     fp = font_path()
     font_arg = f":fontfile='{fp}'" if fp else ""
     return (
-        f"drawtext=text='{text}'{font_arg}:fontsize=46:fontcolor=white"
-        f":x=(w-text_w)/2:y=180:shadowcolor=black:shadowx=2:shadowy=2"
-        f":box=1:boxcolor=black@0.55:boxborderw=16"
+        f"drawtext=text='{text}'{font_arg}:fontsize=60:fontcolor=white"
+        f":x=(w-text_w)/2:y=250:shadowcolor=black:shadowx=2:shadowy=2"
+        f":box=1:boxcolor=0x0A1B33@0.88:boxborderw=18"
         f":enable='between(t,0,{TITLE_SEC})'"
     )
 
@@ -1394,6 +1443,48 @@ def _photo_clip(photo: Path, dur: float, out: Path):
     )
 
 
+def make_open_card(text: str, out: Path, kind: str = "title") -> int:
+    """
+    冷開場字卡（PIL 圖卡，取代陽春 drawtext）：依業界引題／主標階層設計。
+    kind="title"：主標（headline）＝畫面主導元素，深藍底＋亮藍 accent、白粗體 64px；
+    kind="hook"：引題（kicker）＝金黃實心小標籤＋深藍粗體字 38px，放主標上方，
+    字級約為主標 6 成（業界慣例：層級靠字級差 1.5 倍以上＋形狀差，不能只靠顏色）。
+    文字過寬自動縮字級。回傳卡片高度 px。
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    text = (text or "").strip()
+    if kind == "hook":
+        fg, fsize, fmin = (10, 27, 51, 255), 38, 28
+        pad_x, accent_w, pad_v = 22, 0, 26
+    else:
+        fg, fsize, fmin = (255, 255, 255, 255), 64, 44
+        pad_x, accent_w, pad_v = 30, 10, 42
+    max_w = 960
+    font = None
+    while fsize >= fmin:
+        font = ImageFont.truetype(r"C:\Windows\Fonts\msjhbd.ttc", fsize)
+        if accent_w + pad_x * 2 + int(font.getlength(text)) <= max_w:
+            break
+        fsize -= 4
+    tw = int(font.getlength(text))
+    w = min(max_w, accent_w + pad_x * 2 + tw)
+    h = fsize + pad_v
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    if kind == "hook":
+        d.rounded_rectangle([0, 0, w - 1, h - 1], radius=10, fill=(255, 214, 64, 245))
+        d.text((pad_x, h // 2), text, font=font, fill=fg, anchor="lm")
+    else:
+        d.rounded_rectangle([0, 0, w - 1, h - 1], radius=14, fill=(10, 27, 51, 225))
+        d.rounded_rectangle([0, 0, accent_w + 14, h - 1], radius=14, fill=(46, 139, 255, 255))
+        d.rectangle([accent_w + 4, 0, accent_w + 14, h - 1], fill=(10, 27, 51, 225))
+        d.text((accent_w + pad_x, h // 2), text, font=font, fill=fg, anchor="lm")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out)
+    return h
+
+
 def make_strap_png(name: str, title: str, out: Path) -> Path:
     """
     受訪者名條圖卡（SOT lower-third）：深藍圓角底＋亮藍色邊條，
@@ -1530,8 +1621,33 @@ def _assemble_main(plan: list[dict], audio_out: Path, sub_f: str, out: Path,
     filter_parts.append("".join(seg_labels) + f"concat=n={len(seg_labels)}:v=1:a=0[vraw]")
 
     base_label = "vraw"
-    # 冷開場：標題條＋Hook 疊在主畫面最前幾秒（取代舊 3 秒片頭卡）
-    open_f = ",".join(f for f in (_title_filter(title), _hook_filter(hook)) if f)
+    # 冷開場字卡（標題＋Hook）：PIL 圖卡走 PNG overlay（好看、可控），
+    # PIL 失敗才退回 drawtext 備援。位置從角標安全區（y≈106）之下開始排
+    overlay_items: list[dict] = []   # {png,x,y,start,end}
+    _pf = "d" if draft else ""
+    _fallback_open = []
+    y_cursor = 230   # 角標底邊 ~106；使用者指定再往下（原 130）
+    # 業界階層：引題（hook，小標籤）在上、主標（title，大條）在下
+    if hook:
+        _hp = TMP / f"_open_hook{_pf}.png"
+        try:
+            hh = make_open_card(hook, _hp, kind="hook")
+            overlay_items.append({"png": _hp, "x": "(main_w-overlay_w)/2",
+                                  "y": str(y_cursor), "start": 0, "end": HOOK_SEC,
+                                  "rise": True})
+            y_cursor += hh + 12
+        except Exception:
+            _fallback_open.append(_hook_filter(hook))
+    if title:
+        _tp = TMP / f"_open_title{_pf}.png"
+        try:
+            make_open_card(title, _tp, kind="title")
+            overlay_items.append({"png": _tp, "x": "(main_w-overlay_w)/2",
+                                  "y": str(y_cursor), "start": 0, "end": TITLE_SEC,
+                                  "rise": True})
+        except Exception:
+            _fallback_open.append(_title_filter(title))
+    open_f = ",".join(f for f in _fallback_open if f)
     if open_f:
         filter_parts.append(f"[vraw]{open_f}[vhk]")
         base_label = "vhk"
@@ -1548,17 +1664,32 @@ def _assemble_main(plan: list[dict], audio_out: Path, sub_f: str, out: Path,
         filter_parts.append(f"[{base_label}]{sub_f},{ai_f}[vlg]")
         cur = "vlg"
 
-    # 受訪者名條：SOT 時段疊在左下（字幕帶上方），時間窗控制顯示
-    for si, stp in enumerate(straps or []):
-        if not Path(stp["png"]).exists():
+    # 受訪者名條（SOT 時段、左下）＋開場字卡：統一 PNG overlay 時間窗疊加
+    for stp in (straps or []):
+        overlay_items.append({"png": Path(stp["png"]), "x": "40",
+                              "y": "main_h-overlay_h-600",
+                              "start": stp["start"], "end": stp["end"]})
+    # 進出場動畫（業界規範：進場 0.35s 淡入+上浮 24px、退場 0.25s 原地淡出——
+    # 退場要比進場快才不搶注意力；新聞圖卡動作要克制，不做彈跳）
+    _FI, _FO = 0.35, 0.25
+    for oi_n, ov in enumerate(overlay_items):
+        if not Path(ov["png"]).exists():
             continue
-        strap_idx = idx
-        args += ["-i", str(stp["png"])]
+        ov_idx = idx
+        st_, en_ = float(ov["start"]), float(ov["end"])
+        args += ["-loop", "1", "-t", f"{en_ + 0.3:.2f}", "-i", str(ov["png"])]
         idx += 1
         filter_parts.append(
-            f"[{cur}][{strap_idx}:v]overlay=40:main_h-overlay_h-600"
-            f":enable='between(t,{stp['start']},{stp['end']})'[vst{si}]")
-        cur = f"vst{si}"
+            f"[{ov_idx}:v]format=rgba,"
+            f"fade=t=in:st={st_:.2f}:d={_FI}:alpha=1,"
+            f"fade=t=out:st={max(st_, en_ - _FO):.2f}:d={_FO}:alpha=1[ovp{oi_n}]")
+        y_expr = ov["y"]
+        if ov.get("rise"):
+            y_expr = f"{ov['y']}+24*max(0,1-(t-{st_:.2f})/{_FI})"
+        filter_parts.append(
+            f"[{cur}][ovp{oi_n}]overlay=x='{ov['x']}':y='{y_expr}'"
+            f":enable='between(t,{st_:.2f},{en_:.2f})'[vov{oi_n}]")
+        cur = f"vov{oi_n}"
     if draft:   # 預覽：全部效果照舊疊完，最後縮到 480p，用最快檔位編碼
         filter_parts.append(f"[{cur}]scale=480:-2[vout]")
     else:

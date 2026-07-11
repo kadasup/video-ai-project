@@ -30,6 +30,23 @@ def _append_log(record: dict):
         with _LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+_FEEDBACK_FILE = Path(r"D:\VideoAI\logs\feedback.jsonl")
+_fb_lock = threading.Lock()
+
+def _append_feedback(kind: str, job_id: str, payload: dict):
+    """隱性回饋閉環第 1 層：記錄「GPT 的決定 vs 人最後改成什麼」的結構化 diff。
+    append-only（比照回饋資料唯讀慣例，只增不刪），之後彙整成 prompt 改進依據。
+    記錄失敗絕不影響產製流程。"""
+    rec = {"job_id": job_id, "kind": kind,
+           "timestamp": datetime.datetime.now().isoformat(timespec="seconds")}
+    rec.update(payload)
+    try:
+        with _fb_lock:
+            with _FEEDBACK_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
 def _read_logs(limit: int = 200) -> list[dict]:
     """讀取最近 limit 筆（最新在前）"""
     if not _LOG_FILE.exists():
@@ -62,7 +79,7 @@ _load_env()
 sys.path.insert(0, str(Path(__file__).parent))
 from produce import (
     BASE, OUTPUT, TMP, MAIN_SEC, TTS_VOICES,
-    generate_script, shorten_script, factcheck_narration, extract_stat,
+    generate_script, shorten_script, factcheck_narration, extract_card,
     dedup_narration_vs_sots, generate_tts, write_ass,
     align_subtitles_to_boundaries, rescale_subtitles,
     align_segments_to_boundaries, rescale_segments,
@@ -73,7 +90,7 @@ from produce import (
 )
 from select_clip import (
     select_clip, catalog_video, match_narration_to_clips,
-    video_fingerprint, near_duplicate, seg_line,
+    video_fingerprint, near_duplicate, seg_line, describe_photo,
 )
 import ltn_api
 import speech
@@ -104,6 +121,37 @@ _job: dict = {'step': 0, 'msg': '', 'done': True, 'error': None,
 _confirm_event = threading.Event()   # 主執行緒用它喚醒被暫停的產製執行緒
 _confirm_action = ['go']             # 使用者的決定：'go'（渲染）/ 'cancel'（放棄）
 _confirm_edits = [None]              # 分鏡站的人工換片段清單 [{index, path, start}]
+_confirm_meta = [None]               # 分鏡站改過的開場標題/Hook/卡片移除 {'title','hook','removals'}
+_script_dropcard = [False]           # 旁白稿站勾了「這支不用資訊卡」
+
+
+def _remove_card_entries(plan: list, removals: list) -> tuple[list, int]:
+    """
+    分鏡站移除資訊卡（📊 開頭的段）：時長併給相鄰的非鎖定段（前鄰優先），
+    時間軸總長不變 → 不需要重新配對。回傳 (新 plan, 移除數)。
+    """
+    out = [dict(e) for e in plan]
+    removed = 0
+    for i in sorted({int(x) for x in (removals or []) if str(x).lstrip('-').isdigit()},
+                    reverse=True):
+        if not (0 <= i < len(out)):
+            continue
+        if not str(out[i].get('why', '')).startswith('📊'):
+            continue   # 只開放移除資訊卡（SOT 鎖死不能動）
+        d = float(out[i].get('dur', 0) or 0)
+        j = None
+        if i - 1 >= 0 and not str(out[i - 1].get('why', '')).startswith(('🎤', '📊')):
+            j = i - 1
+        elif i + 1 < len(out) and not str(out[i + 1].get('why', '')).startswith(('🎤', '📊')):
+            j = i + 1
+        if j is None:
+            continue   # 兩邊都是鎖定段（幾乎不可能），放著
+        out[j]['dur'] = round(float(out[j].get('dur', 0)) + d, 2)
+        if j == i + 1 and out[j].get('path'):   # 後鄰吸收＝取用起點往前移
+            out[j]['start'] = round(max(0.0, float(out[j].get('start', 0)) - d), 2)
+        out.pop(i)
+        removed += 1
+    return out, removed
 
 # ── 快速預覽（分鏡站的低畫質草稿渲染）───────────────────────────────────────
 _pending_ctx: dict = {}              # 分鏡確認暫停期間的渲染上下文（給預覽用）
@@ -133,13 +181,21 @@ def _apply_plan_edits(plan: list, edits: list, cat_paths: set) -> tuple[list, in
     return out, applied
 
 
-def _render_draft(edits: list):
-    """背景渲染低畫質預覽（480p/ultrafast），內容與正式版完全一致"""
+def _render_draft(edits: list, title_o: str = '', hook_o: str = '',
+                  removals: list | None = None):
+    """背景渲染低畫質預覽（480p/ultrafast），內容與正式版完全一致；
+    title_o/hook_o 是分鏡站現改的開場標題/Hook（空=用原值）、removals=移除的資訊卡"""
     try:
         ctx = dict(_pending_ctx)
         if not ctx:
             raise RuntimeError('沒有等待中的分鏡（預覽只在分鏡確認時可用）')
+        if title_o:
+            ctx['title'] = title_o
+        if hook_o:
+            ctx['hook'] = hook_o
         plan2, _n = _apply_plan_edits(ctx['plan'], edits, ctx['cat_paths'])
+        if removals:
+            plan2, _n2 = _remove_card_entries(plan2, removals)
         clip, _info = make_main_plan(Path(ctx['tts']), Path(ctx['ass']), plan2,
                                      ctx['main_sec'], hook=ctx['hook'],
                                      straps=ctx['straps'], draft=True,
@@ -228,8 +284,9 @@ def _build_preview(script: dict, subtitles: list, plan_rows: list,
             'dur': e.get('dur', 0),
             'why': e.get('why', ''),
             'thumb': thumb,
-            # SOT 跟數據卡的時長跟音軌/動畫鎖死，不能換
+            # SOT 跟資訊卡的時長跟音軌/動畫鎖死，不能換；但資訊卡可以「移除」
             'editable': not str(e.get('why', '')).startswith(('🎤', '📊')),
+            'removable': str(e.get('why', '')).startswith('📊'),
         })
     options = []
     for cat in (catalogs or []):
@@ -419,6 +476,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
     voice = TTS_VOICES.get(voice_key, TTS_VOICES["hsiaochen"])
     # 讓前端能還原「這個工作實際用的輸入」（重跑時產製頁清單要顯示重跑的素材，
     # 不是使用者上次自己選的清單）
+    _confirm_meta[0] = None   # 清掉上一輪殘留的標題/Hook 修改
     _job['input_videos'] = [v['path'] for v in videos]
     _job['input_photos'] = list(photos or [])
     _job['input_article'] = article
@@ -623,26 +681,28 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             except Exception:
                 pass   # 去重是品質加分項，失敗用原稿
 
-        # 數據卡補判＋事實查核：兩個 GPT 呼叫互相獨立（旁白已定稿），並行發出省等待
+        # 資訊卡補判＋事實查核：兩個 GPT 呼叫互相獨立（旁白已定稿），並行發出省等待。
+        # generate_script 給了 stat 就直接當數據卡；沒給才判四型（時序/警示/圖表不需要數字）
         _job['msg'] = f"{STEPS[2]}（事實查核中）"
         from concurrent.futures import ThreadPoolExecutor
-        need_stat = (not script.get('stat')
-                     and re.search(r'\d', script.get('narration', '')))
+        if isinstance(script.get('stat'), dict) and str(script['stat'].get('value', '')).strip():
+            script['card'] = {**script['stat'], 'type': 'stat'}
+        need_card = not script.get('card')
         with ThreadPoolExecutor(max_workers=2) as _ex:
             fut_fc = _ex.submit(factcheck_narration, article, script['narration'])
-            fut_st = (_ex.submit(extract_stat, script['narration'])
-                      if need_stat else None)
+            fut_cd = (_ex.submit(extract_card, script['narration'])
+                      if need_card else None)
             try:
                 fc_issues, fc_translits, fc_tokens = fut_fc.result()
                 _add_tokens(fc_tokens)
             except Exception:
                 fc_issues, fc_translits = [], []
-            if fut_st is not None:
+            if fut_cd is not None:
                 try:
-                    st, st_tokens = fut_st.result()
-                    _add_tokens(st_tokens)
-                    if st:
-                        script['stat'] = st
+                    cd, cd_tokens = fut_cd.result()
+                    _add_tokens(cd_tokens)
+                    if cd:
+                        script['card'] = cd
                 except Exception:
                     pass
         _job['factcheck'] = fc_issues
@@ -680,7 +740,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                 'sots': [{'label': s['label'], 'dur': s['dur'],
                           'display': s['display'],
                           'speaker': s.get('speaker', '')} for s in sots],
-                'stat': script.get('stat') or None,
+                'card': script.get('card') or None,
                 'highlights': script.get('highlights') or [],
                 'factcheck': _job.get('factcheck') or [],
                 'translit': _job.get('translit') or [],
@@ -696,7 +756,20 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             if (not got) or _confirm_action[0] == 'cancel':
                 raise _Cancelled()
             if _script_edit[0]:   # 使用者改過稿 → 後面全部用改過的版本
+                if _script_edit[0] != script.get('narration'):
+                    _append_feedback('narration_edit', job_id, {
+                        'title': script.get('title', ''),
+                        'before': script.get('narration', ''),
+                        'after': _script_edit[0]})
                 script['narration'] = _script_edit[0]
+            if _script_dropcard[0]:   # 勾了「這支不用資訊卡」
+                if script.get('card'):
+                    _append_feedback('card_dropped_at_script', job_id, {
+                        'title': script.get('title', ''),
+                        'card': script.get('card')})
+                script['card'] = None
+                script['stat'] = None
+                _script_dropcard[0] = False
 
         # ── 依 SOT 插入點把旁白拆成交錯時間軸（0~2 段 SOT → 最多 3 塊旁白）────────
         # items 是成片音軌的實際順序：旁白塊與 SOT 段交錯；空旁白塊略過
@@ -773,8 +846,18 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         # 走一遍 items 累計成片時間軸：每塊旁白各自逐字對齊再平移；
         # SOT 字幕用校正後引句按比例分配。順便在「純旁白時間軸」上定位
         # 數據卡的插入時間（旁白唸到 stat 數字的那一句）
-        stat = script.get('stat') if isinstance(script.get('stat'), dict) else None
-        stat_digits = re.sub(r'[^0-9.]', '', str(stat.get('value', ''))) if stat else ''
+        card = script.get('card') if isinstance(script.get('card'), dict) else None
+        # 插卡定位鍵（依序嘗試）：anchor 原文片段 → value 字面寫法（保留萬/億，
+        # 「1萬1400」抽成純數字會跟字幕對不上）→ 純數字備援
+        card_keys = []
+        if card:
+            for k in (card.get('anchor', ''), card.get('value', '')):
+                kk = re.sub(r'[,，\s]', '', str(k))
+                if len(kk) >= 2:
+                    card_keys.append(kk)
+            kd = re.sub(r'[^0-9.]', '', str(card.get('value', '')))
+            if len(kd) >= 2:
+                card_keys.append(kd)
         stat_t = None
         straps = []    # 受訪者名條 [{png, start, end}]（成片時間軸）
         subtitles = []
@@ -791,10 +874,11 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                 if not aligned:
                     align_ok = False
                     aligned = rescale_subtitles(subs_p, float(MAIN_SEC), part_secs[ni])
-                if stat_digits and stat_t is None:
+                if card_keys and stat_t is None:
                     from produce import _ts_to_sec
                     for sb in aligned:
-                        if stat_digits in re.sub(r'[,，]', '', str(sb.get('text', ''))):
+                        txt = re.sub(r'[,，\s]', '', str(sb.get('text', '')))
+                        if any(k in txt for k in card_keys):
                             # 字幕 start 是 SRT 時間字串（00:00:05,976），要轉秒數
                             stat_t = round(nar_axis + _ts_to_sec(sb['start']), 2)
                             break
@@ -851,10 +935,13 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
 
         # ── 步驟5：旁白配畫面（配的是「純旁白時間軸」，配完在 SOT 點切開插入原音段）──
         # 沒有影片但有照片 → 圖輯式模式：整支用照片輪播（Ken Burns）配旁白
-        photo_items = [
-            {"path": ph, "desc": "新聞報導配圖（事件現場或網傳畫面的截圖）"}
-            for ph in (photos or []) if Path(ph).exists()
-        ]
+        # 照片視覺辨識：LTN 沒給圖說，逐張用 GPT 看過（有快取），配對才知道
+        # 哪張拍到校長、哪張是演奏，不再全部用同一句罐頭描述
+        existing_photos = [ph for ph in (photos or []) if Path(ph).exists()]
+        photo_items = []
+        for ph in existing_photos:
+            d = describe_photo(Path(ph)) or "新聞報導配圖（事件現場或網傳畫面的截圖）"
+            photo_items.append({"path": ph, "desc": d})
         photo_mode = (not catalogs) and bool(photo_items)
         plan = None
         if (catalogs or photo_items) and segments:
@@ -872,30 +959,35 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                     photos=photo_items, notes=sot_note)
                 _add_tokens(match_tokens)
 
-                # 數據動態字卡：旁白唸到關鍵數字時，換上 2.8 秒動畫數字卡（1:1 換掉
-                # 原本配的畫面，總長不變，所以不影響後面的 SOT 插入座標）
-                if stat and stat_t is not None and plan:
+                # 資訊卡（數據/時序/警示/圖表）：旁白唸到 anchor 那句時換上動畫卡
+                # （1:1 換掉原本配的畫面，總長不變，不影響後面的 SOT 插入座標）
+                if card and stat_t is not None and plan:
                     try:
                         import hashlib as _hl
                         import statcard
-                        # 同內容的數據卡有快取：重跑/取消再來不用重畫（省 ~20 秒）
-                        card_key = _hl.md5(json.dumps(stat, sort_keys=True,
+                        ctype = card.get('type', 'stat')
+                        cname = statcard.TYPE_NAMES.get(ctype, '資訊卡')
+                        # 同內容的卡有快取：重跑/取消再來不用重畫（省 ~20 秒）
+                        card_key = _hl.md5(json.dumps(card, sort_keys=True,
                                                       ensure_ascii=False).encode()
                                            ).hexdigest()[:12]
                         card_path = TMP / f"_statcard_{card_key}.mp4"
                         if not card_path.exists():
-                            _job['msg'] = f"{STEPS[5]}（渲染數據卡中）"
-                        if card_path.exists() or statcard.render_stat_card(stat, card_path):
+                            _job['msg'] = f"{STEPS[5]}（渲染{cname}中）"
+                        if card_path.exists() or statcard.render_card(card, card_path):
                             plan_total = sum(float(e.get('dur', 0) or 0) for e in plan)
-                            card_dur = round(min(statcard.DUR, plan_total - stat_t), 2)
+                            card_dur = round(min(statcard.card_duration(card),
+                                                 plan_total - stat_t), 2)
                             if card_dur >= 1.5:
+                                gist = (f"{card.get('label', '')}{card.get('value', '')}"
+                                        f"{card.get('unit', '')}" if ctype == 'stat'
+                                        else card.get('title') or card.get('headline') or '')
                                 pA, pB = _split_plan_at(plan, stat_t)
                                 _consumed, pRest = _split_plan_at(pB, card_dur)
                                 plan = pA + [{'path': str(card_path), 'photo': None,
                                               'start': 0.0, 'dur': card_dur,
-                                              'why': (f"📊 數據卡：{stat.get('label', '')} "
-                                                      f"{stat.get('value', '')}{stat.get('unit', '')}")}] + pRest
-                                _job['stat'] = stat
+                                              'why': f"📊 {cname}：{gist}"}] + pRest
+                                _job['stat'] = card
                     except Exception:
                         pass   # 插卡是加分項，失敗不擋產製
 
@@ -908,6 +1000,16 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                         e['photo'] = photo_items[ph_i % len(photo_items)]['path']
                         e['why'] = (e.get('why') or '') + '（照片補黑幕）'
                         ph_i += 1
+
+                # 資訊卡未插入時明確警告（先前是靜默消失，使用者只能猜）
+                if card and not _job.get('stat'):
+                    _ck = card.get('anchor') or card.get('value') or ''
+                    if stat_t is None:
+                        _sk = f"📊 資訊卡未插入：旁白字幕找不到「{_ck}」的落點（anchor 需與旁白字面一致）"
+                    else:
+                        _sk = "📊 資訊卡未插入：渲染失敗或落點太靠影片結尾（不足 1.5 秒）"
+                    _job['warning'] = ((_job.get('warning') + '\n' + _sk)
+                                       if _job.get('warning') else _sk)
 
                 # 照 items 順序在各 SOT 插入點把配對時間軸切開，插進原音段
                 # （畫面=原影片、聲音已在音軌裡）；配對時間軸是「純旁白時間軸」
@@ -975,12 +1077,42 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             if (not got) or _confirm_action[0] == 'cancel':
                 raise _Cancelled()
 
-            # 套用分鏡站的人工換片段：只換畫面來源與起始秒，時長/時間軸不動
+            # 套用分鏡站的人工換片段＋資訊卡移除（移除＝時長併鄰段，不用重配）
             edits = _confirm_edits[0] or []
             _confirm_edits[0] = None
+            removals = (_confirm_meta[0] or {}).get('removals') or []
+            applied = 0
             if edits and plan:
+                for e in edits:   # 回饋閉環：GPT 原選片段 vs 人換成什麼
+                    i = e.get('index')
+                    if (isinstance(i, int) and 0 <= i < len(plan)
+                            and e.get('path')):
+                        seg = plan[i]
+                        _append_feedback('clip_swap', job_id, {
+                            'title': script.get('title', ''), 'index': i,
+                            'before': {'path': str(seg.get('path') or ''),
+                                       'photo': str(seg.get('photo') or ''),
+                                       'start': seg.get('start', 0),
+                                       'why': seg.get('why', '')},
+                            'after': {'path': str(e['path']),
+                                      'start': e.get('start', 0)}})
                 plan, applied = _apply_plan_edits(
                     plan, edits, {str(c['path']) for c in catalogs})
+            if removals and plan:
+                removed_segs = [
+                    {'why': plan[i].get('why', ''), 'dur': plan[i].get('dur')}
+                    for i in removals
+                    if isinstance(i, int) and 0 <= i < len(plan)
+                    and str(plan[i].get('why', '')).startswith('📊')]
+                plan, n_removed = _remove_card_entries(plan, removals)
+                if n_removed:
+                    applied += n_removed
+                    _append_feedback('card_removed_at_plan', job_id, {
+                        'title': script.get('title', ''),
+                        'card': _job.get('stat'),
+                        'segments': removed_segs})
+                    _job['stat'] = None   # 卡移除了，紀錄同步清掉
+            if edits or removals:
                 if applied:
                     _job['plan'] = [
                         {'video': (Path(e['path']).name if e.get('path')
@@ -990,6 +1122,22 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                         for e in plan
                     ]
                     _job['msg'] = f'已套用 {applied} 處人工換片段，開始渲染'
+
+        # 套用分鏡站改過的開場標題/Hook（空值=沒改）
+        meta = _confirm_meta[0] or {}
+        _confirm_meta[0] = None
+        if meta.get('title'):
+            if meta['title'] != (script.get('title') or ''):
+                _append_feedback('title_edit', job_id, {
+                    'before': script.get('title', ''), 'after': meta['title']})
+            script['title'] = meta['title']
+            _job['title'] = meta['title']
+        if meta.get('hook'):
+            if meta['hook'] != (_job.get('hook') or ''):
+                _append_feedback('hook_edit', job_id, {
+                    'title': script.get('title', ''),
+                    'before': _job.get('hook', ''), 'after': meta['hook']})
+            _job['hook'] = meta['hook']
 
         p(6)
         # 冷開場改版（2026-07）：不再做 3 秒片頭卡——研究指出 50~60% 流失發生在
@@ -1183,7 +1331,8 @@ body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f3f4f
 .bar{display:flex;gap:10px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
 .bar input{padding:8px 12px;border:1px solid #d1d5db;border-radius:7px;font-size:.85rem;width:240px}
 .count{color:#6b7280;font-size:.82rem}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:18px;max-width:1240px;margin-left:auto;margin-right:auto}
+.nav,.bar{max-width:1240px;margin-left:auto;margin-right:auto}
 .card{background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.09);display:flex;flex-direction:column}
 .card video{width:100%;aspect-ratio:9/16;background:#000;object-fit:contain;display:block}
 .card .body{padding:12px 14px;display:flex;flex-direction:column;gap:6px;flex:1}
@@ -1335,15 +1484,18 @@ h1{font-size:1.15rem;font-weight:700;margin-bottom:18px}
 .back{font-size:.82rem;color:#6b7280;text-decoration:none;margin-right:14px}
 .back:hover{color:#111}
 .stat-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+.topnav,.stat-row,.price-row,.filter-row,table,.tbl-wrap{max-width:1240px;margin-left:auto;margin-right:auto}
 .stat{background:#fff;border-radius:8px;padding:14px 18px;flex:1;min-width:130px;box-shadow:0 1px 3px rgba(0,0,0,.07)}
 .stat .val{font-size:1.4rem;font-weight:700;color:#2563eb}
 .stat .lbl{font-size:.75rem;color:#888;margin-top:2px}
 .price-row{display:flex;align-items:center;gap:8px;margin-bottom:14px;font-size:.83rem;color:#555}
 .price-row input{width:90px;padding:5px 8px;border:1px solid #d1d5db;border-radius:5px;font-size:.83rem}
 .tbl-wrap{overflow-x:auto;background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.07)}
-table{width:100%;border-collapse:collapse;font-size:.82rem}
-th{background:#f9fafb;padding:10px 12px;text-align:left;font-weight:600;color:#555;border-bottom:2px solid #e5e7eb;white-space:nowrap}
-td{padding:9px 12px;border-bottom:1px solid #f0f0f0;vertical-align:top;color:#374151}
+table{width:100%;min-width:1440px;border-collapse:collapse;font-size:.82rem;table-layout:fixed}
+th{background:#f9fafb;padding:10px 12px;text-align:left;font-weight:600;color:#555;border-bottom:2px solid #e5e7eb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+td{padding:9px 12px;border-bottom:1px solid #f0f0f0;vertical-align:middle;color:#374151;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+td.num,th.num{text-align:right}
+td.wrap{white-space:normal}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:#fafafa}
 .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.75rem;font-weight:600}
@@ -1381,10 +1533,10 @@ tr:hover td{background:#fafafa}
 <div class="price-row">
   <span>估算費用單價（USD / 1M tokens）</span>
   <span>Prompt</span>
-  <input type="number" id="p-price" value="5" step="0.5" min="0">
+  <input type="number" id="p-price" value="1.75" step="0.05" min="0">
   <span>Completion</span>
-  <input type="number" id="c-price" value="15" step="0.5" min="0">
-  <span style="color:#aaa;font-size:.77rem">（Azure 實際費用請查帳單，此為 GPT-4o 級別參考值）</span>
+  <input type="number" id="c-price" value="14" step="0.5" min="0">
+  <span style="color:#aaa;font-size:.77rem">（Azure 實際費用請查帳單，此為目前部署模型 gpt-5.2 的參考定價，2026-07 查證）</span>
 </div>
 
 <!-- 篩選 -->
@@ -1405,18 +1557,25 @@ tr:hover td{background:#fafafa}
 
 <div class="tbl-wrap">
 <table>
+  <colgroup>
+    <col style="width:145px"><col style="width:66px"><col style="width:130px">
+    <col style="width:60px"><col style="width:92px"><col style="width:100px">
+    <col style="width:62px"><col style="width:92px"><col style="width:72px">
+    <col style="width:110px"><col style="width:84px"><col style="width:230px">
+    <col style="width:66px"><col style="width:130px">
+  </colgroup>
   <thead>
     <tr>
       <th>時間</th>
       <th>類型</th>
       <th>模型</th>
-      <th>時長(s)</th>
-      <th>Prompt<br>tokens</th>
-      <th>Completion<br>tokens</th>
-      <th>影格數</th>
-      <th>估算費用<br>(USD)</th>
-      <th>稿件字數</th>
-      <th>影片長度</th>
+      <th class="num">時長(s)</th>
+      <th class="num">Prompt<br>tokens</th>
+      <th class="num">Completion<br>tokens</th>
+      <th class="num">影格數</th>
+      <th class="num">估算費用<br>(USD)</th>
+      <th class="num">稿件字數</th>
+      <th class="num">影片長度</th>
       <th>分類</th>
       <th>輸出檔</th>
       <th>狀態</th>
@@ -1446,8 +1605,8 @@ function renderStats(logs) {
   const ok    = logs.filter(r => !r.error).length;
   const sumTok = logs.reduce((s,r) => s + (r.total_tokens||0), 0);
   const sumDur = logs.reduce((s,r) => s + (r.duration_sec||0), 0);
-  const pp = parseFloat(document.getElementById('p-price').value) || 5;
-  const cp = parseFloat(document.getElementById('c-price').value) || 15;
+  const pp = parseFloat(document.getElementById('p-price').value) || 1.75;
+  const cp = parseFloat(document.getElementById('c-price').value) || 14;
   const cost = logs.reduce((s,r) => s
     + (r.prompt_tokens||0)/1e6*pp
     + (r.completion_tokens||0)/1e6*cp, 0);
@@ -1465,8 +1624,8 @@ function render() {
   const fType = document.getElementById('f-type').value;
   const fStatus = document.getElementById('f-status').value;
   const kw = document.getElementById('f-keyword').value.toLowerCase();
-  const pp = parseFloat(document.getElementById('p-price').value) || 5;
-  const cp = parseFloat(document.getElementById('c-price').value) || 15;
+  const pp = parseFloat(document.getElementById('p-price').value) || 1.75;
+  const cp = parseFloat(document.getElementById('c-price').value) || 14;
 
   let rows = _allLogs.filter(r => {
     if (fType && r.type !== fType) return false;
@@ -1496,21 +1655,21 @@ function render() {
       ? `<button class="btn-export" style="padding:3px 10px;font-size:.76rem" onclick="toggleDetail(${i})">🔍 詳情</button>`
       : (rerunBtn ? '' : na)) + rerunBtn;
     return `<tr>
-      <td class="mono">${ts}</td>
+      <td class="mono" title="${ts}">${ts}</td>
       <td>${typeBadge}</td>
-      <td class="mono" style="font-size:.75rem">${r.model||na}</td>
-      <td>${r.duration_sec||0}</td>
-      <td>${fmtNum(r.prompt_tokens)}</td>
-      <td>${fmtNum(r.completion_tokens)}</td>
-      <td>${r.frames_sent||na}</td>
-      <td class="mono">${cost > 0 ? '$'+cost.toFixed(5) : na}</td>
-      <td>${r.article_chars||na}</td>
-      <td>${videoLenCell(r)}</td>
-      <td>${r.category||na}</td>
-      <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.output_file||''}">${r.output_file||na}</td>
+      <td class="mono" style="font-size:.75rem" title="${r.model||''}">${r.model||na}</td>
+      <td class="num">${r.duration_sec||0}</td>
+      <td class="num">${fmtNum(r.prompt_tokens)}</td>
+      <td class="num">${fmtNum(r.completion_tokens)}</td>
+      <td class="num">${r.frames_sent||na}</td>
+      <td class="mono num">${cost > 0 ? '$'+cost.toFixed(5) : na}</td>
+      <td class="num">${r.article_chars||na}</td>
+      <td class="num" title="${(r.video_count||0)+'支 / '+(r.video_covered_sec||0)+'s'}">${videoLenCell(r)}</td>
+      <td title="${r.category||''}">${r.category||na}</td>
+      <td title="${r.output_file||''}">${r.output_file||na}</td>
       <td>${statusBadge}</td>
       <td>${detailBtn}</td>
-    </tr>` + (hasDetail ? `<tr id="det-${i}" style="display:none"><td colspan="14" style="background:#fafafa">${detailHtml(r)}</td></tr>` : '');
+    </tr>` + (hasDetail ? `<tr id="det-${i}" style="display:none"><td colspan="14" class="wrap" style="background:#fafafa">${detailHtml(r)}</td></tr>` : '');
   }).join('');
 
   renderStats(rows);
@@ -1616,8 +1775,8 @@ function fmtSec(s) {
 }
 
 function exportCSV() {
-  const pp = parseFloat(document.getElementById('p-price').value) || 5;
-  const cp = parseFloat(document.getElementById('c-price').value) || 15;
+  const pp = parseFloat(document.getElementById('p-price').value) || 1.75;
+  const cp = parseFloat(document.getElementById('c-price').value) || 14;
   const headers = ['時間','類型','模型','時長(s)','Prompt tokens','Completion tokens',
                    '影格數','估算費用USD','稿件字數','影片數','涵蓋秒','缺口秒','分類','輸出檔','狀態','錯誤'];
   const rows = _allLogs.map(r => [
@@ -1655,7 +1814,8 @@ HTML = """<!doctype html>
 html{font-size:17px}
 body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f3f4f6;color:#111;padding:28px 24px}
 h1{font-size:1.25rem;font-weight:700;margin-bottom:22px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:980px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:1000px;margin-left:auto;margin-right:auto}
+.topnav,.backlog-card{max-width:1000px;margin-left:auto;margin-right:auto}
 @media(max-width:700px){.grid{grid-template-columns:1fr}}
 .card{background:#fff;border-radius:10px;padding:22px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
 .card h2{font-size:.9rem;font-weight:600;color:#666;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid #f0f0f0}
@@ -1663,7 +1823,7 @@ label{display:block;font-size:.82rem;font-weight:500;color:#555;margin:14px 0 5p
 label:first-of-type{margin-top:0}
 textarea,input[type=text],input[type=number]{
   width:100%;padding:9px 11px;border:1px solid #d1d5db;border-radius:6px;
-  font-size:.88rem;font-family:inherit;background:#fafafa;color:#111;
+  font-size:1rem;font-family:inherit;background:#fafafa;color:#111;
   transition:border .15s
 }
 textarea:focus,input:focus{outline:none;border-color:#2563eb;background:#fff}
@@ -1782,20 +1942,22 @@ textarea{resize:vertical;min-height:210px}
 }
 .backlog-list{max-height:340px;overflow-y:auto;border:1px solid #e5e7eb;border-radius:8px}
 .backlog-row{
-  display:flex;align-items:center;gap:10px;padding:9px 12px;
+  display:grid;grid-template-columns:96px 118px 1fr max-content max-content;
+  align-items:center;gap:10px;padding:9px 12px;
   border-bottom:1px solid #f3f4f6;font-size:.82rem
 }
 .backlog-row:last-child{border-bottom:none}
-.backlog-row .bl-title{flex:1;color:#1f2937}
-.backlog-row .bl-meta{color:#9ca3af;font-size:.72rem;white-space:nowrap}
+.backlog-row .bl-title{color:#1f2937;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.backlog-row .bl-meta{color:#9ca3af;font-size:.74rem;white-space:nowrap;text-align:right}
 .bl-status{
-  padding:2px 9px;border-radius:10px;font-size:.72rem;font-weight:700;white-space:nowrap
+  padding:3px 0;border-radius:10px;font-size:.72rem;font-weight:700;
+  white-space:nowrap;text-align:center
 }
 .bl-status-已完成{background:#d1fae5;color:#065f46}
 .bl-status-不處理不存{background:#fee2e2;color:#991b1b}
 .bl-status-未知{background:#f3f4f6;color:#6b7280}
 /* 素材充足度預判標註 */
-.bl-assess{padding:2px 9px;border-radius:10px;font-size:.72rem;font-weight:700;white-space:nowrap}
+.bl-assess{padding:3px 0;border-radius:10px;font-size:.72rem;font-weight:700;white-space:nowrap;text-align:center}
 .bl-assess-green{background:#059669;color:#fff;box-shadow:0 0 0 2px #a7f3d0}
 .bl-assess-yellow{background:#fef3c7;color:#92400e}
 .bl-assess-red{background:#f3f4f6;color:#9ca3af}
@@ -1878,6 +2040,9 @@ textarea{resize:vertical;min-height:210px}
 .photo-thumb .rm{position:absolute;top:1px;right:1px;background:rgba(0,0,0,.6);color:#fff;border:none;border-radius:4px;font-size:.7rem;cursor:pointer;width:16px;height:16px;line-height:1;padding:0}
 .btn-addphoto{padding:7px 12px;background:#fff;border:1px dashed #9ca3af;border-radius:6px;font-size:.8rem;cursor:pointer;color:#6b7280}
 .btn-addphoto:hover{border-color:#2563eb;color:#2563eb}
+/* 點擊查核警示定位到旁白稿：短暫紅光閃爍，跟原生選取的藍底文字一起提示位置 */
+@keyframes narFlash{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}20%{box-shadow:0 0 0 4px rgba(239,68,68,.55)}}
+.nar-flash{animation:narFlash 1.5s ease-out;border-color:#ef4444 !important}
 </style>
 </head>
 <body>
@@ -1923,14 +2088,17 @@ textarea{resize:vertical;min-height:210px}
 
     <label>新聞稿內容 <span style="color:#e00">*</span></label>
     <textarea id="article" placeholder="貼上新聞稿全文…"></textarea>
-    <div id="import-keywords" style="display:none;font-size:.76rem;color:#6b7280;margin-top:-8px;margin-bottom:12px"></div>
+    <div id="import-keywords" style="display:none;margin-top:-6px;margin-bottom:12px;padding:8px 10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:.8rem;color:#475569;line-height:2"></div>
 
-    <label>影片素材（從上方「後臺影音清單」按「📥 匯入」自動帶入；換匯下一則會整組換新）</label>
-    <p class="hint">匯入後每支影片自動跑智慧分析，結果顯示在檔名下方（分析過的有快取不重複收費）</p>
+    <label style="margin-top:2px">🎬 影片素材</label>
+    <p class="hint" style="margin-bottom:2px">從上方「後臺影音清單」按「📥 匯入」自動帶入，換匯下一則會整組換新</p>
+    <p class="hint">每支匯入後自動跑智慧分析，分類與畫面描述顯示在檔名下方（分析過的有快取，不重複收費）</p>
 
     <div id="video-list" class="video-list"></div>
 
-    <label style="margin-top:6px">照片素材（沒有影片時可純用照片做「圖輯式」短影音；有影片時當補畫面備援）</label>
+    <label style="margin-top:10px">📷 照片素材</label>
+    <p class="hint" id="photo-import-note" style="display:none;color:#2563eb"></p>
+    <p class="hint">沒有影片時可純用照片做「圖輯式」短影音；有影片時當補畫面備援（配不到畫面的旁白段自動用照片補，不留黑幕）</p>
     <div class="photo-strip" id="photo-strip"></div>
     <button class="btn-addphoto" onclick="document.getElementById('photo-file').click()">＋ 加照片</button>
     <input type="file" id="photo-file" accept="image/*" multiple style="display:none" onchange="uploadPhotos(this.files)">
@@ -2116,16 +2284,19 @@ function renderScriptCheckpoint(pv) {
   const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
   let html = '';
   // 查核／譯名警示沿用分鏡面板的樣式（在改稿階段看到最有用）
+  spFactcheckIssues = pv.factcheck || [];
   if (pv.factcheck && pv.factcheck.length) {
-    const rows = pv.factcheck.map(f => {
+    const rows = pv.factcheck.map((f, idx) => {
       const sev = f.severity === 'high'
         ? '<span style="color:#b91c1c;font-weight:700">●高</span>'
         : '<span style="color:#b45309;font-weight:700">●中</span>';
-      return `<div style="margin:4px 0;padding:6px 8px;background:#fff;border-radius:5px">
-        ${sev} <b>${esc(f.field)}</b>：旁白說「${esc(f.narration_says)}」，但原稿是「${esc(f.article_says)}」</div>`;
+      return `<div onclick="jumpToNarrationIssue(${idx})" title="點擊定位到下方旁白區"
+        style="margin:4px 0;padding:6px 8px;background:#fff;border-radius:5px;cursor:pointer;display:flex;gap:6px;align-items:baseline">
+        <span style="flex:1">${sev} <b>${esc(f.field)}</b>：旁白說「${esc(f.narration_says)}」，但原稿是「${esc(f.article_says)}」</span>
+        <span style="color:#2563eb;font-size:.74rem;white-space:nowrap">📍 定位</span></div>`;
     }).join('');
     html += `<div style="margin-bottom:10px;padding:10px 12px;background:#fef2f2;border:2px solid #fca5a5;border-radius:8px">
-      <div style="color:#991b1b;font-weight:700;margin-bottom:6px">🔍 事實查核：${pv.factcheck.length} 處與原稿不符——可直接在下面稿子裡改掉</div>
+      <div style="color:#991b1b;font-weight:700;margin-bottom:6px">🔍 事實查核：${pv.factcheck.length} 處與原稿不符——點警示可定位到下面稿子對應位置</div>
       ${rows}</div>`;
   }
   if (pv.translit && pv.translit.length) {
@@ -2142,9 +2313,19 @@ function renderScriptCheckpoint(pv) {
       <b>🎤 受訪原音安排（${pv.sots.length} 段）：</b>${pv.sots.map(s =>
         `<div style="margin-top:4px;font-size:.8rem;color:#444">${esc(s.label)}・${s.dur}s：「${esc(s.display)}」${s.speaker?`<div style="color:#1d4ed8">📛 名條：${esc(s.speaker)}</div>`:`<div style="color:#92400e">（無法確認發言者，不掛名條）</div>`}</div>`).join('')}</div>`;
   }
-  if (pv.stat && pv.stat.value) {
-    html += `<div style="margin-bottom:6px;padding:8px 10px;background:#fff;border-radius:6px;font-size:.8rem">
-      📊 數據動態卡：<b>${esc(pv.stat.label||'')} ${esc(pv.stat.value)}${esc(pv.stat.unit||'')}</b>（旁白唸到此數字時插入 2.8 秒動畫卡）</div>`;
+  if (pv.card && pv.card.type) {
+    const c = pv.card;
+    const names = {stat:'數據卡', timeline:'時序卡', alert:'警示卡', chart:'圖表卡'};
+    let desc = '';
+    if (c.type === 'stat') desc = `${esc(c.label||'')} <b>${esc(c.value||'')}${esc(c.unit||'')}</b>`;
+    else if (c.type === 'timeline') desc = `${esc(c.title||'')}：${(c.steps||[]).map(esc).join(' → ')}`;
+    else if (c.type === 'alert') desc = `<b>${esc(c.headline||'')}</b>　${esc(c.sub||'')}`;
+    else if (c.type === 'chart') desc = `${esc(c.title||'')}（${(c.points||[]).map(p=>esc(p.label)+' '+esc(String(p.value))).join('、')}）`;
+    html += `<div style="margin-bottom:6px;padding:8px 10px;background:#fff;border-radius:6px;font-size:.8rem;display:flex;align-items:center;gap:10px">
+      <span style="flex:1">📊 ${names[c.type]||'資訊卡'}：${desc}</span>
+      <label style="display:flex;align-items:center;gap:5px;white-space:nowrap;cursor:pointer;color:#6b7280">
+        <input type="checkbox" id="sp-usecard" checked style="width:15px;height:15px">使用這張卡
+      </label></div>`;
   }
   if (pv.highlights && pv.highlights.length) {
     html += `<div style="margin-bottom:6px;padding:8px 10px;background:#fff;border-radius:6px;font-size:.8rem">
@@ -2159,10 +2340,12 @@ async function confirmScript(action) {
   box.querySelectorAll('button').forEach(b => b.disabled = true);
   spDecided = true;
   try {
+    const useCard = document.getElementById('sp-usecard');
     await fetch('/api/confirm_script', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action, narration: document.getElementById('sp-nar').value}),
+      body: JSON.stringify({action, narration: document.getElementById('sp-nar').value,
+                            drop_card: !!(useCard && !useCard.checked)}),
     });
   } catch(_) {}
   box.querySelectorAll('button').forEach(b => b.disabled = false);
@@ -2180,7 +2363,61 @@ async function showCheckpoint() {
 }
 
 let planEdits = {};      // 分鏡站的人工換片段 {rowIndex: {index, path, start}}
+let planRemovals = new Set();   // 分鏡站要移除的資訊卡 row index
 let pvOptions = [];      // 素材庫全部片段（換片段下拉的資料來源）
+let spFactcheckIssues = [];   // 旁白稿確認站的查核清單（點擊定位用）
+
+function toast(m) {
+  let t = document.getElementById('toast2');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'toast2';
+    t.style.cssText = 'position:fixed;bottom:30px;left:50%;transform:translateX(-50%);background:#111;color:#fff;padding:10px 18px;border-radius:8px;font-size:.85rem;z-index:400;opacity:0;transition:opacity .3s;pointer-events:none';
+    document.body.appendChild(t);
+  }
+  t.textContent = m; t.style.opacity = '1';
+  setTimeout(() => t.style.opacity = '0', 2200);
+}
+
+function jumpToNarrationIssue(idx) {
+  const f = spFactcheckIssues[idx];
+  const ta = document.getElementById('sp-nar');
+  if (!f || !ta) return;
+  const text = f.narration_says || '';
+  const pos = text ? ta.value.indexOf(text) : -1;
+  ta.scrollIntoView({behavior: 'smooth', block: 'center'});
+  if (pos < 0) {
+    toast('在旁白裡找不到這段文字（可能已經被手動改過）');
+    return;
+  }
+  // 依命中位置所在行數估算捲動位置，讓文字出現在 textarea 可視範圍內
+  // （只捲整個頁面不夠，稿子一長，命中的那句可能還是在 textarea 看不到的地方）
+  const before = ta.value.slice(0, pos);
+  const lineNo = before.split('\\n').length - 1;
+  const lineHeight = parseFloat(getComputedStyle(ta).lineHeight) || 24;
+  ta.focus();
+  ta.setSelectionRange(pos, pos + text.length);
+  ta.scrollTop = Math.max(0, lineNo * lineHeight - ta.clientHeight / 2);
+  ta.classList.remove('nar-flash');
+  void ta.offsetWidth;   // 強制 reflow，讓動畫能重新觸發（連續點同一項也要再閃一次）
+  ta.classList.add('nar-flash');
+  setTimeout(() => ta.classList.remove('nar-flash'), 1500);
+}
+
+function toggleRemoveCard(i) {
+  const row = document.getElementById('cprow' + i);
+  if (planRemovals.has(i)) {
+    planRemovals.delete(i);
+    row.style.opacity = '';
+    row.style.textDecoration = '';
+    document.getElementById('rmbtn' + i).textContent = '✖ 移除這張卡';
+  } else {
+    planRemovals.add(i);
+    row.style.opacity = '0.45';
+    row.style.textDecoration = 'line-through';
+    document.getElementById('rmbtn' + i).textContent = '↩ 復原';
+  }
+}
 
 function escH(s) {
   return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -2218,6 +2455,7 @@ function applySwap(i, j) {
 
 function renderCheckpoint(pv) {
   planEdits = {};
+  planRemovals = new Set();
   pvOptions = pv.options || [];
   document.getElementById('draft-area').innerHTML = '';
   const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -2256,7 +2494,13 @@ function renderCheckpoint(pv) {
       <div style="font-weight:700;margin-bottom:4px;color:${mis.length?'#991b1b':'#166534'}">🈯 譯名核實（報社音譯總表）</div>
       ${trHtml}${subLines?`<div style="font-size:.78rem;margin-top:4px">${subLines}</div>`:''}</div>`;
   }
-  html += `<div style="margin-bottom:8px"><b>標題：</b>${esc(pv.title)}　<b>Hook：</b>${esc(pv.hook)}</div>`;
+  html += `<div style="display:flex;gap:10px;margin-bottom:8px">
+    <div style="flex:1"><b style="font-size:.78rem">🏷 開場標題字卡（可直接改）</b>
+      <input id="cp-title" value="${esc(pv.title)}" style="width:100%;margin-top:3px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:6px;font-size:.88rem"></div>
+    <div style="flex:1"><b style="font-size:.78rem">⚡ Hook 字卡（可直接改）</b>
+      <input id="cp-hook" value="${esc(pv.hook)}" style="width:100%;margin-top:3px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:6px;font-size:.88rem"></div>
+  </div>
+  <div style="font-size:.74rem;color:#92400e;margin-bottom:8px">改完按「🎬 快速預覽」先看效果，確認渲染時以此為準（也會影響成片檔名與成片庫標題）</div>`;
   html += `<div style="margin-bottom:8px"><b>Hashtags：</b>${esc(tags)}</div>`;
   html += `<div style="margin-bottom:8px"><b>旁白全文：</b><div style="white-space:pre-wrap;line-height:1.7;margin-top:4px;background:#fff;padding:8px;border-radius:6px">${esc(pv.narration)}</div></div>`;
   if (pv.segments && pv.segments.length) {
@@ -2269,7 +2513,9 @@ function renderCheckpoint(pv) {
         : `<div style="width:90px;height:60px;background:#111;border-radius:6px;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#888;font-size:.7rem">黑幕</div>`;
       const swapBtn = s.editable
         ? `<button onclick="toggleSwap(${i})" style="margin-left:8px;font-size:.7rem;padding:1px 8px;border:1px solid #d1d5db;border-radius:5px;background:#fff;cursor:pointer">🔄 換</button>`
-        : '';
+        : (s.removable
+          ? `<button id="rmbtn${i}" onclick="toggleRemoveCard(${i})" style="margin-left:8px;font-size:.7rem;padding:1px 8px;border:1px solid #fca5a5;border-radius:5px;background:#fff;color:#b91c1c;cursor:pointer">✖ 移除這張卡</button>`
+          : '');
       return `<div id="cprow${i}" style="margin-bottom:8px;background:#fff;padding:6px;border-radius:6px">
         <div style="display:flex;gap:10px;align-items:center">
           ${img}
@@ -2298,7 +2544,10 @@ async function draftPreview() {
   try {
     const r = await fetch('/api/draft', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({plan_edits: Object.values(planEdits)}),
+      body: JSON.stringify({plan_edits: Object.values(planEdits),
+        plan_removals: Array.from(planRemovals),
+        title: (document.getElementById('cp-title')||{}).value||'',
+        hook: (document.getElementById('cp-hook')||{}).value||''}),
     });
     const d = await r.json();
     if (d.error) { area.innerHTML = '<div style="color:#b91c1c;font-size:.8rem">預覽失敗：' + d.error + '</div>'; btn.disabled = false; return; }
@@ -2329,7 +2578,10 @@ async function confirmJob(action) {
     await fetch('/api/confirm', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action, plan_edits: Object.values(planEdits)}),
+      body: JSON.stringify({action, plan_edits: Object.values(planEdits),
+        plan_removals: Array.from(planRemovals),
+        title: (document.getElementById('cp-title')||{}).value||'',
+        hook: (document.getElementById('cp-hook')||{}).value||''}),
     });
   } catch(_) {}
   box.querySelectorAll('button').forEach(b => b.disabled = false);
@@ -2787,7 +3039,7 @@ function renderBacklog(skipAssess) {
       <span class="bl-status bl-status-${status}">${status}</span>
       ${assessHtml}
       <span class="bl-title">${_escBl(it.title)}</span>
-      <span class="bl-meta">${ts}・${vc}支影片${a && a.total_sec ? '/' + a.total_sec + 's' : ''}</span>
+      <span class="bl-meta">${ts}・🎬${vc}支${a && a.total_sec ? '(' + a.total_sec + 's)' : ''}${a && a.n_photos != null ? '・📷' + a.n_photos + '張' : ''}</span>
       <button class="btn-import" onclick="importBacklogItem('${it.articleNo}')" id="bl-import-${it.articleNo}">📥 匯入</button>
     </div>`;
   }).join('');
@@ -2807,7 +3059,8 @@ async function assessBacklogItems() {
         try {
           const r = await fetch('/api/backlog/assess', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({videoUrls: (it.videos || []).map(v => v.url)}),
+            body: JSON.stringify({videoUrls: (it.videos || []).map(v => v.url),
+                                  articleNo: it.articleNo}),
           });
           const d = await r.json();
           if (!d.error) it._assess = d;
@@ -2845,15 +3098,21 @@ async function importBacklogItem(articleNo) {
     // 匯入完成直接帶使用者到「輸入資料」的新聞稿區（不用自己往下捲）
     document.getElementById('article').scrollIntoView({behavior: 'smooth', block: 'start'});
     importedPhotos = d.photos || [];   // 換新聞就換配圖，不累積上一篇的
+    // 關鍵字＝標籤條、配圖說明＝歸位到照片素材區（先前全擠在同一行難讀）
     const kwBox = document.getElementById('import-keywords');
-    const kwParts = [];
-    if (d.keywords && d.keywords.length) kwParts.push('關鍵字：' + d.keywords.join('、'));
-    if (importedPhotos.length) kwParts.push(`📷 已附 ${importedPhotos.length} 張配圖（配不到畫面的旁白段會自動用它補）`);
-    if (kwParts.length) {
-      kwBox.textContent = kwParts.join('　');
+    if (d.keywords && d.keywords.length) {
+      kwBox.innerHTML = '🔑 文章關鍵字　' + d.keywords.map(k =>
+        `<span style="display:inline-block;background:#e0e7ff;color:#3730a3;border-radius:6px;padding:1px 9px;margin-right:6px;font-size:.78rem">${escapeHtml(k)}</span>`).join('');
       kwBox.style.display = 'block';
     } else {
       kwBox.style.display = 'none';
+    }
+    const photoNote = document.getElementById('photo-import-note');
+    if (importedPhotos.length) {
+      photoNote.textContent = `已自動附上本篇 ${importedPhotos.length} 張新聞配圖（點縮圖可放大檢視）`;
+      photoNote.style.display = 'block';
+    } else {
+      photoNote.style.display = 'none';
     }
     if (d.errors && d.errors.length) {
       alert('部分影片下載失敗：\\n' + d.errors.join('\\n'));
@@ -3187,6 +3446,7 @@ def api_confirm_script():
         return jsonify({'error': '目前沒有等待中的旁白稿確認'}), 409
     nar = (data.get('narration') or '').strip()
     _script_edit[0] = nar or None
+    _script_dropcard[0] = bool(data.get('drop_card'))
     _confirm_action[0] = action
     _confirm_event.set()
     return jsonify({'ok': True})
@@ -3202,7 +3462,11 @@ def api_draft():
     data = request.get_json(silent=True) or {}
     _draft.update({'running': True, 'error': None})
     threading.Thread(target=_render_draft,
-                     args=(data.get('plan_edits') or [],), daemon=True).start()
+                     args=(data.get('plan_edits') or [],
+                           (data.get('title') or '').strip(),
+                           (data.get('hook') or '').strip(),
+                           data.get('plan_removals') or []),
+                     daemon=True).start()
     return jsonify({'ok': True})
 
 
@@ -3235,6 +3499,9 @@ def api_confirm():
     data = request.json or {}
     action = 'cancel' if data.get('action') == 'cancel' else 'go'
     _confirm_edits[0] = data.get('plan_edits') or None
+    _confirm_meta[0] = {'title': (data.get('title') or '').strip(),
+                        'hook': (data.get('hook') or '').strip(),
+                        'removals': data.get('plan_removals') or []}
     if not _job.get('awaiting_confirm'):
         return jsonify({'error': '目前沒有等待確認的工作'}), 409
     _confirm_action[0] = action
@@ -3306,15 +3573,24 @@ def api_browse():
 # ── 後臺影音清單（LTN 內部 API 匯入，供自動化測試用）──────────────────────────
 @app.route('/api/backlog/assess', methods=['POST'])
 def api_backlog_assess():
-    """探測一篇文章的影片總長，回傳「素材夠不夠做 60 秒」預判（清單標註用）"""
+    """探測一篇文章的影片總長＋配圖張數，回傳素材預判（清單標註用）"""
     data = request.json or {}
     urls = [u for u in (data.get('videoUrls') or []) if u]
-    if not urls:
-        return jsonify({'total_sec': 0, 'n_videos': 0, 'level': 'red', 'label': '✕ 素材不足'})
     try:
-        return jsonify(ltn_api.assess_materials(urls))
+        result = (ltn_api.assess_materials(urls) if urls
+                  else {'total_sec': 0, 'n_videos': 0, 'level': 'red', 'label': '✕ 素材不足'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    # 配圖張數（LTN 圖檔編號遞增，逐號 HEAD 探測）
+    article_no = (data.get('articleNo') or '').strip()
+    if article_no:
+        try:
+            art = ltn_api.fetch_article(article_no)
+            result['n_photos'] = (len(ltn_api.discover_photos(art['photo_url']))
+                                  if art.get('photo_url') else 0)
+        except Exception:
+            result['n_photos'] = None
+    return jsonify(result)
 
 
 @app.route('/api/backlog')

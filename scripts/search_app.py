@@ -558,7 +558,7 @@ button.ghost{background:transparent;border:1px solid var(--line);color:var(--tx2
 <body>
 <div class="wrap">
   <h1>🔎 影音語意搜尋 <a href="/insights" style="float:right;font-size:13px;color:var(--ac);text-decoration:none;font-weight:400">📈 查詢紀錄</a></h1>
-  <div class="sub">來源：input/videos 素材庫（產製短影音下載的素材，每天自動進索引）</div>
+  <div class="sub">來源：input/videos 素材庫（產製短影音下載的素材，每天自動進索引）。可搜：受訪原音逐字稿＋畫面內容（產製時智慧分析過的影片，🎬 標記）</div>
   <div class="bar">
     <input id="q" placeholder="打一句話找片段，例：林榮基講跨境抓人 / 警方攔查機車" autofocus>
     <button onclick="go()">搜尋</button>
@@ -625,8 +625,9 @@ async function go(){
     const qs='s='+encodeURIComponent(r.src)+'&v='+encodeURIComponent(r.relpath);
     const th='/api/seg_thumb?'+qs+'&t='+r.start;
     const cl='/api/clip?'+qs+'&start='+r.start+'&end='+r.end;
-    const badge=(r.source==='title'?'<span class="badge">文章標題<\/span>':'')
-      +(_nsrc>1?`<span class="badge">${esc(r.src)}<\/span>`:'');
+    const srcBadge=r.source==='title'?'<span class="badge">文章標題<\/span>'
+      :(r.source==='visual'?'<span class="badge" style="background:#ecfccb;color:#3f6212">🎬 畫面<\/span>':'');
+    const badge=srcBadge+(_nsrc>1?`<span class="badge">${esc(r.src)}<\/span>`:'');
     return `<div class="card" onclick='play(${JSON.stringify(r.src)},${JSON.stringify(r.relpath)},${r.start},${JSON.stringify(r.text)})'>
       <img loading="lazy" src="${th}">
       <div style="min-width:0">

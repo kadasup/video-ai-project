@@ -310,6 +310,40 @@ def _azure_client():
     )
 
 
+def describe_photo(photo: Path) -> str:
+    """
+    GPT 視覺辨識單張新聞照片 → 一句可供配對判讀的描述（含主體與情境）。
+    LTN 的照片 API 只給網址、沒有圖說 metadata，要知道照片拍到什麼（校長？
+    學童演奏？火場？）唯一辦法就是視覺辨識，配對才配得準。
+    結果進快取（photodesc1），同一張重跑零花費；失敗回空字串（不擋流程）。
+    """
+    photo = Path(photo)
+    cached = _cache_get("photodesc1", photo)
+    if cached is not None:
+        return cached.get("desc", "")
+    try:
+        content = [
+            {"type": "text", "text": (
+                "這是一張新聞報導配圖。用一句話（30 字內）描述畫面主體與情境，"
+                "供影片剪輯配對用：具體寫出人事物與動作（例：校長在禮堂致詞、"
+                "學童上台演奏豎笛、消防員在火場灌救）。畫面若有明顯身分的人物"
+                "（台上致詞者、受訪者）點出來。只回純文字，不要引號或多餘說明。")},
+            {"type": "image_url", "image_url": {
+                "url": f"data:image/jpeg;base64,{_b64(photo)}", "detail": "low"}},
+        ]
+        resp = _azure_client().chat.completions.create(
+            model=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2"),
+            messages=[{"role": "user", "content": content}],
+            max_completion_tokens=120,
+        )
+        desc = (resp.choices[0].message.content or "").strip().strip('"「」 ')
+        _cache_put("photodesc1", photo, {"desc": desc})
+        return desc
+    except Exception as e:
+        print(f"  ⚠ 照片描述失敗（{e}）")
+        return ""
+
+
 def classify_with_vision(
     video: Path,
     candidate: dict,
@@ -499,6 +533,22 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
+_EMPTY_SHOT_KW = ("空景", "空鏡", "空無", "無人", "空曠", "佈置", "布置",
+                  "會場一角", "布幕", "空桌", "椅子", "座位")
+
+
+def _is_empty_shot(seg: dict) -> bool:
+    """過場空景／無事件主體的空鏡（例：拍到講台空椅子、會場佈置、空走廊）。
+    這種鏡頭當環境交代還行，但配在講事件經過的旁白上會顯得畫面空洞、像沒剪到。"""
+    if seg.get("shot") == "空景":
+        return True
+    desc = seg.get("description", "") or ""
+    subj = (seg.get("subject") or "").strip()
+    if not subj and any(k in desc for k in _EMPTY_SHOT_KW):
+        return True
+    return any(k in desc for k in ("空無一人", "無人的", "空鏡頭"))
+
+
 def seg_line(seg: dict) -> str:
     """把結構化欄位組成一行素材描述（配對 prompt 與腳本 footage_notes 共用格式）"""
     marks = []
@@ -512,6 +562,8 @@ def seg_line(seg: dict) -> str:
         marks.append(f"畫面字:{seg['screen_text'][:12]}")
     if seg.get("has_speech"):
         marks.append("有原音人聲")
+    if _is_empty_shot(seg):
+        marks.append("⚠過場空景")
     tag = f"【{'|'.join(marks)}】" if marks else ""
     return f"{seg['start']}s~{seg['end']}s：{seg.get('description', '')}{tag}"
 
@@ -716,6 +768,55 @@ def catalog_video(video: Path, max_segments: int = 16) -> dict:
 
 # ── 旁白 ↔ 片段 智慧配對 ─────────────────────────────────────────────────────
 
+def _dedup_overlaps(plan: list[dict], catalogs: list[dict]) -> list[dict]:
+    """
+    同一支影片被取用到「重疊或幾乎相同」的區間，觀眾會看到同一段畫面連播兩次。
+    prompt 規則只是提醒、GPT 常忽略——這裡硬性把後出現的片段起點位移到該片已用過
+    區間之後；後面畫面不夠就往前找沒用過的空檔；整支都用光了才維持原樣。
+    只動 start（畫面內容），不動 dur（總長與時間軸不變）。
+    """
+    cat_by_path = {str(c["path"]): c for c in catalogs}
+    used: dict[str, list[tuple[float, float]]] = {}
+
+    def _find_free_start(ranges, total, dur, want):
+        """在 [0,total] 找長度 ≥dur、不與 ranges 重疊的起點，優先靠近 want。"""
+        gaps, cursor = [], 0.0
+        for s, e in sorted(ranges):
+            if s - cursor >= dur:
+                gaps.append((cursor, s))
+            cursor = max(cursor, e)
+        if total - cursor >= dur:
+            gaps.append((cursor, total))
+        if not gaps:
+            return None
+        best = min(gaps, key=lambda g: abs(max(g[0], min(want, g[1] - dur)) - want))
+        return round(max(best[0], min(want, best[1] - dur)), 2)
+
+    for e in plan:
+        p = e.get("path")
+        if not p:
+            continue
+        key = str(p)
+        s, d = e["start"], e["dur"]
+        en = s + d
+        prev = used.get(key, [])
+        # 重疊判定留 0.3s 容差（相鄰片段接在一起不算重複）
+        overlap = [(us, ue) for us, ue in prev if s < ue - 0.3 and en > us + 0.3]
+        if overlap:
+            cat = cat_by_path.get(key)
+            total = cat["duration"] if cat else en
+            push = round(max(ue for _, ue in overlap), 2)
+            if push + d <= total + 0.05:              # 往後推排得下
+                s, en = push, round(push + d, 2)
+            else:                                      # 後面不夠 → 找空檔
+                alt = _find_free_start(prev, total, d, s)
+                if alt is not None:
+                    s, en = alt, round(alt + d, 2)
+            e["start"] = round(s, 2)
+        used.setdefault(key, []).append((s, en))
+    return plan
+
+
 def match_narration_to_clips(
     narration_segments: list[dict],
     catalogs: list[dict],
@@ -798,6 +899,9 @@ def match_narration_to_clips(
         "同一位受訪者的講話畫面當底圖（同一張臉先無聲後有聲，觀眾會混亂）\n"
         "5-1. 善用鏡位與畫質標記：開場/交代環境用遠景，講主體細節用中景/特寫；"
         "標記「晃動」「模糊」「過暗」的段落畫質差，有其他選擇時盡量避開\n"
+        "5-2. ⚠️ 標記「過場空景」的段落是沒有事件主體的空鏡（空椅子、會場佈置、"
+        "空走廊等）——只有在旁白正好在交代場地/環境時才用，講事件經過或人物時"
+        "絕對不要選它當畫面（會顯得像沒剪乾淨的過場）；寧可重複用有主體的片段或照片\n"
         "6. ⚠️ 相鄰兩個片段不可取用同一支影片的重疊區間（例如上一段用了 V1 的 1~11 秒，"
         "下一段就不要再用 V1 的 8~15 秒——觀眾會看到同樣畫面連播兩次）\n"
         "6-1. ⚠️ 連戲一致性：相鄰片段若出現同一人物，其外觀（眼鏡/服裝/姿態）與光線"
@@ -903,6 +1007,9 @@ def match_narration_to_clips(
             plan.append({"path": None, "photo": filler_photo, "start": 0.0,
                          "dur": round(gap, 2),
                          "why": "時間軸不足，" + ("以新聞配圖補足" if filler_photo else "補黑幕")})
+
+    # 重複片段去重：同一支影片被取用到重疊區間會讓觀眾看到同畫面連播兩次
+    plan = _dedup_overlaps(plan, catalogs)
 
     # 碎片段合併：<2 秒的片段觀眾根本來不及看，直接併給前一段（延長前段時長）
     merged: list[dict] = []

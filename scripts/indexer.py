@@ -236,6 +236,63 @@ def _embed_or_none(texts: list[str]) -> list[bytes | None]:
         return [None] * len(texts)
 
 
+# ── M2-lite：智慧分析（畫面視覺描述）併入索引 ────────────────────────────────
+# 產製線的「智慧分析」（select_clip.catalog_video）早就把每支影片逐段看過、
+# 存了畫面描述/主體/畫面文字到 catalog 快取。這裡只「讀既有快取」轉成可檢索
+# 片段（source='visual'）——已分析過的影片零額外 GPT 花費即可用畫面內容搜尋。
+# 沒進過產製線、從沒被智慧分析過的影片沒有這份快取，就只有語音層可搜（正常）。
+
+def visual_segments_from_catalog(video: Path) -> list[dict]:
+    """讀 catalog 快取整理成可檢索的視覺片段；沒有快取回 []（不觸發新分析）。"""
+    try:
+        from select_clip import _cache_get
+    except Exception:
+        return []
+    cat = _cache_get("catalog3", Path(video))
+    if not cat or not cat.get("segments"):
+        return []
+    out: list[dict] = []
+    for s in cat["segments"]:
+        desc = (s.get("description") or "").strip()
+        subj = (s.get("subject") or "").strip()
+        stext = (s.get("screen_text") or "").strip()
+        # 去重保序：描述＋主體＋畫面文字串成一句（畫面文字如招牌/字卡最好搜）
+        parts = [p for p in (desc, subj, stext)
+                 if p and p not in ("（未取得描述）", "（無法抽取影格）")]
+        text = "，".join(dict.fromkeys(parts))
+        if len(re.sub(r"[^0-9A-Za-z一-鿿]", "", text)) < 3:
+            continue
+        out.append({"start": float(s.get("start", 0) or 0),
+                    "end": float(s.get("end", 0) or 0), "text": text})
+    # 相鄰且描述完全相同的段落合併成一個時間跨度，減少洗版與向量筆數
+    merged: list[dict] = []
+    for s in out:
+        if merged and merged[-1]["text"] == s["text"]:
+            merged[-1]["end"] = s["end"]
+        else:
+            merged.append(dict(s))
+    return merged
+
+
+def sync_visual_segments(con, video_id: int, video: Path) -> int:
+    """確保該影片的視覺描述片段已進索引（冪等）；已存在就不重做，回傳新增筆數。"""
+    have = con.execute("SELECT COUNT(*) FROM segments WHERE video_id=? AND source='visual'",
+                       (video_id,)).fetchone()[0]
+    if have:
+        return 0
+    vsegs = visual_segments_from_catalog(video)
+    if not vsegs:
+        return 0
+    embs = _embed_or_none([v["text"] for v in vsegs])
+    cur = con.cursor()
+    for v, e in zip(vsegs, embs):
+        cur.execute("""INSERT INTO segments(video_id, start, end, text, text_raw,
+                       source, embedding) VALUES(?,?,?,?,?,?,?)""",
+                    (video_id, v["start"], v["end"], v["text"], "", "visual", e))
+    con.commit()
+    return len(vsegs)
+
+
 def run_index(progress=None) -> dict:
     """
     增量建索引。progress 是選配 callback(done, total, msg)。
@@ -259,7 +316,8 @@ def run_index(progress=None) -> dict:
     for s in sources:
         all_files += [(s["name"], s["path"], p) for p in sorted(s["path"].rglob("*"))
                       if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
-    stats = {"scanned": len(all_files), "added": 0, "skipped": 0, "removed": 0, "errors": 0}
+    stats = {"scanned": len(all_files), "added": 0, "skipped": 0, "removed": 0,
+             "errors": 0, "visual": 0}
 
     # 磁碟上已不存在的（被清掉/搬走/來源停用）→ 索引一併移除
     on_disk = {(src, str(f.relative_to(root))) for src, root, f in all_files}
@@ -281,6 +339,12 @@ def run_index(progress=None) -> dict:
             title = titles.get(f.name, "")
             if title:
                 con.execute("UPDATE videos SET title=? WHERE id=?", (title, row[0]))
+            # M2-lite：這支影片可能在上次建索引之後才被拿去產製（多了智慧分析
+            # 快取），檔案本身沒變也要把新出現的視覺描述補進索引
+            nv = sync_visual_segments(con, row[0], f)
+            if nv:
+                stats["visual"] += nv
+                report(i, len(all_files), f"補視覺描述 [{src}] {rel}（{nv} 段）")
             stats["skipped"] += 1
             continue
 
@@ -323,6 +387,8 @@ def run_index(progress=None) -> dict:
                              embs[-1] if embs else None))
             con.commit()
             stats["added"] += 1
+            # M2-lite：若這支影片有智慧分析快取，畫面描述一併進索引（免費共用）
+            stats["visual"] += sync_visual_segments(con, vid, f)
         except Exception as e:
             print(f"  ✗ [{src}] {rel}: {e}", flush=True)
             stats["errors"] += 1
@@ -331,7 +397,8 @@ def run_index(progress=None) -> dict:
     con.close()
     report(len(all_files), len(all_files),
            f"完成：新增/更新 {stats['added']}、略過 {stats['skipped']}、"
-           f"移除 {stats['removed']}、失敗 {stats['errors']}")
+           f"移除 {stats['removed']}、失敗 {stats['errors']}、"
+           f"視覺描述 {stats['visual']} 段")
     return stats
 
 
