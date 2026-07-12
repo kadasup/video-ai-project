@@ -176,7 +176,7 @@ def assess_materials(video_urls: list[str]) -> dict:
     if total >= 45:
         level, label = "green", "⚡ 可一鍵生成"
     elif total >= 20:
-        level, label = "yellow", "△ 素材偏少（會用照片補）"
+        level, label = "yellow", "△ 素材偏少"
     else:
         level, label = "red", "✕ 素材不足"
     return {"total_sec": total, "n_videos": len(valid), "level": level, "label": label}

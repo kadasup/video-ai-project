@@ -440,8 +440,11 @@ _cache_mem: dict | None = None
 
 
 def _cache_key(video: Path) -> str:
-    st = video.stat()
-    return f"{video}|{int(st.st_mtime)}|{st.st_size}"
+    """快取識別＝檔名＋位元組大小（M2 前置，改自舊的「完整路徑＋mtime＋大小」）。
+    不含路徑與 mtime，所以同一支檔不管在哪個磁碟／機器、下載到本機還是留在 NAS，
+    只要檔名與大小相同就認得出是同一支——產製線與搜尋索引可跨位置共用同一份分析。
+    前提：檔名要夠獨特（LTN 命名 日期-機-稿號-W-序號 已足夠；必要時未來再加影格指紋防撞）。"""
+    return f"{Path(video).name}|{Path(video).stat().st_size}"
 
 
 def _cache_load() -> dict:
