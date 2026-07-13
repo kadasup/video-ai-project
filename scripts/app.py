@@ -16,6 +16,15 @@ import time
 import uuid
 from pathlib import Path
 
+# ── Windows 主控台預設 cp950，遇到 ⚠ 等 emoji 的 print 會 UnicodeEncodeError，
+#    導致產製中途（如「串接輸出」）整個 job 掛掉。這裡把標準輸出強制轉 UTF-8，
+#    並用 backslashreplace 當保險，確保任何字元都不會再讓 print 崩潰。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
+
 from flask import Flask, jsonify, render_template_string, request, send_file
 
 # ── 啟動時自動讀取 D:\VideoAI\.env 的 API key ────────────────────────────────
@@ -467,11 +476,14 @@ STEPS = ['', '分析影片內容', '生成播報腳本', '生成旁白音訊', '
 
 
 def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str = "hsiaochen",
-            checkpoint: bool = True, photos: list[str] | None = None):
+            checkpoint: bool = True, photos: list[str] | None = None,
+            low_quality: bool = True):
     """videos: [{"path": "...", "start": 12.0}, ...]，依序銜接補滿 MAIN_SEC 秒
     photos: 新聞配圖本機路徑（匯入時下載的文章主圖），配不到動態畫面的旁白段
             會用「照片＋Ken Burns 推移」取代黑幕/空洞畫面。
-    checkpoint=True 時，配對完成後會暫停等使用者確認分鏡，才進最後渲染。"""
+    checkpoint=True 時，配對完成後會暫停等使用者確認分鏡，才進最後渲染。
+    low_quality=True（POC 低畫質模式，預設）：正式渲染也走 480p/ultrafast＋480p 片尾，
+    完整流程照舊（進成片庫、metadata、回饋閉環），只是畫質低、渲染快；上線時關掉恢復 1080p。"""
     global _busy, _job
     voice = TTS_VOICES.get(voice_key, TTS_VOICES["hsiaochen"])
     # 讓前端能還原「這個工作實際用的輸入」（重跑時產製頁清單要顯示重跑的素材，
@@ -935,13 +947,15 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
 
         # ── 步驟5：旁白配畫面（配的是「純旁白時間軸」，配完在 SOT 點切開插入原音段）──
         # 沒有影片但有照片 → 圖輯式模式：整支用照片輪播（Ken Burns）配旁白
-        # 照片視覺辨識：LTN 沒給圖說，逐張用 GPT 看過（有快取），配對才知道
-        # 哪張拍到校長、哪張是演奏，不再全部用同一句罐頭描述
+        # 照片圖說優先序：①記者手寫圖說（API A_Photo.Content，主圖才有，最準又免費）
+        # → ②GPT 視覺辨識（探測抓的其餘配圖沒圖說，逐張看，有快取）→ ③罐頭描述。
         existing_photos = [ph for ph in (photos or []) if Path(ph).exists()]
         photo_items = []
         for ph in existing_photos:
-            d = describe_photo(Path(ph)) or "新聞報導配圖（事件現場或網傳畫面的截圖）"
-            photo_items.append({"path": ph, "desc": d})
+            cap = ltn_api.get_photo_caption(ph)
+            d = cap or describe_photo(Path(ph)) or "新聞報導配圖（事件現場或網傳畫面的截圖）"
+            photo_items.append({"path": ph, "desc": d,
+                                "desc_src": "記者圖說" if cap else "AI辨識"})
         photo_mode = (not catalogs) and bool(photo_items)
         plan = None
         if (catalogs or photo_items) and segments:
@@ -1150,10 +1164,14 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         # 兩處讀不同來源會導致「/logs 顯示有 hook、但實際影片沒燒進去」的落差
         hook = _job.get('hook')
         title = _job.get('title') or script.get('title', '')
+        # 只有走 plan 的路徑支援低畫質；無 plan 的純黑幕備援維持全畫質，
+        # 片尾要跟主畫面實際畫質一致（concat -c copy 要求解析度相同）
+        main_is_draft = bool(low_quality and plan)
         if plan:
             _enrich_subject_pos(plan, catalogs)   # 每段查主體位置，供直式裁切偏移
             main_clip, length_info = make_main_plan(tts_path, ass_path, plan, main_sec,
-                                                    hook=hook, straps=straps, title=title)
+                                                    hook=hook, straps=straps, title=title,
+                                                    draft=main_is_draft)
         else:
             main_clip, length_info = make_main(tts_path, ass_path, videos, main_sec,
                                                hook=hook, title=title)
@@ -1167,7 +1185,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             _job['warning'] = (_job.get('warning') + '\n' + short_msg) if _job.get('warning') else short_msg
 
         p(8)
-        outro = make_outro()
+        outro = make_outro(draft=main_is_draft)
 
         p(9)
         safe = re.sub(r'[\\/:*?"<>|]', '-', script['title'])[:20]
@@ -1241,6 +1259,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             "factcheck":          _job.get('factcheck'),
             "translit":           _job.get('translit'),
             "main_sec":           _job.get('main_sec', 0),
+            "low_quality":        bool(low_quality),
             "step_durations":     step_durations,
             "cancelled":          bool(_job.get('cancelled')),
             "error":              err_msg,
@@ -1808,7 +1827,7 @@ HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>短影音產製</title>
+<title>自由短影音產製（內部測試）</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 html{font-size:17px}
@@ -1942,13 +1961,24 @@ textarea{resize:vertical;min-height:210px}
 }
 .backlog-list{max-height:340px;overflow-y:auto;border:1px solid #e5e7eb;border-radius:8px}
 .backlog-row{
-  display:grid;grid-template-columns:96px 118px 1fr max-content max-content;
+  display:grid;grid-template-columns:96px 118px 1fr 210px 78px;
   align-items:center;gap:10px;padding:9px 12px;
   border-bottom:1px solid #f3f4f6;font-size:.82rem
 }
 .backlog-row:last-child{border-bottom:none}
 .backlog-row .bl-title{color:#1f2937;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.backlog-row .bl-meta{color:#9ca3af;font-size:.74rem;white-space:nowrap;text-align:right}
+.backlog-row .bl-meta{color:#9ca3af;font-size:.74rem;white-space:nowrap;text-align:right;overflow:hidden;text-overflow:ellipsis}
+/* 表頭：與資料列共用同一組欄寬 → 欄位對齊 */
+.backlog-head{
+  display:grid;grid-template-columns:96px 118px 1fr 210px 78px;
+  align-items:center;gap:10px;padding:8px 12px;margin-top:8px;
+  background:#f9fafb;border:1px solid #e5e7eb;border-bottom:none;
+  border-radius:8px 8px 0 0;font-size:.72rem;font-weight:700;color:#6b7280;letter-spacing:.02em
+}
+.backlog-head span{text-align:center}
+.backlog-head .h-title{text-align:left}
+.backlog-head .h-meta{text-align:right}
+.backlog-head+.backlog-list{border-radius:0 0 8px 8px;border-top:none}
 .bl-status{
   padding:3px 0;border-radius:10px;font-size:.72rem;font-weight:700;
   white-space:nowrap;text-align:center
@@ -1968,7 +1998,7 @@ textarea{resize:vertical;min-height:210px}
   font-size:.78rem;font-weight:600;cursor:pointer;white-space:nowrap
 }
 .btn-import:hover{background:#1d4ed8}
-.btn-import:disabled{background:#9ca3af;cursor:not-allowed}
+.btn-import:disabled{background:#9ca3af;cursor:not-allowed;opacity:.7;pointer-events:none}
 
 /* 資料夾瀏覽 modal */
 .modal-overlay{
@@ -2041,13 +2071,20 @@ textarea{resize:vertical;min-height:210px}
 .btn-addphoto{padding:7px 12px;background:#fff;border:1px dashed #9ca3af;border-radius:6px;font-size:.8rem;cursor:pointer;color:#6b7280}
 .btn-addphoto:hover{border-color:#2563eb;color:#2563eb}
 /* 點擊查核警示定位到旁白稿：短暫紅光閃爍，跟原生選取的藍底文字一起提示位置 */
-@keyframes narFlash{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}20%{box-shadow:0 0 0 4px rgba(239,68,68,.55)}}
-.nar-flash{animation:narFlash 1.5s ease-out;border-color:#ef4444 !important}
+@keyframes narFlash{
+  0%{box-shadow:0 0 0 0 rgba(239,68,68,.65);background:#fff5f5}
+  25%{box-shadow:0 0 0 6px rgba(239,68,68,.35);background:#ffe4e4}
+  50%{box-shadow:0 0 0 0 rgba(239,68,68,.65);background:#fff5f5}
+  75%{box-shadow:0 0 0 6px rgba(239,68,68,.35);background:#ffe4e4}
+  100%{box-shadow:0 0 0 0 rgba(239,68,68,0);background:transparent}
+}
+.nar-flash{animation:narFlash 1.8s ease-out;border-color:#ef4444 !important;border-width:3px !important}
+#sp-nar::selection{background:#ffd24a;color:#111}
 </style>
 </head>
 <body>
 <div class="topnav">
-  <h1>🎬 短影音產製</h1>
+  <h1>🎬 自由短影音產製（內部測試）</h1>
   <a href="/" class="active">產製</a>
   <a href="/gallery">成片庫</a>
   <a href="/logs">使用記錄</a>
@@ -2074,6 +2111,13 @@ textarea{resize:vertical;min-height:210px}
       </select>
     </div>
     <button class="btn-browse" onclick="loadBacklog()">🔍 搜尋</button>
+  </div>
+  <div class="backlog-head">
+    <span>處理狀況</span>
+    <span>智慧判斷</span>
+    <span class="h-title">標題</span>
+    <span class="h-meta">時間 · 素材</span>
+    <span>匯入</span>
   </div>
   <div class="backlog-list" id="backlog-list">
     <div style="padding:14px;color:#9ca3af;font-size:.82rem">選好日期區間後按「搜尋」載入清單</div>
@@ -2108,6 +2152,10 @@ textarea{resize:vertical;min-height:210px}
       <input type="checkbox" id="checkpoint" checked style="width:16px;height:16px">
       <span>產製途中停站讓我確認（<b>旁白稿站</b>：看稿改稿、查核譯名警示 →
       <b>分鏡站</b>：換畫面、快速預覽）——取消勾選＝全自動一路跑完不停站（批次/過夜用）</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-weight:400;color:#6b7280">
+      <input type="checkbox" id="lowq" checked disabled style="width:16px;height:16px">
+      <span>🔒 <b>POC 低畫質模式</b>（測試期鎖定啟用，不可關）——成片庫存 480p、渲染快；正式上線再由開發端解鎖切回 1080p</span>
     </label>
 
     <button class="btn" id="btn" onclick="startJob()">開始產製</button>
@@ -2222,6 +2270,7 @@ async function startJob() {
         videos:  videos,
         photos:  importedPhotos,
         checkpoint: document.getElementById('checkpoint').checked,
+        low_quality: document.getElementById('lowq').checked,
       })
     });
     const d = await r.json();
@@ -2286,18 +2335,28 @@ function renderScriptCheckpoint(pv) {
   // 查核／譯名警示沿用分鏡面板的樣式（在改稿階段看到最有用）
   spFactcheckIssues = pv.factcheck || [];
   if (pv.factcheck && pv.factcheck.length) {
-    const rows = pv.factcheck.map((f, idx) => {
-      const sev = f.severity === 'high'
-        ? '<span style="color:#b91c1c;font-weight:700">●高</span>'
-        : '<span style="color:#b45309;font-weight:700">●中</span>';
-      return `<div onclick="jumpToNarrationIssue(${idx})" title="點擊定位到下方旁白區"
-        style="margin:4px 0;padding:6px 8px;background:#fff;border-radius:5px;cursor:pointer;display:flex;gap:6px;align-items:baseline">
-        <span style="flex:1">${sev} <b>${esc(f.field)}</b>：旁白說「${esc(f.narration_says)}」，但原稿是「${esc(f.article_says)}」</span>
-        <span style="color:#2563eb;font-size:.74rem;white-space:nowrap">📍 定位</span></div>`;
-    }).join('');
-    html += `<div style="margin-bottom:10px;padding:10px 12px;background:#fef2f2;border:2px solid #fca5a5;border-radius:8px">
-      <div style="color:#991b1b;font-weight:700;margin-bottom:6px">🔍 事實查核：${pv.factcheck.length} 處與原稿不符——點警示可定位到下面稿子對應位置</div>
-      ${rows}</div>`;
+    // 分兩類：矛盾/捏造＝真的會出事，紅色醒目；省略＝旁白比原稿少講但不衝突，灰色小字
+    const isOmit = f => (f.type === '省略') || (f.type == null && f.severity === 'low');
+    const bad = [], omit = [];
+    pv.factcheck.forEach((f, idx) => (isOmit(f) ? omit : bad).push([f, idx]));
+    if (bad.length) {
+      const rows = bad.map(([f, idx]) =>
+        `<div onclick="jumpToNarrationIssue(${idx})" title="點擊定位到下方旁白區"
+          style="margin:4px 0;padding:6px 8px;background:#fff;border-radius:5px;cursor:pointer;display:flex;gap:6px;align-items:baseline">
+          <span style="flex:1"><span style="color:#b91c1c;font-weight:700">●${esc(f.type||'矛盾')}</span> <b>${esc(f.field)}</b>：旁白說「${esc(f.narration_says)}」，但原稿是「${esc(f.article_says)}」</span>
+          <span style="color:#2563eb;font-size:.74rem;white-space:nowrap">📍 定位</span></div>`).join('');
+      html += `<div style="margin-bottom:10px;padding:10px 12px;background:#fef2f2;border:2px solid #fca5a5;border-radius:8px">
+        <div style="color:#991b1b;font-weight:700;margin-bottom:6px">🚨 事實查核：${bad.length} 處與原稿牴觸——務必核對！點警示可定位到下面稿子</div>
+        ${rows}</div>`;
+    }
+    if (omit.length) {
+      const rows = omit.map(([f, idx]) =>
+        `<div onclick="jumpToNarrationIssue(${idx})" title="點擊定位到下方旁白區"
+          style="margin:3px 0;cursor:pointer;color:#6b7280">・<b>${esc(f.field)}</b>：旁白省略了「${esc(f.article_says)}」（不衝突，視版面可不補）</div>`).join('');
+      html += `<div style="margin-bottom:10px;padding:8px 12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;font-size:.78rem">
+        <div style="color:#6b7280;font-weight:700;margin-bottom:4px">ℹ️ 省略提醒（${omit.length} 處，非錯誤）：旁白比原稿少講的細節，通常可接受</div>
+        ${rows}</div>`;
+    }
   }
   if (pv.translit && pv.translit.length) {
     const mis = pv.translit.filter(t => t.status === 'mismatch');
@@ -2379,29 +2438,52 @@ function toast(m) {
   setTimeout(() => t.style.opacity = '0', 2200);
 }
 
+// 在旁白（可能已被人工修改過的 textarea 內容）裡找出查核片段的位置。
+// 查核給的 narration_says 常夾帶自己的註解（如「（未交代罰鍰區間）」）或經過改寫，
+// 未必逐字存在於旁白裡，所以純 indexOf 常找不到。改成分層比對：
+//   ① 整串直接命中 ② 去掉括號註解再試 ③ 退回「旁白裡真的有的最長連續片段」
+function _locateInNarration(hay, needle) {
+  if (!needle) return null;
+  let i = hay.indexOf(needle);
+  if (i >= 0) return [i, needle.length];
+  const stripped = needle.replace(/[（(][^）)]*[）)]/g, '').trim();
+  if (stripped && stripped !== needle) {
+    i = hay.indexOf(stripped);
+    if (i >= 0) return [i, stripped.length];
+  }
+  // 最長連續共同片段（滑動視窗，從長到短找 needle 的哪一段確實在旁白裡）
+  const n = stripped || needle;
+  for (let len = n.length; len >= 6; len--) {
+    for (let s = 0; s + len <= n.length; s++) {
+      const frag = n.slice(s, s + len);
+      const p = hay.indexOf(frag);
+      if (p >= 0) return [p, len];
+    }
+  }
+  return null;
+}
+
 function jumpToNarrationIssue(idx) {
   const f = spFactcheckIssues[idx];
   const ta = document.getElementById('sp-nar');
   if (!f || !ta) return;
-  const text = f.narration_says || '';
-  const pos = text ? ta.value.indexOf(text) : -1;
+  const hit = _locateInNarration(ta.value, f.narration_says || '');
   ta.scrollIntoView({behavior: 'smooth', block: 'center'});
-  if (pos < 0) {
-    toast('在旁白裡找不到這段文字（可能已經被手動改過）');
+  if (!hit) {
+    toast('在旁白裡找不到對應文字（可能已被改寫）');
     return;
   }
-  // 依命中位置所在行數估算捲動位置，讓文字出現在 textarea 可視範圍內
-  // （只捲整個頁面不夠，稿子一長，命中的那句可能還是在 textarea 看不到的地方）
-  const before = ta.value.slice(0, pos);
-  const lineNo = before.split('\\n').length - 1;
-  const lineHeight = parseFloat(getComputedStyle(ta).lineHeight) || 24;
+  const [pos, len] = hit;
+  // 依命中行數估算捲動位置，讓命中片段出現在 textarea 可視範圍中央
+  const lineNo = ta.value.slice(0, pos).split('\\n').length - 1;
+  const lineHeight = parseFloat(getComputedStyle(ta).lineHeight) || 26;
   ta.focus();
-  ta.setSelectionRange(pos, pos + text.length);
+  ta.setSelectionRange(pos, pos + len);   // 選取＝持續醒目，改稿完才消失
   ta.scrollTop = Math.max(0, lineNo * lineHeight - ta.clientHeight / 2);
   ta.classList.remove('nar-flash');
   void ta.offsetWidth;   // 強制 reflow，讓動畫能重新觸發（連續點同一項也要再閃一次）
   ta.classList.add('nar-flash');
-  setTimeout(() => ta.classList.remove('nar-flash'), 1500);
+  setTimeout(() => ta.classList.remove('nar-flash'), 1800);
 }
 
 function toggleRemoveCard(i) {
@@ -2463,17 +2545,24 @@ function renderCheckpoint(pv) {
   let html = '';
   // 事實查核警示：擺最上面最醒目，紅底，逐項列出旁白 vs 原稿的出入
   if (pv.factcheck && pv.factcheck.length) {
-    const rows = pv.factcheck.map(f => {
-      const sev = f.severity === 'high'
-        ? '<span style="color:#b91c1c;font-weight:700">●高</span>'
-        : '<span style="color:#b45309;font-weight:700">●中</span>';
-      return `<div style="margin:4px 0;padding:6px 8px;background:#fff;border-radius:5px">
-        ${sev} <b>${esc(f.field)}</b>：旁白說「${esc(f.narration_says)}」，
-        但原稿是「${esc(f.article_says)}」</div>`;
-    }).join('');
-    html += `<div style="margin-bottom:12px;padding:10px 12px;background:#fef2f2;border:2px solid #fca5a5;border-radius:8px">
-      <div style="color:#991b1b;font-weight:700;margin-bottom:6px">🔍 事實查核：旁白與原稿有 ${pv.factcheck.length} 處出入，請核對後再決定是否渲染</div>
-      ${rows}</div>`;
+    const isOmit = f => (f.type === '省略') || (f.type == null && f.severity === 'low');
+    const bad = pv.factcheck.filter(f => !isOmit(f));
+    const omit = pv.factcheck.filter(isOmit);
+    if (bad.length) {
+      const rows = bad.map(f =>
+        `<div style="margin:4px 0;padding:6px 8px;background:#fff;border-radius:5px">
+          <span style="color:#b91c1c;font-weight:700">●${esc(f.type||'矛盾')}</span> <b>${esc(f.field)}</b>：旁白說「${esc(f.narration_says)}」，但原稿是「${esc(f.article_says)}」</div>`).join('');
+      html += `<div style="margin-bottom:12px;padding:10px 12px;background:#fef2f2;border:2px solid #fca5a5;border-radius:8px">
+        <div style="color:#991b1b;font-weight:700;margin-bottom:6px">🚨 事實查核：${bad.length} 處與原稿牴觸，請務必核對後再渲染</div>
+        ${rows}</div>`;
+    }
+    if (omit.length) {
+      const rows = omit.map(f =>
+        `<div style="margin:3px 0;color:#6b7280">・<b>${esc(f.field)}</b>：旁白省略了「${esc(f.article_says)}」（不衝突，可接受）</div>`).join('');
+      html += `<div style="margin-bottom:12px;padding:8px 12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;font-size:.78rem">
+        <div style="color:#6b7280;font-weight:700;margin-bottom:4px">ℹ️ 省略提醒（${omit.length} 處，非錯誤）</div>
+        ${rows}</div>`;
+    }
   }
   // 譯名核實：跟報社音譯總表比對的結果（不符標紅、相符打勾、未收錄給提示）
   if (pv.translit && pv.translit.length) {
@@ -2494,11 +2583,13 @@ function renderCheckpoint(pv) {
       <div style="font-weight:700;margin-bottom:4px;color:${mis.length?'#991b1b':'#166534'}">🈯 譯名核實（報社音譯總表）</div>
       ${trHtml}${subLines?`<div style="font-size:.78rem;margin-top:4px">${subLines}</div>`:''}</div>`;
   }
-  html += `<div style="display:flex;gap:10px;margin-bottom:8px">
-    <div style="flex:1"><b style="font-size:.78rem">🏷 開場標題字卡（可直接改）</b>
-      <input id="cp-title" value="${esc(pv.title)}" style="width:100%;margin-top:3px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:6px;font-size:.88rem"></div>
-    <div style="flex:1"><b style="font-size:.78rem">⚡ Hook 字卡（可直接改）</b>
-      <input id="cp-hook" value="${esc(pv.hook)}" style="width:100%;margin-top:3px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:6px;font-size:.88rem"></div>
+  html += `<div style="display:flex;gap:12px;margin-bottom:8px">
+    <div style="flex:1;min-width:0">
+      <b style="display:block;font-size:.78rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:4px">🏷 開場標題字卡 <span style="color:#94a3b8;font-weight:400">（可直接改）</span></b>
+      <input id="cp-title" value="${esc(pv.title)}" style="width:100%;box-sizing:border-box;padding:7px 9px;border:1px solid #cbd5e1;border-radius:6px;font-size:.88rem"></div>
+    <div style="flex:1;min-width:0">
+      <b style="display:block;font-size:.78rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:4px">⚡ Hook 字卡 <span style="color:#94a3b8;font-weight:400">（可直接改）</span></b>
+      <input id="cp-hook" value="${esc(pv.hook)}" style="width:100%;box-sizing:border-box;padding:7px 9px;border:1px solid #cbd5e1;border-radius:6px;font-size:.88rem"></div>
   </div>
   <div style="font-size:.74rem;color:#92400e;margin-bottom:8px">改完按「🎬 快速預覽」先看效果，確認渲染時以此為準（也會影響成片檔名與成片庫標題）</div>`;
   html += `<div style="margin-bottom:8px"><b>Hashtags：</b>${esc(tags)}</div>`;
@@ -2962,6 +3053,15 @@ function saveLastSettings() {
   localStorage.setItem('videoai_last_browse_dir', localStorage.getItem('videoai_last_browse_dir') || '');
   // 鍵名 v2：確認站語意已從「單一分鏡確認」升級為「兩站確認」，舊偏好作廢重新預設勾選
   localStorage.setItem('videoai_checkpoint2', document.getElementById('checkpoint').checked ? '1' : '0');
+  localStorage.setItem('videoai_lowq', document.getElementById('lowq').checked ? '1' : '0');
+}
+
+// POC 低畫質開關：勾選時（正式渲染就是快的低畫質）隱藏「快速預覽」按鈕，
+// 取消勾選（上線完整畫質、正式渲染變慢）時預覽按鈕自動回來
+function onLowqChange() {
+  saveLastSettings();
+  const b = document.getElementById('draft-btn');
+  if (b) b.style.display = document.getElementById('lowq').checked ? 'none' : '';
 }
 
 function restoreLastSettings() {
@@ -2972,6 +3072,9 @@ function restoreLastSettings() {
   importedPhotos = [];
   const cpPref = localStorage.getItem('videoai_checkpoint2');
   if (cpPref !== null) document.getElementById('checkpoint').checked = (cpPref === '1');
+  // POC 低畫質為鎖定狀態：強制啟用、忽略任何舊偏好；上線解鎖時改這裡
+  document.getElementById('lowq').checked = true;
+  onLowqChange();   // 隱藏快速預覽按鈕（POC 直接渲染就是低畫質）
   renderVideoList();
   renderPhotoStrip();
 }
@@ -3035,12 +3138,13 @@ function renderBacklog(skipAssess) {
     const assessHtml = a
       ? `<span class="bl-assess bl-assess-${a.level}" title="影片總長 ${a.total_sec}s">${a.label}</span>`
       : `<span class="bl-assess bl-assess-wait" id="bl-assess-${it.articleNo}">⋯評估中</span>`;
+    const materialShort = a && a.level === 'red';
     return `<div class="backlog-row${a && a.level === 'green' ? ' backlog-row-ready' : ''}">
       <span class="bl-status bl-status-${status}">${status}</span>
       ${assessHtml}
       <span class="bl-title">${_escBl(it.title)}</span>
       <span class="bl-meta">${ts}・🎬${vc}支${a && a.total_sec ? '(' + a.total_sec + 's)' : ''}${a && a.n_photos != null ? '・📷' + a.n_photos + '張' : ''}</span>
-      <button class="btn-import" onclick="importBacklogItem('${it.articleNo}')" id="bl-import-${it.articleNo}">📥 匯入</button>
+      <button class="btn-import"${materialShort ? ' disabled title="素材不足，暫不建議匯入"' : ''} onclick="importBacklogItem('${it.articleNo}')" id="bl-import-${it.articleNo}">📥 匯入</button>
     </div>`;
   }).join('');
   if (!skipAssess) assessBacklogItems();
@@ -3063,7 +3167,8 @@ async function assessBacklogItems() {
                                   articleNo: it.articleNo}),
           });
           const d = await r.json();
-          if (!d.error) it._assess = d;
+          // 這篇一評估完就立刻重繪，不等其他篇——避免一篇卡住讓全部列陪著空等
+          if (!d.error) { it._assess = d; renderBacklog(true); }
         } catch (_) {}
       }
     };
@@ -3071,8 +3176,6 @@ async function assessBacklogItems() {
   } finally {
     _assessRunning = false;
   }
-  // 全部評估完重繪一次（含綠標醒目列）；skipAssess=true 避免遞迴
-  if (backlogItems.some(it => it._assess)) renderBacklog(true);
 }
 
 function _escBl(s) {
@@ -3082,6 +3185,11 @@ function _escBl(s) {
 async function importBacklogItem(articleNo) {
   const it = backlogItems.find(x => x.articleNo === articleNo);
   if (!it) return;
+  // 守門：素材不足（紅燈）一律擋掉，不管按鈕是否被點到（防快取/時序造成的誤點）
+  if (it._assess && it._assess.level === 'red') {
+    toast('素材不足，暫不建議匯入');
+    return;
+  }
   const btn = document.getElementById('bl-import-' + articleNo);
   btn.disabled = true;
   btn.textContent = '匯入中…';
@@ -3311,6 +3419,9 @@ function previewVideo(path) {
   const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf(String.fromCharCode(92)));
   document.getElementById('pv-name').textContent = path.substring(cut + 1);
   m.style.display = 'flex';
+  // 播放時聲音自動打開（由 ▶ 點擊觸發，有使用者手勢，允許帶聲音播放）
+  v.muted = false;
+  v.volume = 1;
   v.play().catch(() => {});
 }
 function closePreviewVideo(ev) {
@@ -3407,11 +3518,13 @@ def api_generate():
 
     checkpoint = data.get('checkpoint')
     checkpoint = True if checkpoint is None else bool(checkpoint)
+    lowq = data.get('low_quality')
+    lowq = True if lowq is None else bool(lowq)   # POC 期間預設低畫質
     photos = [p for p in (data.get('photos') or []) if p and Path(p).exists()]
     t = threading.Thread(
         target=run_job,
         args=(article, videos, data.get('fname'), data.get('voice') or 'hsiaochen',
-              checkpoint, photos),
+              checkpoint, photos, lowq),
         daemon=True,
     )
     t.start()
@@ -3581,15 +3694,10 @@ def api_backlog_assess():
                   else {'total_sec': 0, 'n_videos': 0, 'level': 'red', 'label': '✕ 素材不足'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    # 配圖張數（LTN 圖檔編號遞增，逐號 HEAD 探測）
+    # 配圖張數（LTN 圖檔編號遞增，逐號 HEAD 探測；已發布文章配圖不會變，永久快取）
     article_no = (data.get('articleNo') or '').strip()
     if article_no:
-        try:
-            art = ltn_api.fetch_article(article_no)
-            result['n_photos'] = (len(ltn_api.discover_photos(art['photo_url']))
-                                  if art.get('photo_url') else 0)
-        except Exception:
-            result['n_photos'] = None
+        result['n_photos'] = ltn_api.get_photo_count(article_no)
     return jsonify(result)
 
 
@@ -3637,6 +3745,9 @@ def api_backlog_import():
             # LTN 圖檔編號遞增，API 只回第一張——探測抓出同篇全部配圖
             for pi, purl in enumerate(ltn_api.discover_photos(article['photo_url']), 1):
                 photo_paths.append(ltn_api.download_photo(purl, article_no, pi))
+            # 主圖有記者手寫圖說就存起來，配對時優先用（免 GPT 猜、又準）
+            if article.get('photo_caption'):
+                ltn_api.save_photo_caption(article_no, article['photo_caption'])
         except Exception as e:
             errors.append(f"配圖下載失敗：{e}")
 

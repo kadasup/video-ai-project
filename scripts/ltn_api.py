@@ -21,6 +21,8 @@ from produce import BASE, _ffprobe_exe
 INPUT = BASE / "input"
 PROBE_CACHE = BASE / "logs" / "probe_cache.json"
 _probe_lock = threading.Lock()
+PHOTO_COUNT_CACHE = BASE / "logs" / "photo_count_cache.json"
+_photo_count_lock = threading.Lock()
 
 BACKLOG_API = "https://dev55.ltn.com.tw/staff/pelin/video/program/api/getvideos/{year}/{start}/{end}"
 ARTICLE_API = "https://dev55.ltn.com.tw/staff/Chris/sportstestapi/getESNewsDetail/all/breakingnews/{article_no}"
@@ -56,13 +58,18 @@ def _clean_content(raw: str) -> str:
 
 
 def fetch_article(article_no: str) -> dict:
-    """回傳 {content, keywords, source_url, photo_url}"""
+    """回傳 {content, keywords, source_url, photo_url, photo_caption}"""
     data = _get_json(ARTICLE_API.format(article_no=article_no))
     raw = data.get("LTNA_Content", "")
     keywords = [t.get("Name", "") for t in data.get("NewsArticleTag", []) if t.get("Name")]
-    photo_url = (data.get("A_Photo") or {}).get("PathL", "")
+    a_photo = data.get("A_Photo") or {}
+    photo_url = a_photo.get("PathL", "")
+    # A_Photo.Content 是記者手寫的主圖圖說（如「鄭姓竊賊…被警方逮捕送辦。（記者○○翻攝）」）。
+    # 早期 API 沒給，只能靠 GPT 看圖猜；現在有了就優先用——準確、免費、還帶事件脈絡。
+    photo_caption = (a_photo.get("Content") or "").strip()
     return {"content": _clean_content(raw), "keywords": keywords,
-            "source_url": data.get("LTRT_Url", ""), "photo_url": photo_url}
+            "source_url": data.get("LTRT_Url", ""), "photo_url": photo_url,
+            "photo_caption": photo_caption}
 
 
 def _video_date_folder(name: str) -> str:
@@ -88,6 +95,78 @@ def discover_photos(photo_url: str, max_photos: int = 8) -> list[str]:
         except Exception:
             break
     return urls or ([photo_url] if photo_url else [])
+
+
+def _load_photo_count_cache() -> dict:
+    if PHOTO_COUNT_CACHE.exists():
+        try:
+            return json.loads(PHOTO_COUNT_CACHE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def get_photo_count(article_no: str) -> int | None:
+    """
+    文章配圖張數，探測一次後永久快取（依 articleNo）。已發布文章的配圖不會再變，
+    不用像影片長度那樣可能因素材更新而重探——原本每次評估都重打文章 API＋逐號
+    HEAD 探測，是後臺清單評估緩慢的主因之一。探測失敗回 None、不快取，下次重試。
+    """
+    with _photo_count_lock:
+        cache = _load_photo_count_cache()
+    if article_no in cache:
+        return cache[article_no]
+    try:
+        art = fetch_article(article_no)
+        n = len(discover_photos(art["photo_url"])) if art.get("photo_url") else 0
+    except Exception:
+        return None
+    with _photo_count_lock:
+        cache = _load_photo_count_cache()
+        cache[article_no] = n
+        PHOTO_COUNT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        PHOTO_COUNT_CACHE.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    return n
+
+
+PHOTO_CAPTION_CACHE = BASE / "input" / "photos" / "_captions.json"
+_photo_caption_lock = threading.Lock()
+
+
+def save_photo_caption(article_no: str, caption: str):
+    """把記者手寫的主圖圖說（A_Photo.Content）存進 sidecar，配對時直接讀、免再打 API。"""
+    caption = (caption or "").strip()
+    if not caption:
+        return
+    with _photo_caption_lock:
+        cache = {}
+        if PHOTO_CAPTION_CACHE.exists():
+            try:
+                cache = json.loads(PHOTO_CAPTION_CACHE.read_text(encoding="utf-8"))
+            except Exception:
+                cache = {}
+        cache[str(article_no)] = caption
+        PHOTO_CAPTION_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        PHOTO_CAPTION_CACHE.write_text(json.dumps(cache, ensure_ascii=False),
+                                      encoding="utf-8")
+
+
+def get_photo_caption(photo_path: str) -> str:
+    """
+    依本機照片路徑回傳記者圖說。只有主圖（檔名 photo-{articleNo}，無 -N 後綴）有圖說；
+    探測抓來的其餘配圖（photo-{articleNo}-2…）API 沒給圖說，回空字串讓上層 fallback GPT。
+    """
+    m = re.match(r"^photo-(\d+)$", Path(photo_path).stem)
+    if not m:
+        return ""
+    with _photo_caption_lock:
+        if not PHOTO_CAPTION_CACHE.exists():
+            return ""
+        try:
+            cache = json.loads(PHOTO_CAPTION_CACHE.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+    return cache.get(m.group(1), "")
 
 
 def download_photo(url: str, article_no: str, idx: int = 1) -> str:
