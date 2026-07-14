@@ -529,7 +529,70 @@ def _stop_reasons(factcheck, translit, plan, catalogs) -> list[str]:
         pass   # 涵蓋度計算失敗不該擋停站判斷（黑幕段另有獨立判準）
     if any((not s.get('path')) and (not s.get('photo')) for s in (plan or [])):
         reasons.append('有配不到畫面的黑幕段')
+    if any(c.get('fallback') for c in (catalogs or [])):
+        reasons.append('有素材自動辨識失敗（內容安全過濾器誤擋等），以通用描述納入，請確認畫面')
     return reasons
+
+
+def _fallback_catalog(video: Path) -> dict:
+    """
+    catalog_video 失敗時的備援目錄（常見主因：Azure 內容安全過濾器把災害/事故畫面
+    誤判成違規而 400）。不要靜默丟掉整支素材——把它切成數段通用「現場實況畫面」，
+    讓配對仍可使用（比只剩一顆講話頭好太多），並在成片流程標記 fallback 供停站提醒。
+    """
+    try:
+        dur = float(_probe_duration(video))
+    except Exception:
+        dur = 0.0
+    if dur <= 0:
+        dur = 8.0
+    segs, t = [], 0.0
+    while t < dur - 0.5 and len(segs) < 10:
+        end = round(min(dur, t + 5.0), 2)
+        segs.append({"start": round(t, 2), "end": end, "subject_pos": "滿版",
+                     "description": "現場實況畫面（自動辨識被內容安全系統擋下、未詳細描述，請於分鏡站確認）"})
+        t = end
+    return {"path": str(video), "duration": round(dur, 2),
+            "segments": segs, "tokens": {}, "fallback": True}
+
+
+def _fallback_sot(transcripts: list, catalogs: list, narration: str):
+    """
+    GPT 沒排 SOT、但素材有夠份量的受訪逐字稿時，自動補一段（保險，只在完全沒 SOT 時用）。
+    從連續逐字稿段落挑一段 6~14 秒、字數最多（最有內容）的當 SOT，讓「一顆講話頭」的
+    新聞也一定用到當事人原音、而不是讓他無聲動嘴。抓不到合適段落回 None。
+    after_sentence 先粗抓（插在旁白引導說話那句後），最終由後續去重步驟對齊。
+    """
+    def _zh_len(s):
+        return len(re.sub(r"[^一-鿿0-9A-Za-z]", "", s or ""))
+    best = None
+    for vi, tr in enumerate(transcripts):
+        segs = tr.get('segments') or []
+        for i in range(len(segs)):
+            j = i
+            while j < len(segs) and (segs[j]['end'] - segs[i]['start']) <= 14.0:
+                dur = segs[j]['end'] - segs[i]['start']
+                if dur >= 6.0:
+                    text = "".join(s['text'] for s in segs[i:j + 1])
+                    if _zh_len(text) >= 12 and (best is None or len(text) > best['sc']):
+                        best = {'vi': vi, 'st': segs[i]['start'],
+                                'en': segs[j]['end'], 'text': text, 'sc': len(text)}
+                j += 1
+    if not best:
+        return None
+    sents = [s for s in re.split(r'(?<=[。！？])', narration or '') if s.strip()]
+    intro_kw = ('表示', '說明', '指出', '呼籲', '提醒', '坦言', '強調', '回應',
+                '受訪', '到場', '說')
+    after = next((idx for idx, s in enumerate(sents, 1)
+                  if any(k in s for k in intro_kw)), 0)
+    if not after:
+        after = max(1, round(len(sents) * 0.4))
+    vi = best['vi']
+    return {'path': catalogs[vi]['path'], 'start': round(best['st'], 2),
+            'dur': round(best['en'] - best['st'], 2),
+            'display': best['text'].strip(), 'after_sentence': after,
+            'label': f"V{vi + 1}", 'spk_name': '', 'spk_title': '', 'speaker': '',
+            'auto': True}
 
 
 # ── 智慧分析工作狀態 ───────────────────────────────────────────────────────────
@@ -640,15 +703,28 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                 try:
                     cat = catalog_video(Path(v['path']))
                     _add_tokens(cat.get('tokens', {}))
-                    _job['msg'] = f"{STEPS[1]}（{i+1}/{len(videos)}，原音轉譯中）"
-                    try:
-                        tr = speech.transcribe(Path(v['path']))
-                    except Exception:
-                        tr = {"segments": [], "full_text": ""}
-                    catalogs.append(cat)
-                    transcripts.append(tr)
+                except Exception as e:
+                    # 自動辨識失敗（常見：內容安全過濾器誤擋災害/事故畫面 → 400 content_policy）。
+                    # 不要靜默丟掉整支！用備援目錄讓素材仍可配對，並清楚警示編輯：什麼原因、哪一支。
+                    cat = _fallback_catalog(Path(v['path']))
+                    fname = Path(v['path']).name
+                    if 'content_policy' in str(e) or 'content safety' in str(e):
+                        msg = (f"⚠️ 素材「{fname}」被 Azure 內容安全系統擋下"
+                               "（原因 content_policy_violation：畫面被判為疑似不當內容，"
+                               "災害／事故／血腥感畫面常被誤判），因此無法自動辨識內容。"
+                               "已以通用『現場實況畫面』納入配對，請務必到分鏡站確認這支畫面。")
+                    else:
+                        msg = (f"⚠️ 素材「{fname}」自動辨識失敗（原因：{str(e)[:80]}），"
+                               "已以通用『現場實況畫面』納入配對，請到分鏡站確認這支畫面。")
+                    _job['warning'] = ((_job.get('warning') + '\n' + msg)
+                                       if _job.get('warning') else msg)
+                _job['msg'] = f"{STEPS[1]}（{i+1}/{len(videos)}，原音轉譯中）"
+                try:
+                    tr = speech.transcribe(Path(v['path']))
                 except Exception:
-                    pass  # 單支分析失敗不擋整體流程
+                    tr = {"segments": [], "full_text": ""}
+                catalogs.append(cat)
+                transcripts.append(tr)
 
         # 用實際轉譯結果標註每個畫面段落「有沒有原音人聲」（給配對與涵蓋度判斷用，
         # 比靠描述文字猜「受訪」可靠）
@@ -722,6 +798,13 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             except Exception:
                 continue
         sots.sort(key=lambda s: s['after_sentence'])
+        # SOT 自動補排：GPT 沒排（隨機漏排）但素材有夠份量的受訪逐字稿 → 程式補一段，
+        # 不讓「一顆講話頭」的新聞白白浪費當事人原音。插入點/縮稿由下游自動處理。
+        if not sots:
+            fb = _fallback_sot(transcripts, catalogs, script['narration'])
+            if fb:
+                sots.append(fb)
+                _job['msg'] = f"{STEPS[2]}（GPT 未排原音，自動補排 SOT {fb['dur']:.0f} 秒）"
         _job['sot'] = ([{'label': s['label'], 'dur': s['dur'], 'display': s['display'],
                          'speaker': s.get('speaker', '')}
                         for s in sots] or None)
@@ -1349,6 +1432,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             "low_quality":        bool(low_quality),
             "step_durations":     step_durations,
             "cancelled":          bool(_job.get('cancelled')),
+            "warning":            _job.get('warning') or "",
             "error":              err_msg,
             # 產製歷史回溯用：旁白全文、標題/hook/hashtag、配對明細、原始新聞稿
             "article":            article,
@@ -2240,7 +2324,7 @@ textarea{resize:vertical;min-height:210px}
         <span style="white-space:nowrap">🚦 停站確認：</span>
         <select id="checkpoint_mode" onchange="onCkModeChange()"
                 style="flex:1;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:.9rem">
-          <option value="smart">智慧停站（推薦）——只在有問題時才停我</option>
+          <option value="smart">智慧停站（推薦）——只在有問題時才停</option>
           <option value="always">每支都停——腳本站＋分鏡站逐支把關</option>
           <option value="off">全自動——一路跑完不停（批次/過夜用）</option>
         </select>

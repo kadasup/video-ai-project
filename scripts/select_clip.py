@@ -916,6 +916,8 @@ def match_narration_to_clips(
         "要連續，不要讓同一人「上一秒戴眼鏡下一秒沒戴」相鄰跳接；也避免相鄰兩段"
         "鏡位相同、構圖幾乎一樣的跳接（jump cut）——中間換別的畫面或換鏡位\n"
         "7. 完全找不到相關畫面的旁白段落：有照片先用照片，真的都沒有才用 \"black\" 補黑幕\n"
+        "7-1. ⚠️ 同一張照片（同一個 P 編號）整支成片只能用一次，不要重複出現——"
+        "有多張照片就分散用不同張；照片不夠時寧可用影片主體畫面或黑幕，也不要同圖用兩次\n"
         "8. 節奏：單一片段 4~8 秒為佳（少於 3 秒太碎；超過 9 秒觀眾會膩——短影音"
         "每 5~7 秒要換一個視覺）；引述性旁白配受訪畫面可放寬到 12 秒；照片單段 3~6 秒\n"
         "9. 盡量避免從影片最開頭 0 秒取（常有黑幀/晃動），可從段落起點往後 1~2 秒取\n"
@@ -948,6 +950,7 @@ def match_narration_to_clips(
     # ── 驗證與修正：檔案對應、範圍夾擠、總長補正 ────────────────────────────────
     plan: list[dict] = []
     acc = 0.0
+    used_photos: set[str] = set()   # 同一張照片整支只用一次（GPT 沒守就在這裡強制）
     for entry in result.get("timeline", []):
         if acc >= total_sec - 0.05:
             break
@@ -962,6 +965,12 @@ def match_narration_to_clips(
             try:
                 pi = int(vid_id[1:]) - 1
                 photo_path = photos[pi]["path"]
+                # 同圖不重複：已用過就換一張還沒用過的（新聞配圖多半都與事件相關，換了仍切題）
+                if photo_path in used_photos:
+                    alt = next((p for p in photos if p["path"] not in used_photos), None)
+                    if alt is not None:
+                        photo_path = alt["path"]
+                used_photos.add(photo_path)
                 plan.append({"path": None, "photo": photo_path, "start": 0.0,
                              "dur": round(dur, 2), "why": entry.get("why", "")})
                 acc += dur

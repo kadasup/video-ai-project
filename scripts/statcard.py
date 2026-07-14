@@ -20,7 +20,9 @@ DUR = 2.8          # stat 卡秒數（向下相容；各類型秒數見 DUR_BY_T
 W, H = 1080, 1920
 
 # 資訊卡家族：stat 數據卡 / timeline 時序卡 / alert 警示卡 / chart 圖表卡
-DUR_BY_TYPE = {"stat": 2.8, "timeline": 3.6, "alert": 2.5, "chart": 3.4}
+# timeline 時序卡加長到 5.6 秒（原 3.6）：3~4 步剛揭示完就切走、來不及讀完整條時序，
+# 多留約 2 秒定格 hold（揭示速度不變，見 render_card 的 reveal_sec）讓觀眾看清全部步驟
+DUR_BY_TYPE = {"stat": 2.8, "timeline": 5.6, "alert": 2.5, "chart": 3.4}
 TYPE_NAMES = {"stat": "數據卡", "timeline": "時序卡", "alert": "警示卡", "chart": "圖表卡"}
 
 
@@ -302,10 +304,12 @@ def render_card(card: dict, out_path: Path) -> bool:
     """
     ctype = (card or {}).get("type", "stat")
     dur = card_duration(card)
+    reveal_sec = None   # None＝揭示佔全長 82%（stat/alert/chart 沿用舊行為）
     if ctype == "timeline":
         steps = [str(s) for s in (card.get("steps") or []) if str(s).strip()][:4]
         if len(steps) < 2:
             return False
+        reveal_sec = 3.0   # 時序卡揭示維持約 3 秒，5.6-3.0≈2.6 秒都拿來定格 hold
         html = _HTML_TIMELINE.replace("%DATA%", json.dumps(
             {"title": str(card.get("title", "")), "steps": steps}, ensure_ascii=False))
     elif ctype == "alert":
@@ -333,10 +337,11 @@ def render_card(card: dict, out_path: Path) -> bool:
             "mode": ("yi" if "億" in val else ("wan" if "萬" in val else "plain")),
             "isInt": "." not in val,
         }, ensure_ascii=False))
-    return _render_html_card(html, out_path, dur)
+    return _render_html_card(html, out_path, dur, reveal_sec)
 
 
-def _render_html_card(html: str, out_path: Path, dur: float) -> bool:
+def _render_html_card(html: str, out_path: Path, dur: float,
+                      reveal_sec: float | None = None) -> bool:
     frames_dir = TMP / "_statcard_frames"
     try:
         from playwright.sync_api import sync_playwright
@@ -352,8 +357,11 @@ def _render_html_card(html: str, out_path: Path, dur: float) -> bool:
                                     device_scale_factor=2)   # 截出 1080x1920
             page.goto(page_file.as_uri())
             page.wait_for_timeout(150)   # 等字型載入
+            # 揭示影格數：reveal_sec 有給就用它（時序卡固定揭示秒數、其餘定格 hold），
+            # 沒給就沿用「全長 82% 揭示、尾端 18% 定格」的舊行為
+            reveal_frames = int((reveal_sec * FPS) if reveal_sec else (n * 0.82)) or 1
             for i in range(n):
-                p = min(1.0, i / (n * 0.82))   # 尾端 ~0.5 秒定格，數字停穩讓人看清
+                p = min(1.0, i / reveal_frames)   # 揭示完後定格，停穩讓人看清
                 page.evaluate(f"setProgress({p:.4f})")
                 page.screenshot(path=str(frames_dir / f"f{i:04d}.png"))
             browser.close()
