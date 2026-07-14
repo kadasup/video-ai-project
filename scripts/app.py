@@ -100,6 +100,7 @@ from produce import (
 from select_clip import (
     select_clip, catalog_video, match_narration_to_clips,
     video_fingerprint, near_duplicate, seg_line, describe_photo,
+    _cache_get as _photodesc_cache_get,
 )
 import ltn_api
 import speech
@@ -369,10 +370,51 @@ def _merge_tiny_plan_entries(plan: list) -> list:
     return out
 
 
+FACE_MODEL = BASE / "assets" / "face_detection_yunet.onnx"
+
+
+def _sot_face_factor(video_path, start, dur):
+    """
+    SOT 臉部置中：抓受訪片段中點一格，用 YuNet 偵測最大的臉，算出讓臉落在
+    9:16 直式裁切正中的水平偏移 factor（0~1）。缺模型/抓不到臉→回 None，
+    呼叫端退回正中 0.5（比粗略的左/右裁切保險）。
+    """
+    if not FACE_MODEL.exists():
+        return None
+    try:
+        import cv2
+        from produce import ff
+        frame = TMP / f"_sot_face_{uuid.uuid4().hex[:8]}.jpg"
+        t = float(start or 0) + float(dur or 0) / 2
+        ff("-ss", f"{t}", "-i", str(video_path), "-frames:v", "1", "-q:v", "3", frame)
+        img = cv2.imread(str(frame))
+        try:
+            frame.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        det = cv2.FaceDetectorYN.create(str(FACE_MODEL), "", (w, h), score_threshold=0.6)
+        det.setInputSize((w, h))
+        _n, faces = det.detect(img)
+        if faces is None or len(faces) == 0:
+            return None
+        f = max(faces, key=lambda b: float(b[2]) * float(b[3]))   # 面積最大的臉
+        face_cx = float(f[0]) + float(f[2]) / 2.0                 # 臉中心 x（像素）
+        cw = h * 9.0 / 16.0                                       # 直式裁切窗寬（保留全高）
+        if w <= cw:
+            return 0.5                                            # 來源已接近直式
+        return min(1.0, max(0.0, (face_cx - cw / 2.0) / (w - cw)))
+    except Exception:
+        return None
+
+
 def _enrich_subject_pos(plan: list, catalogs: list) -> None:
     """
     給每個影片片段查它取用的區間主體在畫面哪一側（左/中/右），
     寫進 entry['subject_pos'] 供直式裁切偏移。就地修改 plan。
+    SOT 段（🎤）另外走臉部偵測，把受訪者的臉抓到畫面正中（entry['crop_factor']）。
     """
     seg_map = {}   # path -> [(start, end, subject_pos)]
     for cat in catalogs:
@@ -380,6 +422,11 @@ def _enrich_subject_pos(plan: list, catalogs: list) -> None:
             (s['start'], s['end'], s.get('subject_pos', '滿版')) for s in cat['segments']]
     for e in plan:
         if not e.get('path'):
+            continue
+        if str(e.get('why', '')).startswith('🎤'):
+            # SOT 受訪段：臉部置中優先，抓不到臉就正中（0.5）
+            f = _sot_face_factor(e['path'], e.get('start', 0), e.get('dur', 0))
+            e['crop_factor'] = f if f is not None else 0.5
             continue
         segs = seg_map.get(str(e['path']))
         if not segs:
@@ -458,6 +505,33 @@ def _coverage_warning(plan: list, catalogs: list) -> str | None:
     return ("⚠️ 素材涵蓋度提醒：" + "；".join(parts)) if parts else None
 
 
+def _stop_reasons(factcheck, translit, plan, catalogs) -> list[str]:
+    """
+    智慧停站判斷：分鏡站只在「有理由讓人看」時才停下來，其餘自動渲染進成片庫。
+    回傳「該停的理由」清單（空＝沒事、可自動過）。判準都用結構化訊號，不靠警示字串：
+      ①事實查核有硬矛盾（非省略）②譯名與音譯表不符 ③素材涵蓋度偏低 ④成片含黑幕段。
+    保守原則：任一有問題就停，寧可多停也不讓有瑕疵的成片無聲無息跑完。
+    """
+    reasons = []
+    fc = factcheck or []
+    bad = [f for f in fc
+           if not ((f.get('type') == '省略')
+                   or (f.get('type') is None and f.get('severity') == 'low'))]
+    if bad:
+        reasons.append(f'事實查核 {len(bad)} 處與原稿牴觸')
+    mism = [t for t in (translit or []) if t.get('status') == 'mismatch']
+    if mism:
+        reasons.append(f'譯名 {len(mism)} 處與音譯表不符')
+    try:
+        if _coverage_warning(plan or [], catalogs or []):
+            reasons.append('素材涵蓋度偏低（黑幕/受訪佔比過高）')
+    except Exception:
+        pass   # 涵蓋度計算失敗不該擋停站判斷（黑幕段另有獨立判準）
+    if any((not s.get('path')) and (not s.get('photo')) for s in (plan or [])):
+        reasons.append('有配不到畫面的黑幕段')
+    return reasons
+
+
 # ── 智慧分析工作狀態 ───────────────────────────────────────────────────────────
 _alock = threading.Lock()
 _abusy = False
@@ -476,12 +550,14 @@ STEPS = ['', '分析影片內容', '生成播報腳本', '生成旁白音訊', '
 
 
 def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str = "hsiaochen",
-            checkpoint: bool = True, photos: list[str] | None = None,
+            checkpoint_mode: str = "smart", photos: list[str] | None = None,
             low_quality: bool = True):
     """videos: [{"path": "...", "start": 12.0}, ...]，依序銜接補滿 MAIN_SEC 秒
     photos: 新聞配圖本機路徑（匯入時下載的文章主圖），配不到動態畫面的旁白段
             會用「照片＋Ken Burns 推移」取代黑幕/空洞畫面。
-    checkpoint=True 時，配對完成後會暫停等使用者確認分鏡，才進最後渲染。
+    checkpoint_mode：
+      'smart'（預設）＝跳過腳本站；分鏡站只在有理由時才停（見 _stop_reasons），否則自動渲染
+      'always'＝每支都停腳本站＋分鏡站（逐支把關）；'off'＝全自動一路跑完不停站。
     low_quality=True（POC 低畫質模式，預設）：正式渲染也走 480p/ultrafast＋480p 片尾，
     完整流程照舊（進成片庫、metadata、回饋閉環），只是畫質低、渲染快；上線時關掉恢復 1080p。"""
     global _busy, _job
@@ -743,7 +819,8 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
 
         # ── Checkpoint A：旁白稿確認（TTS/配對前先讓人看稿＋查核結果，改稿成本最低）──
         # 借鏡中央社流程：切角/旁白稿在早期就人工把關，稿不對後面全白跑
-        if checkpoint:
+        # 只有 'always'（每支都停）才停腳本站；'smart' 一律跳過（查核結果會在分鏡站呈現）
+        if checkpoint_mode == 'always':
             global _script_preview
             _script_preview = {
                 'title': script.get('title', ''), 'hook': script.get('hook', ''),
@@ -1067,11 +1144,21 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
 
         # ── Checkpoint：分鏡確認（渲染前先讓人看旁白/Hook/配對縮圖/字幕，確認才渲染）──
         # 對治「跑完整支才發現畫面對不上／字幕怪／Hook 怪，又得整支重跑」的痛點。
-        if checkpoint:
+        # 智慧停站（'smart'）：只在有理由時才停（見 _stop_reasons）；乾淨的自動渲染進成片庫。
+        # 'always' 每支都停；'off' 一律不停。
+        if checkpoint_mode == 'smart':
+            _cp_reasons = _stop_reasons(_job.get('factcheck'), _job.get('translit'),
+                                        plan, catalogs)
+            _do_stop = bool(_cp_reasons)
+        else:
+            _cp_reasons = []
+            _do_stop = (checkpoint_mode == 'always')
+        if _do_stop:
             global _preview
             _preview = _build_preview(script, subtitles, plan or [],
                                       _job.get('factcheck'), _job.get('translit'),
                                       catalogs)
+            _preview['stop_reasons'] = _cp_reasons   # 分鏡站最上面直接說明為什麼停
             # 給快速預覽用的渲染上下文（分鏡確認暫停期間有效）
             global _pending_ctx
             _pending_ctx = {'plan': plan or [], 'tts': str(tts_path),
@@ -2148,11 +2235,18 @@ textarea{resize:vertical;min-height:210px}
     <input type="file" id="photo-file" accept="image/*" multiple style="display:none" onchange="uploadPhotos(this.files)">
     <p class="hint" id="photo-mode-hint" style="display:none;color:#2563eb">📸 圖輯式模式：目前沒有影片，會用這些照片輪播（Ken Burns 緩慢推移）配旁白</p>
 
-    <label style="display:flex;align-items:center;gap:8px;margin-top:14px;cursor:pointer;font-weight:400">
-      <input type="checkbox" id="checkpoint" checked style="width:16px;height:16px">
-      <span>產製途中停站讓我確認（<b>旁白稿站</b>：看稿改稿、查核譯名警示 →
-      <b>分鏡站</b>：換畫面、快速預覽）——取消勾選＝全自動一路跑完不停站（批次/過夜用）</span>
-    </label>
+    <div style="margin-top:14px;font-weight:400">
+      <label style="display:flex;align-items:center;gap:8px">
+        <span style="white-space:nowrap">🚦 停站確認：</span>
+        <select id="checkpoint_mode" onchange="onCkModeChange()"
+                style="flex:1;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:.9rem">
+          <option value="smart">智慧停站（推薦）——只在有問題時才停我</option>
+          <option value="always">每支都停——腳本站＋分鏡站逐支把關</option>
+          <option value="off">全自動——一路跑完不停（批次/過夜用）</option>
+        </select>
+      </label>
+      <p class="hint" id="ckmode-hint" style="margin:6px 0 0;color:#6b7280"></p>
+    </div>
     <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-weight:400;color:#6b7280">
       <input type="checkbox" id="lowq" checked disabled style="width:16px;height:16px">
       <span>🔒 <b>POC 低畫質模式</b>（測試期鎖定啟用，不可關）——成片庫存 480p、渲染快；正式上線再由開發端解鎖切回 1080p</span>
@@ -2269,7 +2363,7 @@ async function startJob() {
         article: art,
         videos:  videos,
         photos:  importedPhotos,
-        checkpoint: document.getElementById('checkpoint').checked,
+        checkpoint_mode: document.getElementById('checkpoint_mode').value,
         low_quality: document.getElementById('lowq').checked,
       })
     });
@@ -2543,59 +2637,48 @@ function renderCheckpoint(pv) {
   const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
   const tags = (pv.hashtags && pv.hashtags.length) ? pv.hashtags.join(' ') : '（無）';
   let html = '';
-  // 事實查核警示：擺最上面最醒目，紅底，逐項列出旁白 vs 原稿的出入
-  if (pv.factcheck && pv.factcheck.length) {
-    const isOmit = f => (f.type === '省略') || (f.type == null && f.severity === 'low');
-    const bad = pv.factcheck.filter(f => !isOmit(f));
-    const omit = pv.factcheck.filter(isOmit);
-    if (bad.length) {
-      const rows = bad.map(f =>
-        `<div style="margin:4px 0;padding:6px 8px;background:#fff;border-radius:5px">
-          <span style="color:#b91c1c;font-weight:700">●${esc(f.type||'矛盾')}</span> <b>${esc(f.field)}</b>：旁白說「${esc(f.narration_says)}」，但原稿是「${esc(f.article_says)}」</div>`).join('');
-      html += `<div style="margin-bottom:12px;padding:10px 12px;background:#fef2f2;border:2px solid #fca5a5;border-radius:8px">
-        <div style="color:#991b1b;font-weight:700;margin-bottom:6px">🚨 事實查核：${bad.length} 處與原稿牴觸，請務必核對後再渲染</div>
-        ${rows}</div>`;
-    }
-    if (omit.length) {
-      const rows = omit.map(f =>
-        `<div style="margin:3px 0;color:#6b7280">・<b>${esc(f.field)}</b>：旁白省略了「${esc(f.article_says)}」（不衝突，可接受）</div>`).join('');
-      html += `<div style="margin-bottom:12px;padding:8px 12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;font-size:.78rem">
-        <div style="color:#6b7280;font-weight:700;margin-bottom:4px">ℹ️ 省略提醒（${omit.length} 處，非錯誤）</div>
-        ${rows}</div>`;
-    }
+  // ① 為什麼停在這裡（智慧停站理由）——擺最上面，一眼看到重點
+  if (pv.stop_reasons && pv.stop_reasons.length) {
+    html += `<div style="margin-bottom:12px;padding:8px 12px;background:#fffbeb;border:2px solid #fcd34d;border-radius:8px;font-size:.82rem">
+      <b style="color:#92400e">🚦 這支停下來讓你看，是因為：</b> ${pv.stop_reasons.map(esc).join('、')}</div>`;
   }
-  // 譯名核實：跟報社音譯總表比對的結果（不符標紅、相符打勾、未收錄給提示）
-  if (pv.translit && pv.translit.length) {
-    const mis = pv.translit.filter(t => t.status === 'mismatch');
-    const std = pv.translit.filter(t => t.status === 'standard');
-    const unk = pv.translit.filter(t => t.status === 'unknown');
-    let trHtml = '';
-    if (mis.length) {
-      trHtml += mis.map(t =>
-        `<div style="margin:3px 0;padding:5px 8px;background:#fff;border-radius:5px">
-          <span style="color:#b91c1c;font-weight:700">✗</span> 旁白用「<b>${esc(t.chinese)}</b>」，
-          報社標準譯名是「<b style="color:#166534">${esc(t.expected)}</b>」（${esc(t.english)}）</div>`).join('');
-    }
-    const okLine = std.length ? `<span style="color:#166534">✓ 符合標準：${std.map(t=>esc(t.chinese)).join('、')}</span>` : '';
-    const unkLine = unk.length ? `<span style="color:#92400e">ℹ 音譯表未收錄：${unk.map(t=>esc(t.chinese)).join('、')}（照原稿用字即可）</span>` : '';
-    const subLines = [okLine, unkLine].filter(Boolean).join('　');
-    html += `<div style="margin-bottom:12px;padding:10px 12px;background:${mis.length?'#fef2f2':'#f0fdf4'};border:2px solid ${mis.length?'#fca5a5':'#bbf7d0'};border-radius:8px">
-      <div style="font-weight:700;margin-bottom:4px;color:${mis.length?'#991b1b':'#166534'}">🈯 譯名核實（報社音譯總表）</div>
-      ${trHtml}${subLines?`<div style="font-size:.78rem;margin-top:4px">${subLines}</div>`:''}</div>`;
+  // ② 查核 & 譯名：有問題才紅框攤開；都沒問題只給一行綠字（不再洗版）
+  const isOmit = f => (f.type === '省略') || (f.type == null && f.severity === 'low');
+  const bad = (pv.factcheck || []).filter(f => !isOmit(f));
+  const omit = (pv.factcheck || []).filter(isOmit);
+  const mis = (pv.translit || []).filter(t => t.status === 'mismatch');
+  const std = (pv.translit || []).filter(t => t.status === 'standard');
+  const unk = (pv.translit || []).filter(t => t.status === 'unknown');
+  if (bad.length) {
+    const rows = bad.map(f =>
+      `<div style="margin:4px 0;padding:6px 8px;background:#fff;border-radius:5px">
+        <span style="color:#b91c1c;font-weight:700">●${esc(f.type||'矛盾')}</span> <b>${esc(f.field)}</b>：旁白說「${esc(f.narration_says)}」，但原稿是「${esc(f.article_says)}」</div>`).join('');
+    html += `<div style="margin-bottom:10px;padding:10px 12px;background:#fef2f2;border:2px solid #fca5a5;border-radius:8px">
+      <div style="color:#991b1b;font-weight:700;margin-bottom:6px">🚨 事實查核：${bad.length} 處與原稿牴觸，請務必核對後再渲染</div>
+      ${rows}</div>`;
   }
-  html += `<div style="display:flex;gap:12px;margin-bottom:8px">
+  if (mis.length) {
+    const rows = mis.map(t =>
+      `<div style="margin:3px 0;padding:5px 8px;background:#fff;border-radius:5px">
+        <span style="color:#b91c1c;font-weight:700">✗</span> 旁白用「<b>${esc(t.chinese)}</b>」，報社標準譯名是「<b style="color:#166534">${esc(t.expected)}</b>」（${esc(t.english)}）</div>`).join('');
+    html += `<div style="margin-bottom:10px;padding:10px 12px;background:#fef2f2;border:2px solid #fca5a5;border-radius:8px">
+      <div style="color:#991b1b;font-weight:700;margin-bottom:4px">🈯 譯名核實：${mis.length} 處與音譯表不符</div>${rows}</div>`;
+  }
+  if (!bad.length && !mis.length) {
+    html += `<div style="margin-bottom:10px;padding:7px 12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;color:#166534;font-size:.82rem">✓ 事實查核與譯名皆無誤</div>`;
+  }
+  // ③ 標題 / Hook（可直接改）
+  html += `<div style="display:flex;gap:12px;margin-bottom:6px">
     <div style="flex:1;min-width:0">
-      <b style="display:block;font-size:.78rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:4px">🏷 開場標題字卡 <span style="color:#94a3b8;font-weight:400">（可直接改）</span></b>
+      <b style="display:block;font-size:.78rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:4px">🏷 開場標題字卡 <span style="color:#94a3b8;font-weight:400">（可改）</span></b>
       <input id="cp-title" value="${esc(pv.title)}" style="width:100%;box-sizing:border-box;padding:7px 9px;border:1px solid #cbd5e1;border-radius:6px;font-size:.88rem"></div>
     <div style="flex:1;min-width:0">
-      <b style="display:block;font-size:.78rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:4px">⚡ Hook 字卡 <span style="color:#94a3b8;font-weight:400">（可直接改）</span></b>
+      <b style="display:block;font-size:.78rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:4px">⚡ Hook 字卡 <span style="color:#94a3b8;font-weight:400">（可改）</span></b>
       <input id="cp-hook" value="${esc(pv.hook)}" style="width:100%;box-sizing:border-box;padding:7px 9px;border:1px solid #cbd5e1;border-radius:6px;font-size:.88rem"></div>
-  </div>
-  <div style="font-size:.74rem;color:#92400e;margin-bottom:8px">改完按「🎬 快速預覽」先看效果，確認渲染時以此為準（也會影響成片檔名與成片庫標題）</div>`;
-  html += `<div style="margin-bottom:8px"><b>Hashtags：</b>${esc(tags)}</div>`;
-  html += `<div style="margin-bottom:8px"><b>旁白全文：</b><div style="white-space:pre-wrap;line-height:1.7;margin-top:4px;background:#fff;padding:8px;border-radius:6px">${esc(pv.narration)}</div></div>`;
+  </div>`;
+  // ④ 分鏡縮圖（本站主體，保留逐段換畫面）
   if (pv.segments && pv.segments.length) {
-    html += `<div style="margin-bottom:6px"><b>配對畫面（每段配到什麼）：</b><span style="font-size:.74rem;color:#92400e">　覺得某段配錯 → 按「🔄 換」直接改選素材庫其他片段</span></div>`;
+    html += `<div style="margin:8px 0 6px"><b>配對畫面（每段配到什麼）：</b><span style="font-size:.74rem;color:#92400e">　配錯 → 按「🔄 換」改選素材</span></div>`;
     let at = 0;
     html += pv.segments.map((s, i) => {
       const from = at.toFixed(0); at += (s.dur || 0); const to = at.toFixed(0);
@@ -2620,9 +2703,25 @@ function renderCheckpoint(pv) {
       </div>`;
     }).join('');
   }
-  if (pv.subtitles && pv.subtitles.length) {
-    html += `<div style="margin-top:8px"><b>字幕分段（${pv.subtitles.length} 句）：</b><div style="color:#555;margin-top:4px;line-height:1.8">${pv.subtitles.map(esc).join(' ／ ')}</div></div>`;
-  }
+  // ⑤ 次要文字資訊收進摺疊（預設收起，要看才展開）——這是「畫面太雜」的主因，全部藏起來
+  const omitHtml = omit.length
+    ? `<div style="margin-top:6px"><b style="color:#6b7280">省略提醒（${omit.length} 處，非錯誤）：</b>${omit.map(f=>`<div style="margin:2px 0;color:#6b7280">・<b>${esc(f.field)}</b>：省略了「${esc(f.article_says)}」</div>`).join('')}</div>`
+    : '';
+  const trOkHtml = (std.length || unk.length)
+    ? `<div style="margin-top:6px">${std.length?`<span style="color:#166534">✓ 譯名符合標準：${std.map(t=>esc(t.chinese)).join('、')}</span>`:''}${unk.length?`　<span style="color:#92400e">ℹ 音譯表未收錄：${unk.map(t=>esc(t.chinese)).join('、')}</span>`:''}</div>`
+    : '';
+  const subsHtml = (pv.subtitles && pv.subtitles.length)
+    ? `<div style="margin-bottom:8px"><b>字幕分段（${pv.subtitles.length} 句）：</b><div style="color:#555;margin-top:4px;line-height:1.8">${pv.subtitles.map(esc).join(' ／ ')}</div></div>`
+    : '';
+  html += `<details style="margin-top:10px;font-size:.82rem">
+    <summary style="cursor:pointer;color:#2563eb;font-weight:600;user-select:none">▸ 看文字細節（旁白全文／字幕／Hashtags${omit.length?'／省略提醒':''}）</summary>
+    <div style="margin-top:8px">
+      <div style="margin-bottom:8px"><b>旁白全文：</b><div style="white-space:pre-wrap;line-height:1.7;margin-top:4px;background:#fff;padding:8px;border-radius:6px">${esc(pv.narration)}</div></div>
+      ${subsHtml}
+      <div><b>Hashtags：</b>${esc(tags)}</div>
+      ${omitHtml}${trOkHtml}
+    </div>
+  </details>`;
   document.getElementById('cp-content').innerHTML = html;
 }
 
@@ -3051,9 +3150,22 @@ function saveLastSettings() {
   // 只存「設定類」偏好；素材（影片清單/照片）刻意不存——
   // 使用者指定：重新整理＝乾淨的開始，舊素材通通清掉（2026-07-10）
   localStorage.setItem('videoai_last_browse_dir', localStorage.getItem('videoai_last_browse_dir') || '');
-  // 鍵名 v2：確認站語意已從「單一分鏡確認」升級為「兩站確認」，舊偏好作廢重新預設勾選
-  localStorage.setItem('videoai_checkpoint2', document.getElementById('checkpoint').checked ? '1' : '0');
+  // 鍵名 v3：確認站升級為三態（smart/always/off），舊布林偏好作廢
+  localStorage.setItem('videoai_ckmode', document.getElementById('checkpoint_mode').value);
   localStorage.setItem('videoai_lowq', document.getElementById('lowq').checked ? '1' : '0');
+}
+
+// 停站模式說明文字（依選擇即時更新）
+const CKMODE_HINT = {
+  smart:  '平常自動出片不打擾；只有事實查核有硬矛盾、譯名不符、素材不足或有黑幕段時才停下讓你看。',
+  always: '每支都會停腳本站（看稿改稿）＋分鏡站（換畫面、快速預覽），逐支把關。',
+  off:    '完全不停，一路跑完直接進成片庫。適合批次/過夜大量產製。',
+};
+function onCkModeChange() {
+  const v = document.getElementById('checkpoint_mode').value;
+  const h = document.getElementById('ckmode-hint');
+  if (h) h.textContent = CKMODE_HINT[v] || '';
+  saveLastSettings();
 }
 
 // POC 低畫質開關：勾選時（正式渲染就是快的低畫質）隱藏「快速預覽」按鈕，
@@ -3070,8 +3182,10 @@ function restoreLastSettings() {
     .forEach(k => localStorage.removeItem(k));
   videoList = [];
   importedPhotos = [];
-  const cpPref = localStorage.getItem('videoai_checkpoint2');
-  if (cpPref !== null) document.getElementById('checkpoint').checked = (cpPref === '1');
+  const ckPref = localStorage.getItem('videoai_ckmode');
+  if (ckPref && ['smart','always','off'].includes(ckPref))
+    document.getElementById('checkpoint_mode').value = ckPref;
+  onCkModeChange();   // 帶出對應說明文字
   // POC 低畫質為鎖定狀態：強制啟用、忽略任何舊偏好；上線解鎖時改這裡
   document.getElementById('lowq').checked = true;
   onLowqChange();   // 隱藏快速預覽按鈕（POC 直接渲染就是低畫質）
@@ -3393,11 +3507,27 @@ function browseMsg(text) {
 let lightboxIdx = 0;
 function showPhotoLarge(i) {
   lightboxIdx = i;
+  const path = importedPhotos[i];
   document.getElementById('photo-lightbox-img').src =
-    '/api/photo?path=' + encodeURIComponent(importedPhotos[i]);
+    '/api/photo?path=' + encodeURIComponent(path);
   document.getElementById('photo-lightbox-count').textContent =
     (importedPhotos.length > 1) ? (i + 1) + ' / ' + importedPhotos.length : '';
   document.getElementById('photo-lightbox').style.display = 'flex';
+  // 圖說：先收起，再抓（記者圖說優先，其次已快取的 AI 辨識；快速切圖時只認最後一張）
+  const capBox = document.getElementById('photo-lightbox-caption');
+  capBox.style.display = 'none';
+  fetch('/api/photo_caption?path=' + encodeURIComponent(path))
+    .then(r => r.json())
+    .then(d => {
+      if (lightboxIdx !== i) return;          // 已切到別張，這次結果作廢
+      if (!d.caption) return;                 // 無圖說就維持收起
+      document.getElementById('photo-lightbox-caption-text').textContent = d.caption;
+      const srcEl = document.getElementById('photo-lightbox-caption-src');
+      srcEl.textContent = d.src || '';
+      srcEl.style.background = (d.src === '記者圖說') ? '#2563eb' : '#6b7280';
+      capBox.style.display = 'block';
+    })
+    .catch(() => {});
 }
 function stepPhoto(dir) {
   if (!importedPhotos.length) return;
@@ -3444,7 +3574,18 @@ function closePreviewVideo(ev) {
   <button onclick="event.stopPropagation();stepPhoto(1)"
      style="position:absolute;right:14px;top:50%;transform:translateY(-50%);font-size:30px;color:#fff;
             background:rgba(0,0,0,.45);border:0;border-radius:50%;width:52px;height:52px;cursor:pointer">›</button>
-  <img id="photo-lightbox-img" style="max-width:88vw;max-height:92vh;border-radius:8px">
+  <div style="display:flex;flex-direction:column;align-items:center;gap:10px;max-width:88vw">
+    <img id="photo-lightbox-img" style="max-width:88vw;max-height:82vh;border-radius:8px">
+    <div id="photo-lightbox-caption" onclick="event.stopPropagation()"
+         style="display:none;max-width:760px;padding:10px 16px;border-radius:8px;
+                background:rgba(255,255,255,.10);color:#f3f4f6;font-size:16px;line-height:1.7;
+                text-align:center;cursor:default">
+      <span id="photo-lightbox-caption-src"
+            style="display:inline-block;margin-right:8px;padding:1px 8px;border-radius:10px;
+                   font-size:12px;vertical-align:middle;background:#2563eb;color:#fff"></span>
+      <span id="photo-lightbox-caption-text"></span>
+    </div>
+  </div>
 </div>
 
 <div id="pv-modal" onclick="closePreviewVideo(event)"
@@ -3516,15 +3657,18 @@ def api_generate():
                 'started_at': time.time(), 'step_started_at': time.time(),
                 'elapsed_sec': 0, 'step_elapsed_sec': 0}
 
-    checkpoint = data.get('checkpoint')
-    checkpoint = True if checkpoint is None else bool(checkpoint)
+    mode = data.get('checkpoint_mode')
+    if mode not in ('smart', 'always', 'off'):
+        # 舊版相容：只帶 checkpoint bool 時，True→'always'（維持舊語意）、False→'off'
+        cp = data.get('checkpoint')
+        mode = 'smart' if cp is None else ('always' if cp else 'off')
     lowq = data.get('low_quality')
     lowq = True if lowq is None else bool(lowq)   # POC 期間預設低畫質
     photos = [p for p in (data.get('photos') or []) if p and Path(p).exists()]
     t = threading.Thread(
         target=run_job,
         args=(article, videos, data.get('fname'), data.get('voice') or 'hsiaochen',
-              checkpoint, photos, lowq),
+              mode, photos, lowq),
         daemon=True,
     )
     t.start()
@@ -3848,6 +3992,25 @@ def api_photo():
     except Exception:
         return 'not found', 404
     return send_file(str(rp))
+
+
+@app.route('/api/photo_caption')
+def api_photo_caption():
+    """
+    照片圖說（燈箱下方顯示用）：記者手寫圖說（主圖，API A_Photo.Content）優先，
+    其次撿已快取的 AI 視覺辨識描述——只讀快取、不觸發新的 GPT 呼叫（開圖不花錢）。
+    """
+    raw = request.args.get('path', '')
+    cap = ltn_api.get_photo_caption(raw)
+    if cap:
+        return jsonify({'caption': cap, 'src': '記者圖說'})
+    try:
+        cached = _photodesc_cache_get('photodesc1', Path(raw))
+        if cached and cached.get('desc'):
+            return jsonify({'caption': cached['desc'], 'src': 'AI 辨識'})
+    except Exception:
+        pass
+    return jsonify({'caption': '', 'src': ''})
 
 
 @app.route('/api/gallery')

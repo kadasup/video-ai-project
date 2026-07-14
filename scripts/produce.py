@@ -194,11 +194,18 @@ def num2zh(text: str) -> str:
     return re.sub(r"\d+(?:\.\d+)?", _num, text)
 
 def _client() -> AzureOpenAI:
-    """延遲建立 AzureOpenAI client，讀 D:\\VideoAI\\.env 的設定"""
+    """延遲建立 AzureOpenAI client，讀 D:\\VideoAI\\.env 的設定。
+
+    timeout=90／max_retries=2：實測正常一次呼叫僅約 12 秒，但偶發會遇到 API 端延遲
+    尖峰（曾出現單次 800 秒才回、拖垮整個產製）。設 90 秒上限＋自動重試 2 次，讓卡住的
+    呼叫快速中止改重試，把最壞情況從十幾分鐘壓到 2~3 分鐘（A/B 實測：調 reasoning_effort
+    無效甚至更糟，timeout 才是對症解）。"""
     return AzureOpenAI(
         api_key=os.environ["AZURE_OPENAI_API_KEY"],
         api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2025-04-01-preview"),
         azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+        timeout=90.0,
+        max_retries=2,
     )
 
 
@@ -386,10 +393,12 @@ def generate_script(article: str, footage_notes: str | None = None,
 
 ⚠️ SOT（受訪原音）安排規則——電視新聞的標準做法是「旁白與受訪原音交替」：
 - 若逐字稿裡有適合直接讓當事人/警方「自己講」的話（完整、切題、5~15 秒），
-  安排 SOT：在輸出 JSON 加 "sots" 欄位（見格式）。**最多 2 段**，寧缺勿濫；
-  逐字稿內容破碎、離題或品質差就不要安排（"sots" 給空陣列）
-- 安排 2 段時：兩段要講**不同重點**（例：一段講經過、一段講後續處理），
-  不要選內容重疊的兩段；兩段合計不超過 22 秒；after_sentence 必須遞增（前後有旁白隔開最好）
+  **一定要安排成 SOT**（在輸出 JSON 加 "sots" 欄位）——受訪/講話畫面的正確用法是
+  讓當事人用「原音」講這一段，而不是把講話畫面當無聲底圖鋪在旁白下面。
+  逐字稿內容破碎、離題或品質差才不安排（"sots" 給空陣列）
+- ⚠️ **受訪畫面只安排 1 段就好**（"sots" 最多 1 段）：同一位受訪者講一次即可，
+  短影音塞多段「談話頭」會很悶。挑最切題、最完整的那一段，其餘捨棄；
+  SOT 長度 5~15 秒，after_sentence 放在旁白講完「誰要說話」的引導句之後
 - "quote" 必須從上面逐字稿**一字不差**複製（含錯字也照抄，程式要靠它對回時間軸）；
   "display" 是給觀眾看的字幕版本：把 quote 的同音錯字對照新聞稿改正、轉繁體、
   但不增刪語句結構
@@ -397,7 +406,7 @@ def generate_script(article: str, footage_notes: str | None = None,
   插入點要順：通常放在旁白講完「誰說了什麼」的引導句之後（例：旁白「警方表示」→ SOT 原音）
 - ⚠️ 旁白不要複述 SOT 裡講的內容（會重複）；旁白負責敘事，細節讓原音自己講
 - ⚠️ 安排 SOT 時，旁白字數上限要扣掉原音時間：SOT 每秒約佔 4.3 字的額度
-  （例：安排 10 秒 SOT，旁白就寫 {int(MAIN_SEC * 4.2)} 減 43 字左右；兩段就扣兩段的秒數）
+  （例：安排 10 秒 SOT，旁白就寫 {int(MAIN_SEC * 4.2)} 減 43 字左右）
 - "speaker_name"/"speaker_title"（受訪者名條）：**只在新聞稿能明確判斷這段原音是誰講的**
   才填（例：稿裡寫「桃機公司代理董事長楊○○表示…」且原音內容與其發言吻合）。
   名字職稱照新聞稿用字。**不確定是誰講的就兩個都給空字串——名條掛錯人是重大事故，寧缺勿濫**
@@ -1599,13 +1608,17 @@ def _plan_length_info(plan: list[dict], target_sec: float = MAIN_SEC) -> dict:
     }
 
 
-def _crop_scale(subject_pos: str = "") -> str:
+def _crop_scale(subject_pos: str = "", crop_factor: float | None = None) -> str:
     """
     16:9→9:16 直式裁切，依主體水平位置決定保留哪一側，避免主體被裁掉。
     x 偏移 = (可裁範圍) × factor：左 0.2、右 0.8、中/滿版 0.5（正中）。
-    對已是 9:16 的來源（照片/黑幕）iw-cw=0，任何 factor 都得 x=0，等同無作用、不會裁壞。
+    crop_factor（0~1）：若有給就用精算值（SOT 臉部置中用臉偵測算出的偏移），
+    覆蓋粗略的 subject_pos。對已是 9:16 的來源（照片/黑幕）iw-cw=0，任何 factor 都得 x=0。
     """
-    factor = {"左": 0.2, "右": 0.8}.get((subject_pos or "").strip(), 0.5)
+    if isinstance(crop_factor, (int, float)):
+        factor = min(1.0, max(0.0, float(crop_factor)))
+    else:
+        factor = {"左": 0.2, "右": 0.8}.get((subject_pos or "").strip(), 0.5)
     return f"crop=ih*9/16:ih:(iw-ih*9/16)*{factor}:0,scale={W}:{H}"
 
 
@@ -1630,7 +1643,7 @@ def _assemble_main(plan: list[dict], audio_out: Path, sub_f: str, out: Path,
             args += ["-ss", f"{e['start']}", "-i", str(e["path"])]
             filter_parts.append(
                 f"[{idx}:v]trim=duration={e['dur']:.2f},setpts=PTS-STARTPTS,"
-                f"{_crop_scale(e.get('subject_pos'))},setsar=1[seg{idx}]"
+                f"{_crop_scale(e.get('subject_pos'), e.get('crop_factor'))},setsar=1[seg{idx}]"
             )
         else:
             args += ["-f", "lavfi", "-i",
