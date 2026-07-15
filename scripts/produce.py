@@ -467,6 +467,9 @@ hook／hashtag 規則：
   ③破題句需要重組出「時間＋地點＋事件」
   ④相鄰兩段被刪掉中間內容後需要最小限度的銜接詞
 - 第一句先破題：時間＋地點＋發生什麼事，一句話講完
+- ⚠️ 地點要完整：事發地點第一次出現時保留原稿的完整行政區（縣市＋區/鄉鎮＋路段），
+  不要簡化掉縣市（例：原稿「桃園市龜山區湖山街180巷77弄口」就照寫完整，不要縮成
+  「龜山區湖山街…」）。地方新聞觀眾常不知道「龜山區」在哪個縣市，掉了縣市會看不懂
 - 結構：破題 → 經過細節 → 傷亡損失 → 警方處置 → 收尾（後續發展）
 - ⚠️ 句號要省著用：實測 TTS 在句號／驚嘆號／問號後會停頓約 0.85 秒，逗號只停頓約 0.3 秒，
   句號斷太密旁白會一直卡頓、很不自然。每個句號之間要有 25~40 字，
@@ -480,6 +483,10 @@ hook／hashtag 規則：
   硬濃縮成一個花俏動詞（例：把「駕車衝撞、逆向、闖越三個路口」濃縮成「一路狂飆碾壓」），
   這樣會失去新聞語境、變成 AI 腔。寧可用平實準確的動詞，把事件一件一件交代清楚，
   也不要用一個帥氣動詞含糊帶過多個事實。
+- ⚠️ 不要壓成「新聞標題式的電報體殘句」：每個逗號分句都要是主播唸得出口的完整口語，
+  該有的主詞/動詞/受詞不要為了省字硬砍成兩三個字的碎片。壓字數要靠**刪掉整個次要子句**，
+  不是把句子縮成報紙標題（❌「台水關水，明天改善」——沒講關什麼水、改善什麼，不是人話；
+  ✅「台水已關閉水流，預計明天恢復供水」）。收尾的處置/後續句尤其容易被壓爛，要特別留意
 
 語感範例（模仿這種台灣電視新聞口白的節奏，不要照抄內容；注意句號很省，都是用逗號把短分句串成一句）：
 「台南安平一間超商，昨天下午驚傳搶案，一名王姓男子戴著口罩走進店裡，突然亮出水果刀，
@@ -529,6 +536,9 @@ def shorten_script(script: dict, max_chars: int) -> tuple[dict, dict]:
 請縮短旁白到 {max_chars} 字以內（保留關鍵資訊，刪次要細節），並同步重寫 segments。
 
 規則不變：
+- ⚠️ **縮短靠「刪掉整個次要子句」，不是把句子壓成殘句**：每個逗號分句仍要是主播唸得出口
+  的完整口語，該有的主詞/動詞/受詞不能為了省字砍成兩三字碎片（❌「台水關水，明天改善」；
+  ✅「台水已關閉水流，預計明天恢復」）。寧可整句刪掉，也不要留一句電報體標題殘句
 - segments 3~5 段，"sentences" 是該段涵蓋幾句（依句號/驚嘆號/問號切句），不用給秒數
 - 句號要省著用（每句號間隔 25~40 字，中間用逗號串短分句），句號斷太密 TTS 停頓會很卡
 - 旁白正文不能出現「畫面中」「這段影像」「另一段影像可以看到」這種解說詞
@@ -560,6 +570,45 @@ hook 跟 hashtags 原樣保留不用重寫。"""
     data = json.loads(resp.choices[0].message.content)
     data["subtitles"] = _build_subtitles(data["narration"])
     return data, usage
+
+
+def refine_sot(quote: str, article: str) -> tuple[dict, dict]:
+    """
+    自動補排 SOT 專用：把原始逐字稿引句校正成端正字幕（繁體、修同音錯字、不增刪語意），
+    並從新聞稿判斷發言者姓名/職稱（判不出留空，寧缺勿掛錯人）。回 (data, usage)。
+    data = {"display", "speaker_name", "speaker_title"}。
+    """
+    prompt = f"""以下是新聞素材裡一段受訪原音的逐字稿（本機語音辨識，可能有同音錯字、簡體）：
+「{quote}」
+
+新聞稿：
+{article}
+
+輸出 JSON：
+- "display"：把上面逐字稿校正成端正的繁體中文字幕（修同音錯字、轉繁體、補合適標點），
+  但不增刪原意、不改變語句結構——就是這個人實際講的話
+- "speaker_name"：發言者姓名。**用「動作對應」判斷並果斷填寫**：看這段話在描述誰做的事、
+  站什麼立場講，對應新聞稿裡的具名者。例如引句「我到現場發現…我緊急圍設三角錐、緊急通報」
+  → 對應稿裡「獲報火速到場」的人，而不是稿裡「表示過去已如何處置」的官員。
+  若有多位都到場（例：議員＋里長都火速到場），選**最主要/職銜較高的主要受訪者**（一般
+  議員優先於里長）。稿裡人物與動作能對上就填、不要動不動留空；只有**完全對不上任何具名者
+  才留空**（後續分鏡站會讓編輯再確認一次，掛錯可當場改）
+- "speaker_title"：對應到的那個人的職稱/身分（如「桃園市議員」「里長」）；
+  speaker_name 留空時這欄也留空
+只回 JSON：{{"display":"...","speaker_name":"...","speaker_title":"..."}}"""
+    deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2")
+    resp = _client().chat.completions.create(
+        model=deployment,
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        max_completion_tokens=800,
+    )
+    usage = {}
+    if resp.usage:
+        usage = {"prompt_tokens": resp.usage.prompt_tokens,
+                 "completion_tokens": resp.usage.completion_tokens,
+                 "total_tokens": resp.usage.total_tokens}
+    return json.loads(resp.choices[0].message.content), usage
 
 
 def dedup_narration_vs_sots(narration: str,

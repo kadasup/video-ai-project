@@ -37,7 +37,7 @@ def _append_log(record: dict):
     """將一筆 job 記錄 append 到 JSONL log 檔"""
     with _log_lock:
         with _LOG_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.write(json.dumps(record, ensure_ascii=False, default=_json_default) + "\n")
 
 _FEEDBACK_FILE = Path(r"D:\VideoAI\logs\feedback.jsonl")
 _fb_lock = threading.Lock()
@@ -52,7 +52,7 @@ def _append_feedback(kind: str, job_id: str, payload: dict):
     try:
         with _fb_lock:
             with _FEEDBACK_FILE.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                f.write(json.dumps(rec, ensure_ascii=False, default=_json_default) + "\n")
     except Exception:
         pass
 
@@ -89,7 +89,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from produce import (
     BASE, OUTPUT, TMP, MAIN_SEC, TTS_VOICES,
     generate_script, shorten_script, factcheck_narration, extract_card,
-    dedup_narration_vs_sots, generate_tts, write_ass,
+    dedup_narration_vs_sots, refine_sot, generate_tts, write_ass,
     align_subtitles_to_boundaries, rescale_subtitles,
     align_segments_to_boundaries, rescale_segments,
     _probe_duration, _split_sentences, _build_subtitles,
@@ -100,7 +100,7 @@ from produce import (
 from select_clip import (
     select_clip, catalog_video, match_narration_to_clips,
     video_fingerprint, near_duplicate, seg_line, describe_photo,
-    _cache_get as _photodesc_cache_get,
+    _cache_get as _photodesc_cache_get, _json_default,
 )
 import ltn_api
 import speech
@@ -556,11 +556,12 @@ def _fallback_catalog(video: Path) -> dict:
             "segments": segs, "tokens": {}, "fallback": True}
 
 
-def _fallback_sot(transcripts: list, catalogs: list, narration: str):
+def _fallback_sot(transcripts: list, catalogs: list, narration: str, article: str = ""):
     """
     GPT 沒排 SOT、但素材有夠份量的受訪逐字稿時，自動補一段（保險，只在完全沒 SOT 時用）。
     從連續逐字稿段落挑一段 6~14 秒、字數最多（最有內容）的當 SOT，讓「一顆講話頭」的
     新聞也一定用到當事人原音、而不是讓他無聲動嘴。抓不到合適段落回 None。
+    再用 refine_sot 校正字幕＋從原稿判斷發言者，補上姓名字卡（判不出就留空、不掛錯人）。
     after_sentence 先粗抓（插在旁白引導說話那句後），最終由後續去重步驟對齊。
     """
     def _zh_len(s):
@@ -588,10 +589,20 @@ def _fallback_sot(transcripts: list, catalogs: list, narration: str):
     if not after:
         after = max(1, round(len(sents) * 0.4))
     vi = best['vi']
+    # 校正字幕＋從原稿判斷發言者，補姓名字卡（失敗就用原始逐字稿、不掛名條）
+    display, spk_name, spk_title = best['text'].strip(), '', ''
+    try:
+        ref, _u = refine_sot(best['text'], article or '')
+        display = (ref.get('display') or display).strip()
+        spk_name = (ref.get('speaker_name') or '').strip()
+        spk_title = (ref.get('speaker_title') or '').strip()
+    except Exception:
+        pass
     return {'path': catalogs[vi]['path'], 'start': round(best['st'], 2),
             'dur': round(best['en'] - best['st'], 2),
-            'display': best['text'].strip(), 'after_sentence': after,
-            'label': f"V{vi + 1}", 'spk_name': '', 'spk_title': '', 'speaker': '',
+            'display': display, 'after_sentence': after,
+            'label': f"V{vi + 1}", 'spk_name': spk_name, 'spk_title': spk_title,
+            'speaker': ('｜'.join(x for x in (spk_name, spk_title) if x)),
             'auto': True}
 
 
@@ -692,11 +703,12 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             if dedup_skipped:
                 keep_paths = {id(k['v']) for k in kept}
                 videos = [v for v in videos if id(v) in keep_paths]   # 保留原相對順序
-                _job['warning'] = (f"已略過 {len(dedup_skipped)} 支近重複素材："
+                _job['warning'] = (f"⚠️ 已略過 {len(dedup_skipped)} 支近重複素材："
                                    + "、".join(dedup_skipped))
 
         catalogs = []
         transcripts = []   # 與 catalogs 同 index：該支影片的受訪逐字稿（無人聲為空）
+        _fb_fails = []     # 自動辨識失敗、走備援的素材（產製後彙整成一句給編輯的簡短提示）
         if videos:
             for i, v in enumerate(videos):
                 _job['msg'] = f"{STEPS[1]}（{i+1}/{len(videos)}）"
@@ -705,19 +717,14 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                     _add_tokens(cat.get('tokens', {}))
                 except Exception as e:
                     # 自動辨識失敗（常見：內容安全過濾器誤擋災害/事故畫面 → 400 content_policy）。
-                    # 不要靜默丟掉整支！用備援目錄讓素材仍可配對，並清楚警示編輯：什麼原因、哪一支。
+                    # 不要靜默丟掉整支！改用備援目錄讓素材仍可配對。
+                    # 技術細節（原始錯誤）只印到後臺給開發看；編輯端等迴圈跑完再彙整成一句簡短提示。
                     cat = _fallback_catalog(Path(v['path']))
                     fname = Path(v['path']).name
-                    if 'content_policy' in str(e) or 'content safety' in str(e):
-                        msg = (f"⚠️ 素材「{fname}」被 Azure 內容安全系統擋下"
-                               "（原因 content_policy_violation：畫面被判為疑似不當內容，"
-                               "災害／事故／血腥感畫面常被誤判），因此無法自動辨識內容。"
-                               "已以通用『現場實況畫面』納入配對，請務必到分鏡站確認這支畫面。")
-                    else:
-                        msg = (f"⚠️ 素材「{fname}」自動辨識失敗（原因：{str(e)[:80]}），"
-                               "已以通用『現場實況畫面』納入配對，請到分鏡站確認這支畫面。")
-                    _job['warning'] = ((_job.get('warning') + '\n' + msg)
-                                       if _job.get('warning') else msg)
+                    is_content = ('content_policy' in str(e) or 'content safety' in str(e))
+                    print(f"[catalog] {fname} 自動辨識失敗"
+                          f"（{'內容安全過濾器誤擋' if is_content else type(e).__name__}）：{e}")
+                    _fb_fails.append({'name': fname, 'content': is_content})
                 _job['msg'] = f"{STEPS[1]}（{i+1}/{len(videos)}，原音轉譯中）"
                 try:
                     tr = speech.transcribe(Path(v['path']))
@@ -725,6 +732,16 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                     tr = {"segments": [], "full_text": ""}
                 catalogs.append(cat)
                 transcripts.append(tr)
+
+        # 自動辨識失敗的素材：全部彙整成「一句」給編輯（不噴原始錯誤、不每支各噴一長串）
+        if _fb_fails:
+            names = '、'.join(f['name'] for f in _fb_fails)
+            reason = ('畫面被安全系統誤判擋下、無法自動辨識'
+                      if all(f['content'] for f in _fb_fails) else '無法自動辨識畫面')
+            msg = (f"⚠️ 有 {len(_fb_fails)} 支素材{reason}（{names}），"
+                   "已改用通用畫面納入，請到分鏡站確認這幾支。")
+            _job['warning'] = ((_job.get('warning') + '\n' + msg)
+                               if _job.get('warning') else msg)
 
         # 用實際轉譯結果標註每個畫面段落「有沒有原音人聲」（給配對與涵蓋度判斷用，
         # 比靠描述文字猜「受訪」可靠）
@@ -801,9 +818,10 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         # SOT 自動補排：GPT 沒排（隨機漏排）但素材有夠份量的受訪逐字稿 → 程式補一段，
         # 不讓「一顆講話頭」的新聞白白浪費當事人原音。插入點/縮稿由下游自動處理。
         if not sots:
-            fb = _fallback_sot(transcripts, catalogs, script['narration'])
+            fb = _fallback_sot(transcripts, catalogs, script['narration'], article)
             if fb:
                 sots.append(fb)
+                _job['auto_sot'] = True   # 自動補排＝發言者/內容靠程式判斷，停站讓編輯確認
                 _job['msg'] = f"{STEPS[2]}（GPT 未排原音，自動補排 SOT {fb['dur']:.0f} 秒）"
         _job['sot'] = ([{'label': s['label'], 'dur': s['dur'], 'display': s['display'],
                          'speaker': s.get('speaker', '')}
@@ -1232,6 +1250,8 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         if checkpoint_mode == 'smart':
             _cp_reasons = _stop_reasons(_job.get('factcheck'), _job.get('translit'),
                                         plan, catalogs)
+            if _job.get('auto_sot'):
+                _cp_reasons = _cp_reasons + ['自動補排了受訪原音 SOT，請確認內容與發言者字卡是否正確']
             _do_stop = bool(_cp_reasons)
         else:
             _cp_reasons = []
@@ -1347,7 +1367,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                                                hook=hook, title=title)
         if length_info.get("insufficient"):
             short_msg = (
-                f"來源畫面只涵蓋 {length_info['covered_sec']} 秒，"
+                f"⚠️ 來源畫面只涵蓋 {length_info['covered_sec']} 秒，"
                 f"不足 {length_info['target_sec']} 秒，"
                 f"其餘 {length_info['shortfall_sec']} 秒為黑幕空景"
             )
@@ -1539,6 +1559,13 @@ body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f3f4f
 .b-de{background:#fee2e2;color:#991b1b}
 .b-de:hover{background:#fecaca}
 .b-detail{background:#eff6ff;color:#1d4ed8}
+/* 意見回饋鈕：獨立整排、亮色漸層＋微微呼吸，做得醒目讓編輯看完就想點 */
+.card .b-fb{display:block;width:100%;margin-top:8px;padding:9px 0;border:none;border-radius:8px;
+  cursor:pointer;font-size:.86rem;font-weight:800;color:#fff;letter-spacing:1px;
+  background:linear-gradient(90deg,#f59e0b,#f97316);
+  box-shadow:0 3px 10px rgba(249,115,22,.35);animation:fbpulse 2.4s ease-in-out infinite}
+.card .b-fb:hover{filter:brightness(1.06);box-shadow:0 4px 14px rgba(249,115,22,.5)}
+@keyframes fbpulse{0%,100%{box-shadow:0 3px 10px rgba(249,115,22,.32)}50%{box-shadow:0 3px 18px rgba(249,115,22,.6)}}
 .empty{padding:60px 20px;text-align:center;color:#9ca3af}
 .detail-wrap{display:none;padding:12px 14px;border-top:1px solid #f0f0f0;font-size:.8rem;line-height:1.7}
 .detail-wrap.show{display:block}
@@ -1610,6 +1637,7 @@ function render(){
           <button class="b-detail" onclick="toggleDetail(${i})">詳情</button>
           <button class="b-de" onclick="del('${esc(r.filename)}')">刪</button>
         </div>
+        <button class="b-fb" onclick="openFeedback('${esc(r.filename)}')">💬 給這支寫意見回饋</button>
       </div>
       <div class="detail-wrap" id="d${i}">
         <div><b>Hook：</b>${esc(r.hook)}</div>
@@ -1654,8 +1682,62 @@ function del(fn){
     toast('已刪除');load();
   });
 }
+// ── 意見回饋（回饋閉環第 2 層，成片庫版）──────────────────────────────────────
+const FB_TAGS=['斷句怪','選片不準','受訪畫面太多','AI 腔太重','卡片/字卡多餘','字幕問題','節奏太快','節奏太慢','很好'];
+const FB_RATINGS=[[1,'差'],[2,'普通'],[3,'好']];
+const FB_RCOLOR={1:'#dc2626',2:'#6b7280',3:'#16a34a'};
+let fbFname='',fbTitle='',fbRating=0,fbTagSel=new Set();
+function renderFbRating(){document.getElementById('fb-rating').innerHTML=FB_RATINGS.map(([v,lbl])=>{const on=fbRating===v;const c=FB_RCOLOR[v];return `<button type="button" onclick="setFbRating(${v})" style="flex:1;padding:9px 0;border:1px solid ${on?c:'#d1d5db'};border-radius:8px;background:${on?c:'#fff'};color:${on?'#fff':'#374151'};font-weight:700;font-size:.92rem;cursor:pointer">${lbl}</button>`;}).join('');}
+function setFbRating(n){fbRating=n;renderFbRating();}
+function renderFbTags(){document.getElementById('fb-tags').innerHTML=FB_TAGS.map(t=>{const on=fbTagSel.has(t);return `<span onclick="toggleFbTag('${t}')" style="cursor:pointer;padding:4px 11px;border-radius:14px;font-size:.8rem;border:1px solid ${on?'#0ea5e9':'#d1d5db'};background:${on?'#e0f2fe':'#fff'};color:${on?'#0369a1':'#374151'}">${t}</span>`;}).join('');}
+function toggleFbTag(t){if(fbTagSel.has(t))fbTagSel.delete(t);else fbTagSel.add(t);renderFbTags();}
+function openFeedback(fn){
+  const r=(_all||[]).find(x=>x.filename===fn)||{};
+  fbFname=fn;fbTitle=r.title||'';fbRating=0;fbTagSel=new Set();
+  document.getElementById('fb-for').textContent='成品：'+(fbTitle||fbFname);
+  document.getElementById('fb-comment').value='';
+  renderFbRating();renderFbTags();
+  document.getElementById('fb-modal').style.display='flex';
+}
+function closeFeedback(){document.getElementById('fb-modal').style.display='none';}
+async function submitFeedback(){
+  const comment=document.getElementById('fb-comment').value.trim();
+  if(!fbRating&&!fbTagSel.size&&!comment){toast('請至少給個評分、標籤或文字');return;}
+  try{
+    await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({filename:fbFname,title:fbTitle,rating:fbRating,tags:[...fbTagSel],comment})});
+    closeFeedback();toast('已記錄回饋，謝謝！會用於自動學習優化 🙏');
+  }catch(e){toast('回饋送出失敗，請再試一次');}
+}
 load();
 </script>
+
+<div id="fb-modal" onclick="if(event.target.id==='fb-modal')closeFeedback()"
+     style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:220;
+            align-items:center;justify-content:center">
+  <div style="background:#fff;border-radius:12px;padding:22px 24px;width:min(92vw,520px);
+              max-height:90vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,.3)">
+    <h3 style="margin:0 0 4px;font-size:1.05rem">💬 這支成品的意見回饋</h3>
+    <p style="margin:0 0 14px;font-size:.8rem;color:#6b7280" id="fb-for"></p>
+    <div style="margin-bottom:14px">
+      <div style="font-size:.82rem;font-weight:600;margin-bottom:6px">整體評分</div>
+      <div id="fb-rating" style="display:flex;gap:8px"></div>
+    </div>
+    <div style="margin-bottom:14px">
+      <div style="font-size:.82rem;font-weight:600;margin-bottom:6px">快速標籤（可複選，點一下切換）</div>
+      <div id="fb-tags" style="display:flex;flex-wrap:wrap;gap:8px"></div>
+    </div>
+    <div style="margin-bottom:16px">
+      <div style="font-size:.82rem;font-weight:600;margin-bottom:6px">具體說明（哪裡好、哪裡要改）</div>
+      <textarea id="fb-comment" rows="4" placeholder="例：第3段畫面跟旁白對不上、旁白第2句太像 AI 腔、SOT 這段很好…"
+                style="width:100%;box-sizing:border-box;padding:9px;border:1px solid #cbd5e1;border-radius:8px;font-size:.88rem;font-family:inherit;resize:vertical"></textarea>
+    </div>
+    <div style="display:flex;gap:10px">
+      <button style="flex:1;padding:9px 0;border:none;border-radius:8px;background:#0ea5e9;color:#fff;font-weight:700;cursor:pointer" onclick="submitFeedback()">送出回饋</button>
+      <button style="flex:1;padding:9px 0;border:none;border-radius:8px;background:#9ca3af;color:#fff;font-weight:700;cursor:pointer" onclick="closeFeedback()">取消</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>"""
 
@@ -2068,6 +2150,13 @@ textarea{resize:vertical;min-height:210px}
   font-size:.87rem;font-weight:600
 }
 .dl:hover{background:#15803d}
+/* 意見回饋鈕：跟成片庫一致——整排、橙色漸層、微微呼吸，醒目 */
+.b-fb{display:block;width:100%;margin-top:10px;padding:11px 0;border:none;border-radius:8px;
+  cursor:pointer;font-size:.9rem;font-weight:800;color:#fff;letter-spacing:1px;
+  background:linear-gradient(90deg,#f59e0b,#f97316);
+  box-shadow:0 3px 10px rgba(249,115,22,.35);animation:fbpulse 2.4s ease-in-out infinite}
+.b-fb:hover{filter:brightness(1.06);box-shadow:0 4px 14px rgba(249,115,22,.5)}
+@keyframes fbpulse{0%,100%{box-shadow:0 3px 10px rgba(249,115,22,.32)}50%{box-shadow:0 3px 18px rgba(249,115,22,.6)}}
 .err{
   margin-top:18px;padding:13px 15px;background:#fef2f2;
   border:1px solid #fca5a5;border-radius:8px;
@@ -2077,8 +2166,8 @@ textarea{resize:vertical;min-height:210px}
 .warn{
   margin-top:18px;padding:13px 15px;background:#fffbeb;
   border:1px solid #fde68a;border-radius:8px;
-  font-size:.84rem;color:#92400e;display:none;
-  word-break:break-all
+  font-size:.84rem;color:#92400e;display:none;line-height:1.6;
+  white-space:pre-wrap;overflow-wrap:anywhere
 }
 
 /* 多影片清單（含每支的智慧分析結果） */
@@ -2170,6 +2259,9 @@ textarea{resize:vertical;min-height:210px}
 }
 .btn-import:hover{background:#1d4ed8}
 .btn-import:disabled{background:#9ca3af;cursor:not-allowed;opacity:.7;pointer-events:none}
+/* 素材不足：維持原本的灰色外觀（不鼓勵點），但仍「可點」——點了會跳確認框、確定就照匯 */
+.btn-import-warn{background:#9ca3af;opacity:.75}
+.btn-import-warn:hover{background:#6b7280;opacity:1}
 
 /* 資料夾瀏覽 modal */
 .modal-overlay{
@@ -2340,7 +2432,7 @@ textarea{resize:vertical;min-height:210px}
   </div>
 
   <!-- 右：進度 -->
-  <div class="card">
+  <div class="card" id="progress-card">
     <h2>產製進度</h2>
 
     <div class="progress-wrap"><div class="progress-bar" id="progress-bar"></div></div>
@@ -2401,11 +2493,40 @@ textarea{resize:vertical;min-height:210px}
              style="font-size:.82rem;color:#2563eb;cursor:pointer;padding:8px 10px;background:#f3f4f6;border-radius:6px;word-break:break-all"></div>
       </div>
       <a class="dl" id="dl" href="#">⬇ 下載成片</a>
+      <button class="b-fb" id="fb-btn" type="button" onclick="openFeedback()">💬 給這支寫意見回饋</button>
     </div>
     <div class="warn" id="warn"></div>
     <div class="err" id="err"></div>
   </div>
 
+</div>
+
+<!-- 意見回饋 modal：編輯看完成品後寫回饋，記入自動學習閉環 -->
+<div id="fb-modal" onclick="if(event.target.id==='fb-modal')closeFeedback()"
+     style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:220;
+            align-items:center;justify-content:center">
+  <div style="background:#fff;border-radius:12px;padding:22px 24px;width:min(92vw,520px);
+              max-height:90vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,.3)">
+    <h3 style="margin:0 0 4px;font-size:1.05rem">💬 這支成品的意見回饋</h3>
+    <p style="margin:0 0 14px;font-size:.8rem;color:#6b7280" id="fb-for"></p>
+    <div style="margin-bottom:14px">
+      <div style="font-size:.82rem;font-weight:600;margin-bottom:6px">整體評分</div>
+      <div id="fb-rating" style="display:flex;gap:8px"></div>
+    </div>
+    <div style="margin-bottom:14px">
+      <div style="font-size:.82rem;font-weight:600;margin-bottom:6px">快速標籤（可複選，點一下切換）</div>
+      <div id="fb-tags" style="display:flex;flex-wrap:wrap;gap:8px"></div>
+    </div>
+    <div style="margin-bottom:16px">
+      <div style="font-size:.82rem;font-weight:600;margin-bottom:6px">具體說明（哪裡好、哪裡要改）</div>
+      <textarea id="fb-comment" rows="4" placeholder="例：第3段畫面跟旁白對不上、旁白第2句太像 AI 腔、SOT 這段很好…"
+                style="width:100%;box-sizing:border-box;padding:9px;border:1px solid #cbd5e1;border-radius:8px;font-size:.88rem;font-family:inherit;resize:vertical"></textarea>
+    </div>
+    <div style="display:flex;gap:10px">
+      <button class="btn" style="flex:1;background:#0ea5e9" onclick="submitFeedback()">送出回饋</button>
+      <button class="btn" style="flex:1;background:#9ca3af" onclick="closeFeedback()">取消</button>
+    </div>
+  </div>
 </div>
 
 <!-- 資料夾瀏覽 modal -->
@@ -2454,6 +2575,8 @@ async function startJob() {
     const d = await r.json();
     if (d.error) { showErr(d.error); document.getElementById('btn').disabled = false; return; }
     timer = setInterval(poll, 1000);
+    // 開始產製後自動捲到「產製進度」，讓編輯直接看到進度不用自己找
+    document.getElementById('progress-card').scrollIntoView({behavior:'smooth', block:'start'});
   } catch(e) {
     showErr(e.message);
     document.getElementById('btn').disabled = false;
@@ -2614,6 +2737,22 @@ function toast(m) {
   }
   t.textContent = m; t.style.opacity = '1';
   setTimeout(() => t.style.opacity = '0', 2200);
+}
+
+// 自訂確認框（禁用原生 confirm）：msg 支援 HTML，按「確定」才呼叫 onYes
+function askConfirm(msg, onYes){
+  const ov = document.createElement('div');
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:300;display:flex;align-items:center;justify-content:center';
+  ov.innerHTML = `<div style="background:#fff;border-radius:12px;padding:20px 22px;max-width:380px;width:90%;box-shadow:0 10px 40px rgba(0,0,0,.3)">
+    <div style="font-size:.92rem;color:#111;line-height:1.65">${msg}</div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button class="ok" style="flex:1;padding:9px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-weight:700;cursor:pointer">確定</button>
+      <button class="no" style="flex:1;padding:9px;border:1px solid #d1d5db;border-radius:8px;background:#fff;color:#374151;cursor:pointer">取消</button>
+    </div></div>`;
+  ov.querySelector('.ok').onclick = () => { ov.remove(); onYes(); };
+  ov.querySelector('.no').onclick = () => ov.remove();
+  ov.onclick = e => { if (e.target === ov) ov.remove(); };
+  document.body.appendChild(ov);
 }
 
 // 在旁白（可能已被人工修改過的 textarea 內容）裡找出查核片段的位置。
@@ -2974,7 +3113,9 @@ function renderProgress(d) {
   else        timeEl.textContent = '已執行 ' + t + ' 秒';
 }
 
+let fbFname = '', fbTitle = '';   // 目前這支成品（供意見回饋帶上）
 function showResult(fname, title, warning, plan, hashtags) {
+  fbFname = fname || ''; fbTitle = title || '';
   document.getElementById('titleText').textContent = title || '';
   const dlUrl = '/api/download/' + encodeURIComponent(fname);
   document.getElementById('dl').href = dlUrl;
@@ -3005,7 +3146,7 @@ function showResult(fname, title, warning, plan, hashtags) {
 
   const warnEl = document.getElementById('warn');
   if (warning) {
-    warnEl.textContent = '⚠️ ' + warning;
+    warnEl.textContent = warning;   // 各則警示自己已帶 ⚠️，不再重複加前綴
     warnEl.style.display = 'block';
   } else {
     warnEl.style.display = 'none';
@@ -3018,6 +3159,47 @@ function showResult(fname, title, warning, plan, hashtags) {
   } else {
     hashtagBox.style.display = 'none';
   }
+}
+
+// ── 意見回饋（回饋閉環第 2 層：編輯看完成品→評分/標籤/備註→記入 feedback.jsonl）──
+const FB_TAGS = ['斷句怪','選片不準','受訪畫面太多','AI 腔太重','卡片/字卡多餘','字幕問題','節奏太快','節奏太慢','很好'];
+const FB_RATINGS = [[1,'差'],[2,'普通'],[3,'好']];
+const FB_RCOLOR = {1:'#dc2626',2:'#6b7280',3:'#16a34a'};
+let fbRating = 0, fbTagSel = new Set();
+function renderFbRating() {
+  document.getElementById('fb-rating').innerHTML = FB_RATINGS.map(([v,lbl]) => {
+    const on = fbRating===v; const c = FB_RCOLOR[v];
+    return `<button type="button" onclick="setFbRating(${v})" style="flex:1;padding:9px 0;border:1px solid ${on?c:'#d1d5db'};border-radius:8px;background:${on?c:'#fff'};color:${on?'#fff':'#374151'};font-weight:700;font-size:.92rem;cursor:pointer">${lbl}</button>`;
+  }).join('');
+}
+function setFbRating(n) { fbRating = n; renderFbRating(); }
+function renderFbTags() {
+  document.getElementById('fb-tags').innerHTML = FB_TAGS.map(t => {
+    const on = fbTagSel.has(t);
+    return `<span onclick="toggleFbTag('${t}')" style="cursor:pointer;padding:4px 11px;border-radius:14px;font-size:.8rem;
+      border:1px solid ${on?'#0ea5e9':'#d1d5db'};background:${on?'#e0f2fe':'#fff'};color:${on?'#0369a1':'#374151'}">${t}</span>`;
+  }).join('');
+}
+function toggleFbTag(t) { if (fbTagSel.has(t)) fbTagSel.delete(t); else fbTagSel.add(t); renderFbTags(); }
+function openFeedback() {
+  if (!fbFname) { toast('目前沒有可回饋的成品'); return; }
+  fbRating = 0; fbTagSel = new Set();
+  document.getElementById('fb-for').textContent = '成品：' + (fbTitle || fbFname);
+  document.getElementById('fb-comment').value = '';
+  renderFbRating(); renderFbTags();
+  document.getElementById('fb-modal').style.display = 'flex';
+}
+function closeFeedback() { document.getElementById('fb-modal').style.display = 'none'; }
+async function submitFeedback() {
+  const comment = document.getElementById('fb-comment').value.trim();
+  if (!fbRating && !fbTagSel.size && !comment) { toast('請至少給個評分、標籤或文字'); return; }
+  try {
+    await fetch('/api/feedback', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({filename: fbFname, title: fbTitle, rating: fbRating,
+                            tags: [...fbTagSel], comment})});
+    closeFeedback();
+    toast('已記錄回饋，謝謝！會用於自動學習優化 🙏');
+  } catch(e) { toast('回饋送出失敗，請再試一次'); }
 }
 
 function copyHashtags() {
@@ -3342,7 +3524,7 @@ function renderBacklog(skipAssess) {
       ${assessHtml}
       <span class="bl-title">${_escBl(it.title)}</span>
       <span class="bl-meta">${ts}・🎬${vc}支${a && a.total_sec ? '(' + a.total_sec + 's)' : ''}${a && a.n_photos != null ? '・📷' + a.n_photos + '張' : ''}</span>
-      <button class="btn-import"${materialShort ? ' disabled title="素材不足，暫不建議匯入"' : ''} onclick="importBacklogItem('${it.articleNo}')" id="bl-import-${it.articleNo}">📥 匯入</button>
+      <button class="btn-import${materialShort ? ' btn-import-warn' : ''}"${materialShort ? ' title="素材不足，點擊仍可確認後匯入"' : ''} onclick="importBacklogItem('${it.articleNo}')" id="bl-import-${it.articleNo}">📥 匯入</button>
     </div>`;
   }).join('');
   if (!skipAssess) assessBacklogItems();
@@ -3383,11 +3565,16 @@ function _escBl(s) {
 async function importBacklogItem(articleNo) {
   const it = backlogItems.find(x => x.articleNo === articleNo);
   if (!it) return;
-  // 守門：素材不足（紅燈）一律擋掉，不管按鈕是否被點到（防快取/時序造成的誤點）
+  // 素材不足（紅燈）→ 不再直接擋，改成跳確認框；使用者確定要匯入就照匯
   if (it._assess && it._assess.level === 'red') {
-    toast('素材不足，暫不建議匯入');
+    askConfirm('<b>素材不足，確定匯入嗎？</b><br><span style="color:#6b7280;font-size:.82rem">這篇可用畫面偏少，成片可能會有較多黑幕或畫面重複。</span>',
+      () => _doImportBacklog(it, articleNo));
     return;
   }
+  _doImportBacklog(it, articleNo);
+}
+
+async function _doImportBacklog(it, articleNo) {
   const btn = document.getElementById('bl-import-' + articleNo);
   btn.disabled = true;
   btn.textContent = '匯入中…';
@@ -3401,6 +3588,9 @@ async function importBacklogItem(articleNo) {
     if (d.error) { alert('匯入失敗：' + d.error); btn.disabled = false; btn.textContent = '📥 匯入'; return; }
 
     document.getElementById('article').value = d.content || '';
+    // 換新聞＝右側清乾淨：清掉上一篇殘留的產製進度、成片預覽/下載/回饋（避免張冠李戴）
+    resetUI();
+    document.getElementById('progress-time').textContent = '尚未開始';
     // 匯入完成直接帶使用者到「輸入資料」的新聞稿區（不用自己往下捲）
     document.getElementById('article').scrollIntoView({behavior: 'smooth', block: 'start'});
     importedPhotos = d.photos || [];   // 換新聞就換配圖，不累積上一篇的
@@ -4095,6 +4285,41 @@ def api_photo_caption():
     except Exception:
         pass
     return jsonify({'caption': '', 'src': ''})
+
+
+@app.route('/api/feedback', methods=['POST'])
+def api_feedback():
+    """
+    編輯對成品的意見回饋（回饋閉環第 2 層）→ 記入 feedback.jsonl 供自動學習優化。
+    附上該成片的旁白/plan/hook/SOT 脈絡，讓「這樣的產出得到這樣的評價」成為有用訓練料。
+    append-only（比照回饋資料唯讀慣例，只增不刪）。
+    """
+    d = request.get_json(force=True, silent=True) or {}
+    fname = (d.get('filename') or '').strip()
+    rating = d.get('rating') or 0
+    tags = d.get('tags') or []
+    comment = (d.get('comment') or '').strip()
+    if not (rating or tags or comment):
+        return jsonify({'ok': False, 'error': 'empty'}), 400
+    # 找對應成片的產製紀錄，附上內容脈絡（讓回饋能對回「產出了什麼」）
+    job_id, ctx = '', {}
+    try:
+        for r in _read_logs(1000):
+            if r.get('type') == 'produce' and r.get('output_file') == fname:
+                job_id = r.get('id', '')
+                ctx = {'produced_title': r.get('title', ''),
+                       'narration': r.get('narration', ''),
+                       'hook': r.get('hook', ''),
+                       'sot': r.get('sot'),
+                       'plan': r.get('plan', [])}
+                break
+    except Exception:
+        pass
+    _append_feedback('editor_feedback', job_id or fname, {
+        'filename': fname, 'title': d.get('title', ''),
+        'rating': int(rating) if rating else 0, 'tags': tags, 'comment': comment,
+        **ctx})
+    return jsonify({'ok': True})
 
 
 @app.route('/api/gallery')
