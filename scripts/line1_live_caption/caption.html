@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>直播即時字幕</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    overflow: hidden;
+  }
+  #caption {
+    position: fixed;
+    bottom: 40px;
+    left: 0;
+    right: 0;
+    text-align: center;
+    font-family: "Microsoft JhengHei", "微軟正黑體", sans-serif;
+    font-size: 48px;
+    font-weight: bold;
+    color: #ffffff;
+    text-shadow:
+      2px 2px 4px #000, -2px -2px 4px #000,
+      2px -2px 4px #000, -2px 2px 4px #000;
+    padding: 0 40px;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+  <div id="caption"></div>
+  <script>
+    const el = document.getElementById('caption');
+
+    function connect() {
+      const ws = new WebSocket('ws://localhost:8765');
+      ws.onmessage = (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          el.textContent = data.text || '';
+        } catch (e) {
+          // 非 JSON 訊息忽略
+        }
+      };
+      ws.onclose = () => setTimeout(connect, 1000);
+    }
+
+    connect();
+  </script>
+</body>
+</html>
