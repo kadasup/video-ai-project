@@ -56,6 +56,39 @@ def _append_feedback(kind: str, job_id: str, payload: dict):
     except Exception:
         pass
 
+
+def _feedback_by_filename() -> dict:
+    """讀 feedback.jsonl，把編輯意見回饋（editor_feedback）依成片檔名分組，新到舊。
+    只回顯示需要的欄位（評分/標籤/備註/時間），不帶旁白/plan 等大脈絡。"""
+    out: dict = {}
+    if not _FEEDBACK_FILE.exists():
+        return out
+    try:
+        for line in _FEEDBACK_FILE.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("kind") != "editor_feedback":
+                continue
+            fn = r.get("filename") or ""
+            if not fn:
+                continue
+            out.setdefault(fn, []).append({
+                "rating": r.get("rating", 0),
+                "tags": r.get("tags") or [],
+                "comment": r.get("comment", ""),
+                "timestamp": r.get("timestamp", ""),
+            })
+    except Exception:
+        return out
+    for fn in out:
+        out[fn].reverse()   # 新到舊
+    return out
+
+
 def _read_logs(limit: int = 200) -> list[dict]:
     """讀取最近 limit 筆（最新在前）"""
     if not _LOG_FILE.exists():
@@ -1565,6 +1598,15 @@ body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f3f4f
   background:linear-gradient(90deg,#f59e0b,#f97316);
   box-shadow:0 3px 10px rgba(249,115,22,.35);animation:fbpulse 2.4s ease-in-out infinite}
 .card .b-fb:hover{filter:brightness(1.06);box-shadow:0 4px 14px rgba(249,115,22,.5)}
+/* 意見回饋風琴夾：直接列在影片下方，點標題展開/收合 */
+.fb-acc{margin-top:8px;border:1px solid #fed7aa;border-radius:8px;background:#fffbeb;overflow:hidden}
+.fb-acc summary{cursor:pointer;padding:8px 12px;font-size:.82rem;font-weight:700;color:#b45309;user-select:none;list-style:none}
+.fb-acc summary::-webkit-details-marker{display:none}
+.fb-acc summary::before{content:'▸ ';color:#f59e0b}
+.fb-acc[open] summary::before{content:'▾ '}
+.fb-acc .fb-body{padding:2px 12px 8px}
+.fb-item{padding:7px 0;border-top:1px solid #fde68a;font-size:.8rem;line-height:1.55}
+.fb-item:first-child{border-top:none}
 @keyframes fbpulse{0%,100%{box-shadow:0 3px 10px rgba(249,115,22,.32)}50%{box-shadow:0 3px 18px rgba(249,115,22,.6)}}
 .empty{padding:60px 20px;text-align:center;color:#9ca3af}
 .detail-wrap{display:none;padding:12px 14px;border-top:1px solid #f0f0f0;font-size:.8rem;line-height:1.7}
@@ -1624,6 +1666,17 @@ function render(){
     const tags = (r.hashtags||[]).join(' ');
     const fc = (r.factcheck&&r.factcheck.length)?`<div class="fc">🔍 查核有 ${r.factcheck.length} 處出入（未修）</div>`:'';
     const sot = r.sot?`<div class="meta">🎤 含受訪原音${(Array.isArray(r.sot)&&r.sot.length>1)?' ×'+r.sot.length:''}</div>`:'';
+    const fb = r.feedback||[]; const nfb = fb.length;
+    const RLBL = {1:['差','#dc2626'],2:['普通','#6b7280'],3:['好','#16a34a']};
+    const fbHtml = fb.map(f => {
+      const rl = RLBL[f.rating];
+      const rating = rl?`<span style="color:#fff;background:${rl[1]};border-radius:10px;padding:1px 9px;font-size:.72rem;font-weight:700">${rl[0]}</span>`:'';
+      const tgs = (f.tags||[]).map(t=>`<span style="background:#e0f2fe;color:#0369a1;border-radius:10px;padding:1px 7px;font-size:.72rem;margin-left:4px">${esc(t)}</span>`).join('');
+      const cm = f.comment?`<div style="margin-top:3px;color:#374151">${esc(f.comment)}</div>`:'';
+      const t = (f.timestamp||'').replace('T',' ').slice(0,16);
+      return `<div class="fb-item">${rating}${tgs} <span style="color:#9ca3af;font-size:.7rem">${t}</span>${cm}</div>`;
+    }).join('');
+    const fbAcc = nfb?`<details class="fb-acc"><summary>📋 意見回饋（${nfb}）</summary><div class="fb-body">${fbHtml}</div></details>`:'';
     return `<div class="card">
       <video src="${vurl}" data-poster="/api/thumb/${encodeURIComponent(r.filename)}" preload="none" controls playsinline></video>
       <div class="body">
@@ -1637,7 +1690,8 @@ function render(){
           <button class="b-detail" onclick="toggleDetail(${i})">詳情</button>
           <button class="b-de" onclick="del('${esc(r.filename)}')">刪</button>
         </div>
-        <button class="b-fb" onclick="openFeedback('${esc(r.filename)}')">💬 給這支寫意見回饋</button>
+        <button class="b-fb" onclick="openFeedback('${esc(r.filename)}')">💬 給這支寫意見回饋${nfb?`（${nfb}）`:''}</button>
+        ${fbAcc}
       </div>
       <div class="detail-wrap" id="d${i}">
         <div><b>Hook：</b>${esc(r.hook)}</div>
@@ -1707,6 +1761,7 @@ async function submitFeedback(){
     await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({filename:fbFname,title:fbTitle,rating:fbRating,tags:[...fbTagSel],comment})});
     closeFeedback();toast('已記錄回饋，謝謝！會用於自動學習優化 🙏');
+    load();   // 重載成片庫→更新該支的回饋則數與風琴夾
   }catch(e){toast('回饋送出失敗，請再試一次');}
 }
 load();
@@ -4327,6 +4382,7 @@ def api_gallery():
     """成片庫：jobs.jsonl 裡成功產出、且檔案還在的成片，附完整 metadata，新到舊"""
     seen = set()
     items = []
+    fb_map = _feedback_by_filename()
     for r in _read_logs(1000):
         if r.get('type') != 'produce' or r.get('error') or r.get('cancelled'):
             continue
@@ -4353,6 +4409,7 @@ def api_gallery():
             'factcheck': r.get('factcheck') or [],
             'cost': round(pp, 4),
             'day': path.parent.name if path.parent != OUTPUT else '',
+            'feedback': fb_map.get(fn, []),
         })
     return jsonify(items)
 
