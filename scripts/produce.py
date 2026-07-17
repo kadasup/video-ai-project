@@ -447,6 +447,7 @@ def generate_script(article: str, footage_notes: str | None = None,
 {{
   "title": "片頭標題（20 字內，吸睛但不煽情，放在片頭卡）",
   "hook": "開頭鉤子（10~14 字內，比 title 更聳動抓眼球，疊在主畫面最前 2 秒的畫面上，不會被旁白唸出來，純文字看的）",
+  "mood": "這則新聞的整體語氣，從這六選一：嚴肅/平靜/緊張/溫馨/歡快/勵志（決定配樂情緒）",
   "hashtags": ["#關鍵字1", "#關鍵字2", "#關鍵字3", "#關鍵字4"],
   "location": "地點（縣市＋路段，10 字內）",
   "narration": "旁白全文（繁體中文，約 {int(MAIN_SEC * 4.5)} 字）",
@@ -463,6 +464,14 @@ def generate_script(article: str, footage_notes: str | None = None,
   "highlights": ["760架次", "全數取消", "陳彥伯"]
 }}
 （沒有受訪逐字稿、或沒有適合的原音時，"sots" 給空陣列 []）
+
+"mood"（配樂情緒）規則——只能填這六個之一，用來挑背景音樂的情緒，別填其他詞：
+- 嚴肅：災害、事故、死傷、案件、弊案、抗議等沉重負面題材（最常見，拿不準就用這個）
+- 平靜：民生、政策、施政、一般敘事性新聞，無強烈情緒起伏
+- 緊張：追緝、槍戰、搜索、火警搶救、衝突對峙等有懸念/急迫感的題材
+- 溫馨：助人、送暖、動物、人情味、地方溫情故事
+- 歡快：節慶、活動、美食、趣聞、輕鬆正面的軟性題材
+- 勵志：奮鬥有成、克服困難、正能量激勵題材
 
 "stat"（數據動態字卡）規則：
 - 只在新聞裡有「一個」具衝擊力的關鍵數字時才給（金額、人數、次數、百分比等），
@@ -585,8 +594,8 @@ def shorten_script(script: dict, max_chars: int) -> tuple[dict, dict]:
 原腳本：
 {json.dumps(script, ensure_ascii=False)}
 
-輸出相同格式的完整 JSON（title、hook、hashtags、location、narration、segments，不用輸出 subtitles），
-hook 跟 hashtags 原樣保留不用重寫。"""
+輸出相同格式的完整 JSON（title、hook、mood、hashtags、location、narration、segments，不用輸出 subtitles），
+hook、mood、hashtags 原樣保留不用重寫。"""
 
     deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2")
     resp = _client().chat.completions.create(
@@ -604,6 +613,10 @@ hook 跟 hashtags 原樣保留不用重寫。"""
         }
     data = json.loads(resp.choices[0].message.content)
     data["subtitles"] = _build_subtitles(data["narration"])
+    # 防呆：縮寫時 GPT 偶爾漏帶這些「原樣保留」欄位 → 從原腳本補回，別讓 mood/stat 掉光
+    for k in ("mood", "hook", "hashtags", "stat", "highlights", "sots"):
+        if not data.get(k) and script.get(k) is not None:
+            data[k] = script[k]
     return data, usage
 
 
@@ -1453,25 +1466,49 @@ def _pick_bgm() -> Path | None:
     return picks[0] if picks else None
 
 
-def _bgm_candidates(limit: int = 3) -> list[Path]:
-    """回傳候選 BGM（隨機排序、最多 limit 首）：人工指定曲最優先，否則從 01配樂 嚴選庫抽。
-    回傳一串（而非單一首）是為了讓混音端在抽到損壞/0-byte 檔時能換下一首重試，
-    不會因單一壞檔就讓整支產製失敗。"""
+# 新聞語氣 → 配樂資料夾：GPT 寫稿時順手判斷 mood，選曲就從對應情緒資料夾抽，
+# 災害不再配到歡樂拉丁、趣聞不再配到悲傷弦樂。資料夾名對不上就退回全庫（安全預設）。
+_MOOD_DIRS = {
+    "嚴肅": ["04.嚴肅沉靜"],
+    "平靜": ["02.平靜溫和"],
+    "緊張": ["05.緊張刺激", "09.懸疑"],
+    "溫馨": ["01.開心歡快", "02.平靜溫和"],
+    "歡快": ["01.開心歡快", "10.節慶"],
+    "勵志": ["03.勵志"],
+}
+
+
+def _bgm_files_in(subdirs: list[str] | None) -> list[Path]:
+    """列某幾個情緒子資料夾（None＝全庫）內的可用配樂，排除浮水印/AppleDouble 垃圾檔。"""
+    roots = [BGM_DIR / s for s in subdirs] if subdirs else [BGM_DIR]
+    out: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            out += [p for ext in ("*.mp3", "*.m4a", "*.wav")
+                    for p in root.rglob(ext)
+                    if "浮水印" not in p.name and not p.name.startswith("._")]
+        except OSError:
+            pass
+    return out
+
+
+def _bgm_candidates(limit: int = 3, mood: str | None = None) -> list[Path]:
+    """回傳候選 BGM（隨機排序、最多 limit 首）：人工指定曲最優先，否則依 mood 從對應
+    情緒資料夾抽（該資料夾空/無此 mood 就退回全庫）。回傳一串（而非單一首）是為了讓
+    混音端在抽到損壞/0-byte 檔時能換下一首重試，不會因單一壞檔就讓整支產製失敗。"""
     if BGM_MP3.exists():
         return [BGM_MP3]
-    try:
-        tracks = [
-            p for ext in ("*.mp3", "*.m4a", "*.wav")
-            for p in BGM_DIR.rglob(ext)
-            if "浮水印" not in p.name and not p.name.startswith("._")
-        ]
-    except OSError:
-        tracks = []
+    tracks = _bgm_files_in(_MOOD_DIRS.get((mood or "").strip())) if mood else []
+    if not tracks:
+        tracks = _bgm_files_in(None)   # mood 無對應或該資料夾空 → 全庫
     random.shuffle(tracks)
     return tracks[:limit]
 
 
-def _mix_audio(tts: Path, audio_out: Path, main_sec: float) -> Path | None:
+def _mix_audio(tts: Path, audio_out: Path, main_sec: float,
+               mood: str | None = None) -> Path | None:
     """
     TTS + BGM 混音，長度切齊 main_sec。
     BGM 走 sidechain 閃避：旁白/受訪原音出聲時自動壓低、空隙時浮上來，
@@ -1481,7 +1518,7 @@ def _mix_audio(tts: Path, audio_out: Path, main_sec: float) -> Path | None:
     ⚠️ 抽到損壞/0-byte 的配樂檔會讓 ffmpeg 失敗，這裡逐首換下一首重試，全失敗才退回
     無 BGM 純轉檔——絕不讓單一壞配樂檔殺掉整支產製（配樂庫是編輯自由增減的資料夾）。
     """
-    for bgm in _bgm_candidates():
+    for bgm in _bgm_candidates(mood=mood):
         try:
             ff(
                 "-i", tts,
@@ -1510,7 +1547,7 @@ def _mix_audio(tts: Path, audio_out: Path, main_sec: float) -> Path | None:
 
 def make_main(tts: Path, srt: Path, sources: list[dict] | None = None,
               main_sec: float = MAIN_SEC, hook: str | None = None,
-              title: str | None = None) -> tuple[Path, dict]:
+              title: str | None = None, mood: str | None = None) -> tuple[Path, dict]:
     """
     sources: [{"path": "...", "start": 12.0}, ...] 依序使用，不足 main_sec 秒的部分自動補黑幕。
              傳 None 或空 list = 全黑幕（測試流程）。
@@ -1529,7 +1566,7 @@ def make_main(tts: Path, srt: Path, sources: list[dict] | None = None,
     out       = TMP / "main.mp4"
     audio_out = TMP / "audio.aac"
     sub_f = _sub_filter(srt)
-    bgm = _mix_audio(tts, audio_out, main_sec)
+    bgm = _mix_audio(tts, audio_out, main_sec, mood=mood)
 
     # ── 依序分配每支來源可用秒數，湊不滿就補黑幕（結尾）─────────────────────────
     sources = sources or []
@@ -1667,7 +1704,8 @@ def make_strap_png(name: str, title: str, out: Path) -> Path:
 def make_main_plan(tts: Path, srt: Path, plan: list[dict],
                    main_sec: float = MAIN_SEC, hook: str | None = None,
                    straps: list[dict] | None = None,
-                   draft: bool = False, title: str | None = None) -> tuple[Path, dict]:
+                   draft: bool = False, title: str | None = None,
+                   mood: str | None = None) -> tuple[Path, dict]:
     """
     依智慧配對產生的時間軸組裝主畫面。
     plan: [{"path": str|None, "photo": str|None, "start": float, "dur": float}, ...]
@@ -1679,7 +1717,7 @@ def make_main_plan(tts: Path, srt: Path, plan: list[dict],
     out       = TMP / ("draft_main.mp4" if draft else "main.mp4")
     audio_out = TMP / ("draft_audio.aac" if draft else "audio.aac")
     sub_f = _sub_filter(srt)
-    bgm = _mix_audio(tts, audio_out, main_sec)
+    bgm = _mix_audio(tts, audio_out, main_sec, mood=mood)
 
     norm_plan = []
     for i, e in enumerate(plan):
@@ -2010,7 +2048,8 @@ def main():
     intro = make_intro(script)
 
     print(f"⑤ 組裝主畫面 ({MAIN_SEC}秒)...")
-    main_clip, length_info = make_main(tts_path, srt_path, sources, hook=script.get("hook"))
+    main_clip, length_info = make_main(tts_path, srt_path, sources,
+                                       hook=script.get("hook"), mood=script.get("mood"))
     if length_info["insufficient"]:
         print(f"   ⚠️ 來源影片總長度只有 {length_info['covered_sec']} 秒，"
               f"不足 {MAIN_SEC} 秒，其餘 {length_info['shortfall_sec']} 秒為黑幕空景")

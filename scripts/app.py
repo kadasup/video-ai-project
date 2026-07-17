@@ -242,7 +242,7 @@ def _render_draft(edits: list, title_o: str = '', hook_o: str = '',
         clip, _info = make_main_plan(Path(ctx['tts']), Path(ctx['ass']), plan2,
                                      ctx['main_sec'], hook=ctx['hook'],
                                      straps=ctx['straps'], draft=True,
-                                     title=ctx.get('title'))
+                                     title=ctx.get('title'), mood=ctx.get('mood'))
         _draft.update({'file': str(clip), 'ts': time.time(), 'error': None})
     except Exception as e:
         _draft['error'] = str(e)
@@ -470,6 +470,26 @@ def _enrich_subject_pos(plan: list, catalogs: list) -> None:
         if pos is None and segs:
             pos = min(segs, key=lambda x: abs((x[0] + x[1]) / 2 - mid))[2]
         e['subject_pos'] = pos or '滿版'
+
+
+def _absorb_slivers(plan: list, min_dur: float = 0.25) -> list:
+    """把時長 < min_dur 的碎片段（切割/插卡留下的 3~5 幀閃跳）併進鄰段：
+    多出來的秒數優先加給前一段、沒有前段就加給後段，總長不變、音畫維持同步。"""
+    out: list = [dict(e) for e in plan]
+    i = 0
+    while i < len(out):
+        d = float(out[i].get('dur', 0) or 0)
+        if d < min_dur and len(out) > 1:
+            if i > 0:            # 併進前一段
+                out[i - 1]['dur'] = round(float(out[i - 1].get('dur', 0) or 0) + d, 2)
+                out.pop(i)
+                continue
+            else:                # 第一段碎片 → 併進後一段
+                out[1]['dur'] = round(float(out[1].get('dur', 0) or 0) + d, 2)
+                out.pop(0)
+                continue
+        i += 1
+    return out
 
 
 def _split_plan_at(plan: list, t: float) -> tuple[list, list]:
@@ -826,17 +846,29 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                 vi = int(str(s0.get('video', '')).strip().upper().lstrip('V')) - 1
                 if not (0 <= vi < len(transcripts)):
                     continue
-                span = speech.resolve_quote_span(transcripts[vi], s0.get('quote', ''))
+                # snap_sentence_sec：GPT 的 quote 常是半句，讓 SOT 結束對齊句尾、
+                # 別把受訪者切在話講一半（回饋：「議員講話也沒讓他講完」）
+                span = speech.resolve_quote_span(transcripts[vi], s0.get('quote', ''),
+                                                 snap_sentence_sec=5.0)
                 if not span:
                     continue
-                st, en, _spansegs = span
+                st, en, _spansegs, _tail = span
                 dur_s = round(en - st, 2)
-                if dur_s > 16.0 or dur_s < 3.0:
-                    continue   # 超過 16 秒太拖、不足 3 秒不成句，寧缺勿濫
+                if dur_s > 20.0 or dur_s < 3.0:
+                    continue   # 超過 20 秒太拖、不足 3 秒不成句，寧缺勿濫（snap 補完句子後上限放寬）
                 spk_name = (s0.get('speaker_name') or '').strip()
                 spk_title = (s0.get('speaker_title') or '').strip()
+                # 補完句子多出來的原音尾巴接進字幕，讓字幕涵蓋到實際播放的完整原音
+                _disp = (s0.get('display') or s0.get('quote') or '').strip()
+                if _tail:
+                    if not _disp:
+                        _disp = _tail
+                    elif _disp[-1] in '。！？!?…、，,':   # 已有結尾標點就直接接，不再補逗號
+                        _disp = _disp + _tail
+                    else:
+                        _disp = _disp + '，' + _tail
                 cand = {'path': catalogs[vi]['path'], 'start': st, 'dur': dur_s,
-                        'display': (s0.get('display') or s0.get('quote') or '').strip(),
+                        'display': _disp,
                         'after_sentence': int(s0.get('after_sentence', 0) or 0),
                         'label': f"V{vi+1}",
                         # 受訪者名條：GPT 只在能明確判斷發言者時才給（掛錯人是事故）
@@ -1206,17 +1238,23 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                             _job['msg'] = f"{STEPS[5]}（渲染{cname}中）"
                         if card_path.exists() or statcard.render_card(card, card_path):
                             plan_total = sum(float(e.get('dur', 0) or 0) for e in plan)
+                            # 開場保護：卡片別插在最前面把開場畫面切成碎片（曾見開場災害畫面
+                            # 只剩 0.09 秒就切去時序卡）。研究指出前 3 秒流失最重，開場那幾秒要留給
+                            # 真實畫面。若 anchor 落在前 2.5 秒，把卡片下移到 2.5 秒後再上。
+                            card_at = max(stat_t, 2.5) if stat_t < 2.5 else stat_t
+                            card_at = min(card_at, plan_total)   # 不超出總長
                             card_dur = round(min(statcard.card_duration(card),
-                                                 plan_total - stat_t), 2)
+                                                 plan_total - card_at), 2)
                             if card_dur >= 1.5:
                                 gist = (f"{card.get('label', '')}{card.get('value', '')}"
                                         f"{card.get('unit', '')}" if ctype == 'stat'
                                         else card.get('title') or card.get('headline') or '')
-                                pA, pB = _split_plan_at(plan, stat_t)
+                                pA, pB = _split_plan_at(plan, card_at)
                                 _consumed, pRest = _split_plan_at(pB, card_dur)
                                 plan = pA + [{'path': str(card_path), 'photo': None,
                                               'start': 0.0, 'dur': card_dur,
                                               'why': f"📊 {cname}：{gist}"}] + pRest
+                                plan = _absorb_slivers(plan)   # 切割留下的碎片段併掉
                                 _job['stat'] = card
                     except Exception:
                         pass   # 插卡是加分項，失敗不擋產製
@@ -1306,6 +1344,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                             'ass': str(ass_path), 'main_sec': main_sec,
                             'hook': _job.get('hook'), 'straps': straps,
                             'title': _job.get('title') or script.get('title', ''),
+                            'mood': script.get('mood'),
                             'cat_paths': {str(c['path']) for c in catalogs}}
             _confirm_action[0] = 'go'
             _confirm_edits[0] = None
@@ -1395,14 +1434,15 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         # 只有走 plan 的路徑支援低畫質；無 plan 的純黑幕備援維持全畫質，
         # 片尾要跟主畫面實際畫質一致（concat -c copy 要求解析度相同）
         main_is_draft = bool(low_quality and plan)
+        mood = script.get('mood')   # 配樂情緒（GPT 依新聞語氣判定，選曲對應資料夾）
         if plan:
             _enrich_subject_pos(plan, catalogs)   # 每段查主體位置，供直式裁切偏移
             main_clip, length_info = make_main_plan(tts_path, ass_path, plan, main_sec,
                                                     hook=hook, straps=straps, title=title,
-                                                    draft=main_is_draft)
+                                                    draft=main_is_draft, mood=mood)
         else:
             main_clip, length_info = make_main(tts_path, ass_path, videos, main_sec,
-                                               hook=hook, title=title)
+                                               hook=hook, title=title, mood=mood)
         if length_info.get("insufficient"):
             short_msg = (
                 f"⚠️ 來源畫面只涵蓋 {length_info['covered_sec']} 秒，"
@@ -1484,6 +1524,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             "seg_align":          _job.get('seg_align', ''),
             "sot":                _job.get('sot'),
             "stat":               _job.get('stat'),
+            "mood":               script.get('mood', ''),
             "photos":             photos or [],
             "factcheck":          _job.get('factcheck'),
             "translit":           _job.get('translit'),

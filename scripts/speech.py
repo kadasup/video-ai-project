@@ -85,15 +85,26 @@ def _clean(s: str) -> str:
     return re.sub(r"[^0-9A-Za-z一-鿿]", "", s)
 
 
+_SENT_END = "。！？!?…"
+
+
 def resolve_quote_span(transcript: dict, quote: str,
-                       pad: float = 0.25) -> tuple[float, float, list] | None:
+                       pad: float = 0.25,
+                       snap_sentence_sec: float = 0.0
+                       ) -> tuple[float, float, list, str] | None:
     """
-    把 GPT 選的引句文字對回逐字稿時間軸，回傳 (start, end, 覆蓋到的 segments)。
+    把 GPT 選的引句文字對回逐字稿時間軸，回傳 (start, end, 覆蓋到的 segments, tail)。
+    tail 是為了講完句子（snap）而多納入的段落原文，沒延伸時為空字串。
 
     做法：把全部 segment 文字去標點串成一條長字串（記錄每個 segment 的字元
     起訖位置），用 find() 找引句的**實際起點**，再映射回起訖 segment——
     不能用「滑動視窗串接後 in 檢查」：引句落在視窗中段也會命中，
     會把前面不相干的句子一起圈進來（實測踩過：字幕跟原音對不上）。
+
+    snap_sentence_sec > 0：GPT 給的 quote 常是半句，結束段落落在話沒講完處
+    （回饋：「議員講話也沒讓他講完」）。開這個選項後，若結束段的原文不是以句尾
+    標點（。！？…）收尾，就往後多納入幾段直到湊成完整句子，最多多延伸這麼多秒，
+    寧可讓受訪者把話講完也不要硬切在半句。
     """
     q = _clean(quote)
     if not q or not transcript.get("segments"):
@@ -130,5 +141,18 @@ def resolve_quote_span(transcript: dict, quote: str,
     if ei is None:
         ei = len(segs) - 1
 
+    # 收尾對齊句尾：結束段原文沒以句尾標點收，往後多納段落把整句講完（限秒數預算內）。
+    # tail = 為了講完句子而「多納入的段落原文」，回給呼叫端補進字幕，音畫才同步。
+    tail = ""
+    if snap_sentence_sec > 0:
+        base_end = segs[ei]["end"]
+        ei0 = ei
+        while (ei < len(segs) - 1
+               and (segs[ei]["text"].rstrip() or "x")[-1] not in _SENT_END
+               and segs[ei + 1]["end"] - base_end <= snap_sentence_sec):
+            ei += 1
+        if ei > ei0:
+            tail = "".join(segs[k]["text"] for k in range(ei0 + 1, ei + 1)).strip()
+
     return (round(max(0.0, segs[si]["start"] - pad), 2),
-            round(segs[ei]["end"] + pad, 2), segs[si:ei + 1])
+            round(segs[ei]["end"] + pad, 2), segs[si:ei + 1], tail)
