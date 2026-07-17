@@ -1442,8 +1442,16 @@ def _pick_bgm() -> Path | None:
     排除檔名含「浮水印」的（未授權正式使用的預覽版）；排除 `._` 開頭的（macOS AppleDouble
     資源分岔檔，同名不是真的音檔，餵給 ffmpeg 會直接炸掉整支產製）。
     要增減曲目直接對 01配樂 底下加刪檔案即可。"""
+    picks = _bgm_candidates()
+    return picks[0] if picks else None
+
+
+def _bgm_candidates(limit: int = 3) -> list[Path]:
+    """回傳候選 BGM（隨機排序、最多 limit 首）：人工指定曲最優先，否則從 01配樂 嚴選庫抽。
+    回傳一串（而非單一首）是為了讓混音端在抽到損壞/0-byte 檔時能換下一首重試，
+    不會因單一壞檔就讓整支產製失敗。"""
     if BGM_MP3.exists():
-        return BGM_MP3
+        return [BGM_MP3]
     try:
         tracks = [
             p for ext in ("*.mp3", "*.m4a", "*.wav")
@@ -1452,7 +1460,8 @@ def _pick_bgm() -> Path | None:
         ]
     except OSError:
         tracks = []
-    return random.choice(tracks) if tracks else None
+    random.shuffle(tracks)
+    return tracks[:limit]
 
 
 def _mix_audio(tts: Path, audio_out: Path, main_sec: float) -> Path | None:
@@ -1462,29 +1471,34 @@ def _mix_audio(tts: Path, audio_out: Path, main_sec: float) -> Path | None:
     不再是整條固定音量硬墊。無 BGM 時只轉檔（行為與過去一致）。
     有 BGM 時尾端不淡出——BGM 會接續播放到片尾結束（make_outro 用回傳的同一首歌
     接續，真正的結尾淡出點在片尾那邊），回傳挑到的 BGM 路徑供片尾接續使用。
+    ⚠️ 抽到損壞/0-byte 的配樂檔會讓 ffmpeg 失敗，這裡逐首換下一首重試，全失敗才退回
+    無 BGM 純轉檔——絕不讓單一壞配樂檔殺掉整支產製（配樂庫是編輯自由增減的資料夾）。
     """
-    bgm = _pick_bgm()
-    if bgm:
-        ff(
-            "-i", tts,
-            "-stream_loop", "-1", "-i", bgm,
-            "-filter_complex",
-            "[0:a]asplit=2[n1][n2];"
-            "[1:a]volume=0.32,aformat=sample_rates=44100:channel_layouts=stereo[bg];"
-            "[bg][n1]sidechaincompress=threshold=0.02:ratio=14:attack=60:release=700[duck];"
-            # amix 實測仍會把輸出壓 -3dB（normalize=0 也一樣），volume 補償回原響度
-            "[n2][duck]amix=inputs=2:duration=first:normalize=0,volume=3dB[a]",
-            "-map", "[a]", "-t", main_sec,
-            "-c:a", "aac", "-ar", "44100", "-ac", "2",
-            audio_out
-        )
-    else:
-        ff(
-            "-i", tts, "-t", main_sec,
-            "-c:a", "aac", "-ar", "44100", "-ac", "2",
-            audio_out
-        )
-    return bgm
+    for bgm in _bgm_candidates():
+        try:
+            ff(
+                "-i", tts,
+                "-stream_loop", "-1", "-i", bgm,
+                "-filter_complex",
+                "[0:a]asplit=2[n1][n2];"
+                "[1:a]volume=0.32,aformat=sample_rates=44100:channel_layouts=stereo[bg];"
+                "[bg][n1]sidechaincompress=threshold=0.02:ratio=14:attack=60:release=700[duck];"
+                # amix 實測仍會把輸出壓 -3dB（normalize=0 也一樣），volume 補償回原響度
+                "[n2][duck]amix=inputs=2:duration=first:normalize=0,volume=3dB[a]",
+                "-map", "[a]", "-t", main_sec,
+                "-c:a", "aac", "-ar", "44100", "-ac", "2",
+                audio_out
+            )
+            return bgm
+        except Exception as e:
+            print(f"⚠️ 配樂混音失敗（{Path(bgm).name}），換下一首：{e}")
+    # 全部候選都失敗（或根本沒配樂）→ 無 BGM 純轉檔，產製照常完成
+    ff(
+        "-i", tts, "-t", main_sec,
+        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        audio_out
+    )
+    return None
 
 
 def make_main(tts: Path, srt: Path, sources: list[dict] | None = None,
@@ -1901,18 +1915,22 @@ def make_outro(draft: bool = False, bgm: Path | None = None, bgm_offset: float =
         )
 
     if bgm:
-        outro_dur = _probe_duration(out)
-        bgm_audio = TMP / ("draft_outro_bgm.aac" if draft else "outro_bgm.aac")
-        _bgm_continuation_audio(bgm, bgm_offset, outro_dur, bgm_audio)
-        muxed = TMP / ("draft_outro_muxed.mp4" if draft else "outro_muxed.mp4")
-        ff(
-            "-i", out, "-i", bgm_audio,
-            "-map", "0:v", "-map", "1:a",
-            "-c:v", "copy", "-c:a", "aac", "-ar", "44100",
-            "-shortest",
-            muxed
-        )
-        return muxed
+        # 片尾接續 BGM 失敗不該炸掉整支（片尾是最後一步）：失敗就回原本無配樂片尾
+        try:
+            outro_dur = _probe_duration(out)
+            bgm_audio = TMP / ("draft_outro_bgm.aac" if draft else "outro_bgm.aac")
+            _bgm_continuation_audio(bgm, bgm_offset, outro_dur, bgm_audio)
+            muxed = TMP / ("draft_outro_muxed.mp4" if draft else "outro_muxed.mp4")
+            ff(
+                "-i", out, "-i", bgm_audio,
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "copy", "-c:a", "aac", "-ar", "44100",
+                "-shortest",
+                muxed
+            )
+            return muxed
+        except Exception as e:
+            print(f"⚠️ 片尾配樂接續失敗，改用無配樂片尾：{e}")
     return out
 
 

@@ -80,7 +80,10 @@ def _load_env():
 
 def _connect() -> sqlite3.Connection:
     SEARCH_DIR.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_FILE)
+    con = sqlite3.connect(DB_FILE, timeout=10)
+    # WAL：讓「寫索引時搜尋站仍能讀」不互鎖（搜尋站是純讀端）；busy_timeout 遇短暫鎖會等而非立刻報錯
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=8000")
     # 舊版 schema（無 src 欄）直接砍掉重建——逐字稿/校正/向量都有快取，重建近乎免費
     cols = {r[1] for r in con.execute("PRAGMA table_info(videos)")}
     if cols and "src" not in cols:
@@ -405,7 +408,8 @@ def run_index(progress=None) -> dict:
 def index_stats() -> dict:
     if not DB_FILE.exists():
         return {"videos": 0, "segments": 0, "with_vec": 0, "no_speech": 0, "last": ""}
-    con = sqlite3.connect(DB_FILE)
+    con = sqlite3.connect(DB_FILE, timeout=10)
+    con.execute("PRAGMA busy_timeout=8000")
     try:
         v  = con.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
         s  = con.execute("SELECT COUNT(*) FROM segments").fetchone()[0]

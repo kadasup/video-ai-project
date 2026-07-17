@@ -4153,9 +4153,21 @@ def api_generate():
     return jsonify({'ok': True})
 
 
+def _snapshot_job() -> dict:
+    """安全複製 _job：產製執行緒會同時增減 key（sot/auto_sot/preview/warning… 都是中途才加），
+    直接 dict(_job) 撞上就丟 RuntimeError: dictionary changed size during iteration。
+    寫入點散落數十處、逐一包鎖有死鎖風險，這裡用重試快照吸收瞬間的併發改動。"""
+    for _ in range(5):
+        try:
+            return dict(_job)
+        except RuntimeError:
+            time.sleep(0.005)
+    return {k: _job.get(k) for k in list(_job)}   # 最後保底：逐鍵取，缺就 None
+
+
 @app.route('/api/status')
 def api_status():
-    d = dict(_job)
+    d = _snapshot_job()
     d.pop('preview', None)   # 預覽 payload 較大，只走 /api/preview，狀態輪詢保持輕量
     if not d.get('done'):
         now = time.time()
@@ -4642,9 +4654,12 @@ def api_rerun():
                 'plan': None, 'started_at': time.time(), 'step_started_at': time.time(),
                 'elapsed_sec': 0, 'step_elapsed_sec': 0}
     photos = [p for p in (src.get('photos') or []) if Path(p).exists()]
+    # 用關鍵字參數，避免位置錯位（曾把 True 誤放到 checkpoint_mode → 靜默變成 'off' 不停站）
     t = threading.Thread(target=run_job,
-                         args=(article, videos, src.get('output_file', '').rsplit('.', 1)[0],
-                               'hsiaochen', True, photos),
+                         args=(article, videos,
+                               src.get('output_file', '').rsplit('.', 1)[0]),
+                         kwargs={'voice_key': 'hsiaochen', 'checkpoint_mode': 'smart',
+                                 'photos': photos},
                          daemon=True)
     t.start()
     return jsonify({'ok': True, 'videos_found': len(videos), 'videos_expected': len(vpaths)})

@@ -53,7 +53,12 @@ def _load_index():
     with _idx_lock:
         if mt == _idx["mtime"] and _idx["rows"]:
             return
-        con = sqlite3.connect(DB_FILE)
+        con = sqlite3.connect(DB_FILE, timeout=10)
+        # WAL＋busy_timeout：indexer 重建索引（持寫鎖）期間讀取才不會撞
+        # 「database is locked」→ 搜尋 500。WAL 是 DB 檔的持久屬性、設一次即可，
+        # 這裡讀端一併設保險；busy_timeout 需逐連線設。
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=8000")
         try:
             videos = {r[0]: {"src": r[1], "relpath": r[2], "duration": r[3],
                              "title": r[4] or "",
