@@ -1408,7 +1408,8 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             _job['warning'] = (_job.get('warning') + '\n' + short_msg) if _job.get('warning') else short_msg
 
         p(8)
-        outro = make_outro(draft=main_is_draft)
+        outro = make_outro(draft=main_is_draft, bgm=length_info.get('bgm'),
+                           bgm_offset=length_info.get('bgm_offset', 0.0))
 
         p(9)
         safe = re.sub(r'[\\/:*?"<>|]', '-', script['title'])[:20]

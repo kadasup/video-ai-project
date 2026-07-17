@@ -49,7 +49,7 @@ OUTRO_PNG = TEMPLATES / "outro.png"    # 片尾圖卡（設計師提供，靜態
 OUTRO_MP4 = TEMPLATES / "shorts片尾.mp4"  # 設計師提供的 shorts 專用動態片尾（已是 1080x1920，優先使用）
 LOGO_PNG  = TEMPLATES / "logo.png"     # 角標（標準命名，找不到時退回下方實際素材）
 BGM_MP3   = TEMPLATES / "bgm.mp3"     # 背景音樂（人工指定單曲，優先於嚴選庫）
-BGM_DIR   = BASE / "assets" / "bgm"   # BGM 嚴選庫（每支隨機選曲，sidechain 閃避旁白）
+BGM_DIR   = TEMPLATES / "01配樂"      # BGM 嚴選庫（依情緒分資料夾，遞迴隨機選曲，sidechain 閃避旁白）
 FONT_TTF  = TEMPLATES / "font.ttf"    # 字幕字型
 # 沒有設計師素材時，自動用黑底 / 系統字型暫代，流程照跑
 
@@ -127,7 +127,10 @@ def _tts_normalize_punct(text: str) -> str:
 # 字幕/TTS 字數差由對齊端的比例縮放吸收（跟 apply_pronounce 同一套機制）。
 
 _ZH_DIGITS = "零一二三四五六七八九"
-_HOTLINES = {"110", "119", "113", "165", "1999", "1968", "1995"}
+# 逐字唸的號碼/型號：報案專線（110…）本來就該逐字唸；747 這類機型/型號數字
+# 也不是「量」而是「編號」，唸成「七百四十七」是錯的，要逐字唸「七四七」
+# （回饋案例：波音747 貨機被唸成整數，2026-07-16 加入）。
+_DIGIT_BY_DIGIT = {"110", "119", "113", "165", "1999", "1968", "1995", "747"}
 
 
 def _int_to_zh(s: str) -> str:
@@ -175,21 +178,39 @@ def _digits_to_zh(s: str) -> str:
 
 def num2zh(text: str) -> str:
     """把文中的阿拉伯數字換成中文讀法。規則：
-    百分比 → 百分之N；4 位數+年 → 逐字唸；報案/服務專線與 7 位以上長號碼 → 逐字唸；
+    M/D 日期斜線 → N月M日；百分比 → 百分之N；4 位數+年 → 逐字唸；
+    報案/服務專線與型號（110…／747）與 7 位以上長號碼 → 逐字唸；
     小數 → 整數部分讀量值＋點＋逐字；其餘一律讀量值（760 → 七百六十）。"""
     def _num(m: re.Match) -> str:
         s = m.group(0)
         tail = text[m.end(): m.end() + 1]
         if len(s) == 4 and tail == "年":
             return _digits_to_zh(s)
-        if s in _HOTLINES or len(s) >= 7:
+        if s in _DIGIT_BY_DIGIT or len(s) >= 7:
             return _digits_to_zh(s)
         if "." in s:
             a, b = s.split(".", 1)
             return _int_to_zh(a) + "點" + _digits_to_zh(b)
         return _int_to_zh(s)
 
+    # M/D 日期（如「7/10」）先轉「N月M日」，否則會被 edge-tts 唸成分數
+    # （回饋案例：「7/10開放至今」唸錯，2026-07-16）。範圍限 1~12/1~31 避免誤吃真分數。
+    text = re.sub(
+        r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)",
+        lambda m: (f"{m.group(1)}月{m.group(2)}日"
+                   if 1 <= int(m.group(1)) <= 12 and 1 <= int(m.group(2)) <= 31
+                   else m.group(0)),
+        text
+    )
     text = re.sub(r"(?<=\d),(?=\d)", "", text)   # 千分位逗號先拿掉（1,200 → 1200），否則會唸成「一,兩百」
+    # 頓號夾在單一數字中間是約略區間慣用語（「1、2千噸」讀作「一兩千噸」，不是列舉停頓），
+    # 直接轉成中文數字詞組（先轉完，下面的通用數字轉換就不會再吃到這裡，也不會誤併成 12）
+    # 回饋案例：「1、2千噸」被唸得卡卡的，2026-07-16。
+    text = re.sub(
+        r"(?<!\d)(\d)、(\d)(?=[千萬百億])",
+        lambda m: "".join("兩" if d == "2" else _ZH_DIGITS[int(d)] for d in m.group(1, 2)),
+        text
+    )
     text = re.sub(r"(\d+(?:\.\d+)?)\s*[%％]", lambda m: "百分之" + num2zh(m.group(1)), text)
     return re.sub(r"\d+(?:\.\d+)?", _num, text)
 
@@ -487,6 +508,11 @@ hook／hashtag 規則：
   該有的主詞/動詞/受詞不要為了省字硬砍成兩三個字的碎片。壓字數要靠**刪掉整個次要子句**，
   不是把句子縮成報紙標題（❌「台水關水，明天改善」——沒講關什麼水、改善什麼，不是人話；
   ✅「台水已關閉水流，預計明天恢復供水」）。收尾的處置/後續句尤其容易被壓爛，要特別留意
+- ⚠️ 逗號絕對不能插在「一個完整名稱/門牌地址/複合詞」中間，把它切成兩截：
+  機具/設備全名（❌「山貓，怪手」若原意是同一部機具名稱不能拆開）、
+  門牌地址（❌「湖山街180巷，77弄口」──巷弄是同一個地址要連著唸，
+  ✅「湖山街180巷77弄口」）、複合狀態詞（❌「預防性，下架」✅「預防性下架」）。
+  這類詞唸起來是一個不可分割的單位，逗號只能點在詞與詞的自然邊界，不能點在詞的內部
 
 語感範例（模仿這種台灣電視新聞口白的節奏，不要照抄內容；注意句號很省，都是用逗號把短分句串成一句）：
 「台南安平一間超商，昨天下午驚傳搶案，一名王姓男子戴著口罩走進店裡，突然亮出水果刀，
@@ -539,6 +565,8 @@ def shorten_script(script: dict, max_chars: int) -> tuple[dict, dict]:
 - ⚠️ **縮短靠「刪掉整個次要子句」，不是把句子壓成殘句**：每個逗號分句仍要是主播唸得出口
   的完整口語，該有的主詞/動詞/受詞不能為了省字砍成兩三字碎片（❌「台水關水，明天改善」；
   ✅「台水已關閉水流，預計明天恢復」）。寧可整句刪掉，也不要留一句電報體標題殘句
+- ⚠️ 逗號不能插在機具全名/門牌地址/複合詞中間把它切成兩截
+  （❌「湖山街180巷，77弄口」✅「湖山街180巷77弄口」），縮寫時這類詞要整個保留或整個刪掉
 - segments 3~5 段，"sentences" 是該段涵蓋幾句（依句號/驚嘆號/問號切句），不用給秒數
 - 句號要省著用（每句號間隔 25~40 字，中間用逗號串短分句），句號斷太密 TTS 停頓會很卡
 - 旁白正文不能出現「畫面中」「這段影像」「另一段影像可以看到」這種解說詞
@@ -1409,27 +1437,34 @@ def _sub_filter(srt: Path) -> str:
 
 
 def _pick_bgm() -> Path | None:
-    """選 BGM：templates/bgm.mp3（人工指定曲）優先；否則從 assets/bgm 嚴選庫隨機。
-    嚴選庫是從報社 templates/背景mp3（56 首曲風很雜）挑出的新聞/紀實氛圍曲，
-    要增減曲目直接對 assets/bgm 加刪檔案即可。"""
+    """選 BGM：templates/bgm.mp3（人工指定曲）優先；否則從 01配樂 嚴選庫（依情緒分資料夾，
+    開心歡快/平靜溫和/勵志/嚴肅沉靜/緊張刺激/古典樂曲/搖滾/懸疑/節慶…）遞迴隨機挑一首。
+    排除檔名含「浮水印」的（未授權正式使用的預覽版）；排除 `._` 開頭的（macOS AppleDouble
+    資源分岔檔，同名不是真的音檔，餵給 ffmpeg 會直接炸掉整支產製）。
+    要增減曲目直接對 01配樂 底下加刪檔案即可。"""
     if BGM_MP3.exists():
         return BGM_MP3
     try:
-        tracks = sorted(BGM_DIR.glob("*.mp3")) + sorted(BGM_DIR.glob("*.m4a"))
+        tracks = [
+            p for ext in ("*.mp3", "*.m4a", "*.wav")
+            for p in BGM_DIR.rglob(ext)
+            if "浮水印" not in p.name and not p.name.startswith("._")
+        ]
     except OSError:
         tracks = []
     return random.choice(tracks) if tracks else None
 
 
-def _mix_audio(tts: Path, audio_out: Path, main_sec: float):
+def _mix_audio(tts: Path, audio_out: Path, main_sec: float) -> Path | None:
     """
-    TTS + BGM 混音，長度切齊 main_sec，結尾 1 秒淡出。
+    TTS + BGM 混音，長度切齊 main_sec。
     BGM 走 sidechain 閃避：旁白/受訪原音出聲時自動壓低、空隙時浮上來，
     不再是整條固定音量硬墊。無 BGM 時只轉檔（行為與過去一致）。
+    有 BGM 時尾端不淡出——BGM 會接續播放到片尾結束（make_outro 用回傳的同一首歌
+    接續，真正的結尾淡出點在片尾那邊），回傳挑到的 BGM 路徑供片尾接續使用。
     """
     bgm = _pick_bgm()
     if bgm:
-        fade_st = max(0.0, float(main_sec) - 1.0)
         ff(
             "-i", tts,
             "-stream_loop", "-1", "-i", bgm,
@@ -1438,8 +1473,7 @@ def _mix_audio(tts: Path, audio_out: Path, main_sec: float):
             "[1:a]volume=0.32,aformat=sample_rates=44100:channel_layouts=stereo[bg];"
             "[bg][n1]sidechaincompress=threshold=0.02:ratio=14:attack=60:release=700[duck];"
             # amix 實測仍會把輸出壓 -3dB（normalize=0 也一樣），volume 補償回原響度
-            f"[n2][duck]amix=inputs=2:duration=first:normalize=0,volume=3dB,"
-            f"afade=t=out:st={fade_st:.2f}:d=1[a]",
+            "[n2][duck]amix=inputs=2:duration=first:normalize=0,volume=3dB[a]",
             "-map", "[a]", "-t", main_sec,
             "-c:a", "aac", "-ar", "44100", "-ac", "2",
             audio_out
@@ -1450,6 +1484,7 @@ def _mix_audio(tts: Path, audio_out: Path, main_sec: float):
             "-c:a", "aac", "-ar", "44100", "-ac", "2",
             audio_out
         )
+    return bgm
 
 
 def make_main(tts: Path, srt: Path, sources: list[dict] | None = None,
@@ -1473,7 +1508,7 @@ def make_main(tts: Path, srt: Path, sources: list[dict] | None = None,
     out       = TMP / "main.mp4"
     audio_out = TMP / "audio.aac"
     sub_f = _sub_filter(srt)
-    _mix_audio(tts, audio_out, main_sec)
+    bgm = _mix_audio(tts, audio_out, main_sec)
 
     # ── 依序分配每支來源可用秒數，湊不滿就補黑幕（結尾）─────────────────────────
     sources = sources or []
@@ -1500,6 +1535,8 @@ def make_main(tts: Path, srt: Path, sources: list[dict] | None = None,
         plan.append({"path": None, "start": 0, "dur": remaining})
 
     length_info = _plan_length_info(plan, main_sec)
+    length_info["bgm"] = bgm
+    length_info["bgm_offset"] = main_sec
     _assemble_main(plan, audio_out, sub_f, out, main_sec, hook=hook, title=title)
     return out, length_info
 
@@ -1621,7 +1658,7 @@ def make_main_plan(tts: Path, srt: Path, plan: list[dict],
     out       = TMP / ("draft_main.mp4" if draft else "main.mp4")
     audio_out = TMP / ("draft_audio.aac" if draft else "audio.aac")
     sub_f = _sub_filter(srt)
-    _mix_audio(tts, audio_out, main_sec)
+    bgm = _mix_audio(tts, audio_out, main_sec)
 
     norm_plan = []
     for i, e in enumerate(plan):
@@ -1640,6 +1677,8 @@ def make_main_plan(tts: Path, srt: Path, plan: list[dict],
         else:
             norm_plan.append({"path": None, "start": 0.0, "dur": dur})
     length_info = _plan_length_info(norm_plan, main_sec)
+    length_info["bgm"] = bgm
+    length_info["bgm_offset"] = main_sec
     _assemble_main(norm_plan, audio_out, sub_f, out, main_sec, hook=hook,
                    straps=straps, draft=draft, title=title)
     return out, length_info
@@ -1679,8 +1718,7 @@ def _assemble_main(plan: list[dict], audio_out: Path, sub_f: str, out: Path,
     → 疊受訪者名條（straps: [{png,start,end}]，SOT 時段顯示）→ 混音輸出。
     draft=True 是分鏡站的快速預覽：內容完全相同（字幕/名條/數據卡/BGM 都在），
     只是縮到 480p＋最快編碼檔位，十幾秒可出——正式渲染不受影響。"""
-    logo_path = resolve_logo_path()
-    has_logo  = logo_path is not None
+    has_logo = False  # 右上角自由時報浮水印已取消（2026-07-16）
 
     args: list = []
     filter_parts: list[str] = []
@@ -1797,7 +1835,27 @@ def _assemble_main(plan: list[dict], audio_out: Path, sub_f: str, out: Path,
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 4c：片尾
 # ─────────────────────────────────────────────────────────────────────────────
-def make_outro(draft: bool = False) -> Path:
+def _bgm_continuation_audio(bgm: Path, offset: float, dur: float, out_audio: Path):
+    """接續主畫面 BGM 播放到片尾結束的音軌：從 offset 秒（＝主畫面實際長度）接著往下播，
+    軌長不夠就繞回開頭（依實際曲長取模，不是每次都從 0 開始），尾端 0.8 秒淡出——
+    這裡才是全片真正的結尾，片尾自帶音軌是近乎全靜音（實測 -91dB），直接用這軌取代。"""
+    try:
+        track_dur = _probe_duration(bgm)
+    except Exception:
+        track_dur = 0.0
+    seek = (offset % track_dur) if track_dur > 0.5 else 0.0
+    fade_st = max(0.0, dur - 0.8)
+    ff(
+        "-stream_loop", "-1", "-ss", f"{seek:.2f}", "-i", bgm,
+        "-t", f"{dur:.2f}",
+        "-af", (f"volume=0.32,aformat=sample_rates=44100:channel_layouts=stereo,"
+                f"volume=3dB,afade=t=out:st={fade_st:.2f}:d=0.8"),
+        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        out_audio
+    )
+
+
+def make_outro(draft: bool = False, bgm: Path | None = None, bgm_offset: float = 0.0) -> Path:
     """
     片尾優先序：shorts片尾.mp4（設計師提供的動態片尾，已是 1080x1920）
     → outro.png（靜態圖備援）→ 黑底暫代。
@@ -1805,6 +1863,8 @@ def make_outro(draft: bool = False) -> Path:
     不會因規格不一致而出錯或音畫不同步。
     draft=True（POC 低畫質模式）：片尾也縮到 480×854/24fps/ultrafast，跟低畫質主畫面
     規格一致，concat -c copy 才串得起來。
+    bgm 有給值時：主畫面用的同一首 BGM 接續播放到片尾結束（見 _bgm_continuation_audio），
+    取代原本片尾素材裡近乎全靜音的音軌；bgm_offset 是主畫面實際長度，接續的起點。
     """
     out = TMP / ("draft_outro.mp4" if draft else "outro.mp4")
     tw, th = (480, 854) if draft else (W, H)          # 主畫面 draft = scale=480:-2 → 480×854
@@ -1839,6 +1899,20 @@ def make_outro(draft: bool = False) -> Path:
             "-c:v", "libx264", "-c:a", "aac", "-ar", "44100",
             out
         )
+
+    if bgm:
+        outro_dur = _probe_duration(out)
+        bgm_audio = TMP / ("draft_outro_bgm.aac" if draft else "outro_bgm.aac")
+        _bgm_continuation_audio(bgm, bgm_offset, outro_dur, bgm_audio)
+        muxed = TMP / ("draft_outro_muxed.mp4" if draft else "outro_muxed.mp4")
+        ff(
+            "-i", out, "-i", bgm_audio,
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "copy", "-c:a", "aac", "-ar", "44100",
+            "-shortest",
+            muxed
+        )
+        return muxed
     return out
 
 
@@ -1910,7 +1984,7 @@ def main():
               f"不足 {MAIN_SEC} 秒，其餘 {length_info['shortfall_sec']} 秒為黑幕空景")
 
     print("⑥ 組裝片尾 (5秒)...")
-    outro = make_outro()
+    outro = make_outro(bgm=length_info.get("bgm"), bgm_offset=length_info.get("bgm_offset", 0.0))
 
     safe_name = re.sub(r'[\\/:*?"<>|]', "-", script["title"])[:20]
     out_path = OUTPUT / (args.name or f"{safe_name}.mp4")
