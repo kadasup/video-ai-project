@@ -1622,7 +1622,6 @@ body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f3f4f
   <h1>🎬 成片庫</h1>
   <a href="/">產製</a>
   <a href="/gallery" class="active">成片庫</a>
-  <a href="/logs">使用記錄</a>
 </div>
 <div class="bar">
   <input type="text" id="kw" placeholder="搜尋標題／關鍵字…" oninput="render()">
@@ -1852,6 +1851,7 @@ tr:hover td{background:#fafafa}
   <a href="/">產製</a>
   <a href="/gallery">成片庫</a>
   <a href="/logs" class="active">使用記錄</a>
+  <a href="/insights">回饋儀表板</a>
 </div>
 
 <!-- 統計卡片 -->
@@ -2130,6 +2130,152 @@ loadLogs();
 </body>
 </html>"""
 
+# ── 回饋儀表板（管理者自用，導覽列不放連結，靠產製頁右上角小圖示進入）──────────
+INSIGHTS_HTML = """<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>回饋儀表板 — VideoAI</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html{font-size:17px}
+body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f3f4f6;color:#111;padding:24px}
+.topnav,.alert-box,.stat-row,.sec{max-width:1080px;margin-left:auto;margin-right:auto}
+.topnav{display:flex;gap:6px;align-items:center;margin-bottom:20px}
+.topnav h1{font-size:1.2rem;font-weight:700;margin:0 auto 0 0}
+.topnav a{font-size:.83rem;color:#6b7280;text-decoration:none;padding:7px 14px;border:1px solid #d1d5db;border-radius:7px;background:#fff}
+.topnav a.active{background:#2563eb;color:#fff;border-color:#2563eb}
+.topnav a:hover:not(.active){background:#f9fafb}
+.alert-box{margin-bottom:18px}
+.alert{background:#fef2f2;border:1px solid #fecaca;border-left:4px solid #dc2626;border-radius:8px;padding:12px 16px;font-size:.88rem;color:#7f1d1d;margin-bottom:8px}
+.alert b{color:#b91c1c}
+.alert-ok{background:#f0fdf4;border:1px solid #bbf7d0;border-left:4px solid #16a34a;border-radius:8px;padding:12px 16px;font-size:.88rem;color:#14532d}
+.stat-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+.stat{background:#fff;border-radius:8px;padding:14px 18px;flex:1;min-width:120px;box-shadow:0 1px 3px rgba(0,0,0,.07)}
+.stat .val{font-size:1.4rem;font-weight:700;color:#2563eb}
+.stat .lbl{font-size:.75rem;color:#888;margin-top:2px}
+.stat.bad .val{color:#dc2626}
+.stat.good .val{color:#16a34a}
+.sec{background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.07);padding:18px 20px;margin-bottom:18px}
+.sec h2{font-size:.95rem;font-weight:700;margin-bottom:12px;color:#374151}
+.tagbar{display:flex;align-items:center;gap:10px;margin-bottom:8px;font-size:.84rem}
+.tagbar .tname{width:130px;color:#374151;flex-shrink:0}
+.tagbar .bar{height:16px;background:#3b82f6;border-radius:4px;min-width:2px}
+.tagbar .bar.hot{background:#dc2626}
+.tagbar .tcnt{color:#6b7280;font-size:.8rem}
+.fb-item{border-bottom:1px solid #f0f0f0;padding:10px 2px;font-size:.85rem}
+.fb-item:last-child{border-bottom:none}
+.fb-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px}
+.chip{display:inline-block;padding:1px 9px;border-radius:9px;font-size:.75rem;font-weight:700;color:#fff}
+.tagchip{display:inline-block;padding:1px 8px;border-radius:8px;font-size:.73rem;background:#e0e7ff;color:#3730a3}
+.fb-fn{color:#6b7280;font-size:.77rem}
+.fb-ts{color:#9ca3af;font-size:.75rem;margin-left:auto}
+.fb-cmt{color:#374151;white-space:pre-wrap;line-height:1.5}
+.muted{color:#9ca3af;font-size:.84rem}
+.usage-link{font-size:.82rem;color:#2563eb;text-decoration:none}
+.usage-link:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="topnav">
+  <h1>📊 回饋儀表板</h1>
+  <a href="/">產製</a>
+  <a href="/gallery">成片庫</a>
+  <a href="/logs">使用記錄</a>
+  <a href="/insights" class="active">回饋儀表板</a>
+</div>
+
+<div class="alert-box" id="alerts"></div>
+<div class="stat-row" id="stats"></div>
+
+<div class="sec">
+  <h2>🏷️ 問題標籤排行</h2>
+  <div id="tagbars" class="muted">載入中…</div>
+</div>
+
+<div class="sec">
+  <h2>⚙️ 產製使用統計 <a class="usage-link" href="/logs" style="float:right">完整使用記錄 →</a></h2>
+  <div class="stat-row" id="usage" style="margin-bottom:0"></div>
+</div>
+
+<div class="sec">
+  <h2>💬 最新回饋（新到舊）</h2>
+  <div id="fblist" class="muted">載入中…</div>
+</div>
+
+<script>
+const THRESHOLD = 5;   // 同一標籤累積達此數 → 紅色門檻提醒
+const RLBL = {1:['差','#dc2626'], 2:['普通','#6b7280'], 3:['好','#16a34a']};
+const esc = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+async function load(){
+  const fb = await (await fetch('/api/fb_insights')).json();
+
+  // ── 統計卡 ──
+  const now = Date.now(), week = 7*86400*1000;
+  const in7d = fb.filter(r => now - new Date(r.timestamp).getTime() < week);
+  const cnt = r => fb.filter(x => x.rating === r).length;
+  document.getElementById('stats').innerHTML = `
+    <div class="stat"><div class="val">${fb.length}</div><div class="lbl">總回饋數</div></div>
+    <div class="stat bad"><div class="val">${cnt(1)}</div><div class="lbl">差</div></div>
+    <div class="stat"><div class="val">${cnt(2)}</div><div class="lbl">普通</div></div>
+    <div class="stat good"><div class="val">${cnt(3)}</div><div class="lbl">好</div></div>
+    <div class="stat"><div class="val">${in7d.length}</div><div class="lbl">近 7 天新增</div></div>`;
+
+  // ── 標籤統計＋門檻提醒 ──
+  const tagCnt = {};
+  fb.forEach(r => (r.tags||[]).forEach(t => tagCnt[t] = (tagCnt[t]||0)+1));
+  const sorted = Object.entries(tagCnt).sort((a,b) => b[1]-a[1]);
+  const alerts = [];
+  sorted.forEach(([t,c]) => { if(c >= THRESHOLD) alerts.push(`標籤「<b>${esc(t)}</b>」已累積 <b>${c}</b> 則，建議安排處理`); });
+  const bad7 = in7d.filter(r => r.rating === 1).length;
+  if(bad7 >= 3) alerts.push(`近 7 天「差」評已有 <b>${bad7}</b> 則，品質可能在退步，建議看一下最新回饋`);
+  document.getElementById('alerts').innerHTML = alerts.length
+    ? alerts.map(a => `<div class="alert">🚨 ${a}</div>`).join('')
+    : '<div class="alert-ok">✅ 目前沒有累積到門檻的問題（同標籤 ≥ '+THRESHOLD+' 則、或近 7 天差評 ≥ 3 則會在這裡提醒）</div>';
+
+  const maxc = sorted.length ? sorted[0][1] : 1;
+  document.getElementById('tagbars').innerHTML = sorted.length
+    ? sorted.map(([t,c]) => `<div class="tagbar"><span class="tname">${esc(t)}</span>
+        <div class="bar${c>=THRESHOLD?' hot':''}" style="width:${Math.round(c/maxc*420)}px"></div>
+        <span class="tcnt">${c}</span></div>`).join('')
+    : '<span class="muted">還沒有標籤資料（編輯填回饋時大多沒勾標籤，重點看下方備註）</span>';
+
+  // ── 最新回饋列表 ──
+  document.getElementById('fblist').innerHTML = fb.length ? fb.map(r => {
+    const [lbl,color] = RLBL[r.rating] || ['?', '#9ca3af'];
+    const tags = (r.tags||[]).map(t => `<span class="tagchip">${esc(t)}</span>`).join(' ');
+    return `<div class="fb-item">
+      <div class="fb-head">
+        <span class="chip" style="background:${color}">${lbl}</span>
+        ${tags}
+        <span class="fb-fn">${esc(r.filename)}</span>
+        <span class="fb-ts">${esc((r.timestamp||'').replace('T',' ').slice(0,16))}</span>
+      </div>
+      ${r.comment ? `<div class="fb-cmt">${esc(r.comment)}</div>` : ''}
+    </div>`;
+  }).join('') : '<span class="muted">還沒有任何回饋</span>';
+
+  // ── 產製使用統計（重用 /api/logs）──
+  const logs = await (await fetch('/api/logs?limit=2000')).json();
+  const prods = logs.filter(r => r.type === 'produce' && !r.error && !r.cancelled);
+  const p7 = prods.filter(r => now - new Date(r.timestamp).getTime() < week);
+  const errs = logs.filter(r => r.type === 'produce' && r.error);
+  const avg = prods.length ? Math.round(prods.reduce((s,r) => s+(r.duration_sec||0),0)/prods.length) : 0;
+  const days = new Set(prods.map(r => (r.timestamp||'').slice(0,10))).size || 1;
+  document.getElementById('usage').innerHTML = `
+    <div class="stat"><div class="val">${prods.length}</div><div class="lbl">成功產製（近 2000 筆內）</div></div>
+    <div class="stat"><div class="val">${p7.length}</div><div class="lbl">近 7 天產製</div></div>
+    <div class="stat"><div class="val">${(prods.length/days).toFixed(1)}</div><div class="lbl">平均每日產製</div></div>
+    <div class="stat"><div class="val">${avg}s</div><div class="lbl">平均產製耗時</div></div>
+    <div class="stat bad"><div class="val">${errs.length}</div><div class="lbl">失敗次數</div></div>`;
+}
+load();
+</script>
+</body>
+</html>"""
+
 # ── HTML ─────────────────────────────────────────────────────────────────────
 HTML = """<!doctype html>
 <html lang="zh-TW">
@@ -2142,8 +2288,8 @@ HTML = """<!doctype html>
 html{font-size:17px}
 body{font-family:-apple-system,"Microsoft JhengHei",sans-serif;background:#f3f4f6;color:#111;padding:28px 24px}
 h1{font-size:1.25rem;font-weight:700;margin-bottom:22px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:1000px;margin-left:auto;margin-right:auto}
-.topnav,.backlog-card{max-width:1000px;margin-left:auto;margin-right:auto}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:1240px;margin-left:auto;margin-right:auto}
+.topnav,.backlog-card{max-width:1240px;margin-left:auto;margin-right:auto}
 @media(max-width:700px){.grid{grid-template-columns:1fr}}
 .card{background:#fff;border-radius:10px;padding:22px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
 .card h2{font-size:.9rem;font-weight:600;color:#666;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid #f0f0f0}
@@ -2406,8 +2552,10 @@ textarea{resize:vertical;min-height:210px}
   <h1>🎬 自由短影音產製（內部測試）</h1>
   <a href="/" class="active">產製</a>
   <a href="/gallery">成片庫</a>
-  <a href="/logs">使用記錄</a>
 </div>
+<!-- 管理者入口（回饋儀表板＋使用記錄）：低調但看得到，一般編輯不需要用到 -->
+<a href="/insights" title="" style="position:fixed;top:14px;right:16px;font-size:20px;color:#6b7280;opacity:.6;text-decoration:none;z-index:60"
+   onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=.6">⚙</a>
 
 <!-- 後臺影音清單（LTN 內部系統匯入） -->
 <div class="backlog-card">
@@ -4245,6 +4393,40 @@ def api_logs():
 @app.route('/logs')
 def page_logs():
     return render_template_string(LOGS_HTML)
+
+
+@app.route('/api/fb_insights')
+def api_fb_insights():
+    """回饋儀表板資料：editor_feedback 全部原始列（新到舊），統計/門檻在前端算。
+    這頁是管理者自用（導覽列不放連結），資料照樣只讀不寫。"""
+    items = []
+    if _FEEDBACK_FILE.exists():
+        try:
+            for line in _FEEDBACK_FILE.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("kind") != "editor_feedback":
+                    continue
+                items.append({
+                    "rating":    r.get("rating", 0),
+                    "tags":      r.get("tags") or [],
+                    "comment":   r.get("comment", ""),
+                    "timestamp": r.get("timestamp", ""),
+                    "filename":  r.get("filename", ""),
+                })
+        except Exception:
+            pass
+    items.reverse()   # 新到舊
+    return jsonify(items)
+
+
+@app.route('/insights')
+def page_insights():
+    return render_template_string(INSIGHTS_HTML)
 
 
 def _find_output(filename: str):
