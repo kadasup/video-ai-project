@@ -561,8 +561,11 @@ button.ghost{background:transparent;border:1px solid var(--line);color:var(--tx2
 </style>
 </head>
 <body>
+<!-- 管理者入口（查詢紀錄）：比照產製站，低調齒輪、導覽不放明顯連結，一般編輯不需看到全體查詢字串 -->
+<a href="/insights" title="查詢紀錄" style="position:fixed;top:14px;right:16px;font-size:20px;color:#6b7280;opacity:.6;text-decoration:none;z-index:60"
+   onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=.6">⚙</a>
 <div class="wrap">
-  <h1>🔎 影音語意搜尋 <a href="/insights" style="float:right;font-size:13px;color:var(--ac);text-decoration:none;font-weight:400">📈 查詢紀錄</a></h1>
+  <h1>🔎 影音語意搜尋</h1>
   <div class="sub">來源：input/videos 素材庫（產製短影音下載的素材，每天自動進索引）。可搜：受訪原音逐字稿＋畫面內容（產製時智慧分析過的影片，🎬 標記）</div>
   <div class="bar">
     <input id="q" placeholder="打一句話找片段，例：林榮基講跨境抓人 / 警方攔查機車" autofocus>

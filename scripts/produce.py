@@ -195,13 +195,20 @@ def num2zh(text: str) -> str:
 
     # M/D 日期（如「7/10」）先轉「N月M日」，否則會被 edge-tts 唸成分數
     # （回饋案例：「7/10開放至今」唸錯，2026-07-16）。範圍限 1~12/1~31 避免誤吃真分數。
-    text = re.sub(
-        r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)",
-        lambda m: (f"{m.group(1)}月{m.group(2)}日"
-                   if 1 <= int(m.group(1)) <= 12 and 1 <= int(m.group(2)) <= 31
-                   else m.group(0)),
-        text
-    )
+    # ⚠️ 運動比分（「3/2領先」「終場5:3」）也是 N/N，數值範圍跟日期重疊、純數字無法分辨，
+    # 因此鄰近有比分語境詞（比分/比數/領先/落後/擊敗/勝/敗/得分/終場/戰績…）時不轉日期，
+    # 走一般數字讀法（3/2→三分之二仍不理想，但不會唸成「三月二日」這種明顯錯誤）。
+    _SCORE_KW = ("比數", "比分", "領先", "落後", "擊敗", "戰勝", "終場", "得分",
+                 "分之", "勝出", "淘汰", "晉級", "追平", "逆轉")
+    def _md(m: re.Match) -> str:
+        a, b = int(m.group(1)), int(m.group(2))
+        if not (1 <= a <= 12 and 1 <= b <= 31):
+            return m.group(0)
+        near = text[max(0, m.start() - 8): m.end() + 8]
+        if any(k in near for k in _SCORE_KW):
+            return m.group(0)   # 比分語境，不當日期
+        return f"{a}月{b}日"
+    text = re.sub(r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)", _md, text)
     text = re.sub(r"(?<=\d),(?=\d)", "", text)   # 千分位逗號先拿掉（1,200 → 1200），否則會唸成「一,兩百」
     # 頓號夾在單一數字中間是約略區間慣用語（「1、2千噸」讀作「一兩千噸」，不是列舉停頓），
     # 直接轉成中文數字詞組（先轉完，下面的通用數字轉換就不會再吃到這裡，也不會誤併成 12）
@@ -1721,7 +1728,14 @@ def _crop_scale(subject_pos: str = "", crop_factor: float | None = None) -> str:
         factor = min(1.0, max(0.0, float(crop_factor)))
     else:
         factor = {"左": 0.2, "右": 0.8}.get((subject_pos or "").strip(), 0.5)
-    return f"crop=ih*9/16:ih:(iw-ih*9/16)*{factor}:0,scale={W}:{H}"
+    # 裁切區塊夾在來源尺寸內：橫式(比9:16寬)裁寬、直式(比9:16高)裁高，兩者都取最大的 9:16。
+    # 原本寫死 crop=ih*9/16 假設來源都比 9:16 寬；遇到比 9:16 更高的直式手機素材
+    # （如 1080×2400）ih*9/16=1350>iw 會超出畫面讓 ffmpeg crop 直接失敗、殺掉整支產製。
+    # ⚠️ min() 內的逗號在濾鏡圖裡是濾鏡分隔符，要跳脫成 \, 否則 ffmpeg 報 Filter not found。
+    cw = r"min(iw\,ih*9/16)"
+    ch = r"min(ih\,iw*16/9)"
+    # 水平依主體位置偏移；垂直無主體資訊、取正中
+    return (f"crop={cw}:{ch}:(iw-{cw})*{factor}:(ih-{ch})/2,scale={W}:{H}")
 
 
 def _assemble_main(plan: list[dict], audio_out: Path, sub_f: str, out: Path,

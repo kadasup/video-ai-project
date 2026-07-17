@@ -10,13 +10,29 @@ LTN 內部 API 串接：後臺影音清單、文章內容 → 匯入 VideoAI 自
 另含：影片長度探測（ffprobe over HTTP）＋快取，供「素材夠不夠做 60 秒」預判。
 """
 import json
+import os
 import re
+import shutil
 import subprocess
 import threading
 import urllib.request
 from pathlib import Path
 
 from produce import BASE, _ffprobe_exe
+
+
+def _download_atomic(url: str, dest: Path, timeout: int, headers: dict):
+    """串流下載到 <dest>.part 完成後才原子改名成 dest，避免中斷留半檔被下次
+    exists() 誤判為已完成（後續轉譯/探測會讀到壞檔）；分塊寫入也避免大檔整檔載入記憶體。"""
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp, tmp.open("wb") as f:
+            shutil.copyfileobj(resp, f, length=1 << 20)   # 1MB 一塊
+        os.replace(tmp, dest)                              # 同碟原子改名
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)                    # 失敗殘檔清掉
 
 INPUT = BASE / "input"
 PROBE_CACHE = BASE / "logs" / "probe_cache.json"
@@ -177,9 +193,7 @@ def download_photo(url: str, article_no: str, idx: int = 1) -> str:
     dest = photo_dir / (f"photo-{article_no}{ext}" if idx == 1
                         else f"photo-{article_no}-{idx}{ext}")
     if not dest.exists():
-        req = urllib.request.Request(url, headers=_UA)
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            dest.write_bytes(resp.read())
+        _download_atomic(url, dest, timeout=60, headers=_UA)
     return str(dest)
 
 
@@ -190,9 +204,7 @@ def download_video(url: str) -> str:
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / name
     if not dest.exists():
-        req = urllib.request.Request(url, headers=_UA)
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            dest.write_bytes(resp.read())
+        _download_atomic(url, dest, timeout=120, headers=_UA)
     return str(dest)
 
 
@@ -210,7 +222,8 @@ def _load_probe_cache() -> dict:
 def probe_durations(urls: list[str]) -> dict:
     """
     ffprobe over HTTP 探測遠端影片長度（內網 LAN 很快），URL→秒數，有快取。
-    探不到（timeout/壞檔）的回 -1，快取也記 -1 避免重複嘗試。
+    探不到（timeout/壞檔）回 -1，但**不寫入快取**——探測失敗常是一次性網路/timeout，
+    寫死 -1 會讓明明夠長的素材永久被判「素材不足」，下次應重探而非沿用失敗值。
     """
     with _probe_lock:
         cache = _load_probe_cache()
@@ -230,9 +243,10 @@ def probe_durations(urls: list[str]) -> dict:
                 dur = round(float(r.stdout.strip()), 1)
         except Exception:
             pass
-        cache[url] = dur
         result[url] = dur
-        dirty = True
+        if dur >= 0:                 # 只快取成功探測；-1 失敗不寫、下次重探
+            cache[url] = dur
+            dirty = True
     if dirty:
         with _probe_lock:
             merged = {**_load_probe_cache(), **cache}

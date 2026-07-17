@@ -357,13 +357,16 @@ def run_index(progress=None) -> dict:
             tr = speech.transcribe(f)          # 有快取：產製轉過的直接命中
             chunks = chunk_transcript(tr.get("segments", []))
             title = titles.get(f.name, "")
-            status = "ok" if chunks else "no_speech"
 
             raw_texts = [c["text"] for c in chunks]
             texts = _correct_texts(f, raw_texts)   # GPT 校正錯字（有快取）
             if title:   # 標題也做成一個可檢索片段（涵蓋整支影片）
                 texts = texts + [title]
             embs = _embed_or_none(texts) if texts else []
+            # 有文字卻整批拿不到向量＝暫時性向量 API 失敗：標 partial 讓下次重建重試，
+            # 不要標 ok 被永久略過而凍在「只有關鍵字、無語意搜尋」狀態（B9）。
+            emb_failed = bool(texts) and not any(e is not None for e in embs)
+            status = "partial" if emb_failed else ("ok" if chunks else "no_speech")
 
             cur = con.cursor()
             if row:
