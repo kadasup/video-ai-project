@@ -14,6 +14,7 @@ import json
 import re
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_file
@@ -24,6 +25,43 @@ from indexer import BASE, DB_FILE, SEARCH_DIR, unpack_vec
 THUMB_DIR = SEARCH_DIR / "thumbs"
 CLIPS_DIR = SEARCH_DIR / "clips"
 QUERY_LOG = SEARCH_DIR / "query_log.jsonl"
+
+# 縮圖/片段快取上限（MB）：兩個目錄依 md5 只增不減，長期會塞爆資料碟（媒體檔已 5GB+），
+# 超過上限就從「最久沒被存取」的開始刪（LRU 近似：取 atime/mtime 較新者當最後使用時間）
+_CACHE_CAPS = [(THUMB_DIR, 500), (CLIPS_DIR, 2000)]
+
+
+def _prune_cache_dirs():
+    for d, cap_mb in _CACHE_CAPS:
+        try:
+            if not d.exists():
+                continue
+            files = [(f, f.stat()) for f in d.iterdir() if f.is_file()]
+            total = sum(st.st_size for _, st in files)
+            cap = cap_mb * 1024 * 1024
+            if total <= cap:
+                continue
+            files.sort(key=lambda x: max(x[1].st_atime, x[1].st_mtime))  # 最舊在前
+            removed = 0
+            for f, st in files:
+                if total <= cap * 0.8:      # 刪到 8 成滿為止，避免每次都在邊界打轉
+                    break
+                try:
+                    f.unlink()
+                    total -= st.st_size
+                    removed += 1
+                except OSError:
+                    pass
+            if removed:
+                print(f"[cache] {d.name} 清出 {removed} 個舊快取檔（上限 {cap_mb}MB）")
+        except Exception as e:
+            print(f"[cache] 清理 {d} 失敗：{e}")
+
+
+def _cache_prune_loop():
+    while True:
+        _prune_cache_dirs()
+        time.sleep(24 * 3600)   # 啟動先清一次，之後每天清一次
 PORT = 5001
 
 _qlog_lock = threading.Lock()
@@ -689,5 +727,6 @@ def home():
 
 if __name__ == "__main__":
     indexer._load_env()
+    threading.Thread(target=_cache_prune_loop, daemon=True).start()   # 縮圖/片段快取每日清理
     print(f"影音語意搜尋 → http://localhost:{PORT}/")
     app.run(host="0.0.0.0", port=PORT, threaded=True)

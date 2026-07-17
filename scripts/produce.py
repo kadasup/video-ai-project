@@ -2024,10 +2024,13 @@ def main():
     print("⑦ 串接輸出...")
     concat([intro, main_clip, outro], out_path)
 
-    # 清暫存
-    for f in TMP.iterdir():
+    # 清暫存：只刪「這次 CLI 產製自己會產出的檔名」，不整個 TMP 掃掉——
+    # 整目錄清空會誤刪同時在跑的伺服器產製（app.py）正在用的暫存檔（B4）
+    _own = ("intro.mp4", "main.mp4", "audio.aac", "outro.mp4", "outro_bgm.aac",
+            "outro_muxed.mp4", "concat.txt", "narration.mp3", "subtitles.ass")
+    for name in _own:
         try:
-            f.unlink()
+            (TMP / name).unlink(missing_ok=True)
         except Exception:
             pass
 

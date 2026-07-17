@@ -4706,8 +4706,29 @@ def page_gallery():
     return render_template_string(GALLERY_HTML)
 
 
+def _prune_stale_tmp(days: int = 2):
+    """啟動時清 TMP 裡放超過 N 天的陳舊暫存檔（草稿/照片段/字卡…用完常沒人收），
+    只在啟動時做——此刻必定沒有產製在跑，不會誤刪使用中的檔案（B4 配套）。"""
+    import time as _t
+    cutoff = _t.time() - days * 86400
+    n = 0
+    try:
+        for f in TMP.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    n += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    if n:
+        print(f"[tmp] 清出 {n} 個超過 {days} 天的暫存檔")
+
+
 if __name__ == '__main__':
     print("[VideoAI] Starting on http://localhost:5000")
+    _prune_stale_tmp()
     # threaded=True：後臺清單/文章/影片下載這幾個新端點是同步處理，
     # 沒有這個參數整台伺服器只能一次處理一個請求，下載影片時會卡住其他所有請求
     # （含正在跑的產製工作的 /api/status 輪詢）
