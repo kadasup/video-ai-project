@@ -391,32 +391,48 @@ INSIGHTS_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>查詢紀錄 — 影音語意搜尋</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+TC:wght@400;500;700;900&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0f1420;--card:#1a2332;--line:#2a3650;--tx:#e8edf6;--tx2:#8fa1bd;--ac:#4da3ff}
+:root{--bg:#f4f5f7;--surface:#fff;--surface2:#f7f8fa;--accentsoft:#eaf0fc;
+  --card:#fff;--line:#e2e6eb;--tx:#1b2130;--tx2:#7a8494;--ac:#2b5cc9;
+  --mono:'IBM Plex Mono',ui-monospace,monospace}
+:root[data-theme="dark"]{--bg:#0f131b;--surface:#1a2130;--surface2:#151b27;--accentsoft:#1b2740;
+  --card:#1a2130;--line:#2a3346;--tx:#e8edf6;--tx2:#8a94a6;--ac:#5b8bff}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--tx);font:14.5px/1.65 "Microsoft JhengHei",system-ui,sans-serif}
+body{background:var(--bg);color:var(--tx);font:14.5px/1.65 'IBM Plex Sans','Noto Sans TC',"Microsoft JhengHei",system-ui,sans-serif;transition:background .2s,color .2s}
+::selection{background:#ffd24a;color:#111}
 .wrap{max-width:980px;margin:0 auto;padding:24px 16px 80px}
-h1{font-size:20px;margin-bottom:2px}
+h1{font-size:20px;margin-bottom:2px;color:var(--tx)}
 a{color:var(--ac);text-decoration:none}
 .sub{color:var(--tx2);font-size:12.5px;margin-bottom:18px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 @media(max-width:760px){.grid{grid-template-columns:1fr}}
 .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
-.panel h2{font-size:15px;margin-bottom:10px}
+.panel h2{font-size:15px;margin-bottom:10px;color:var(--tx)}
 .panel.full{grid-column:1/-1}
 table{width:100%;border-collapse:collapse;font-size:13px}
-td,th{padding:5px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+td,th{padding:5px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;color:var(--tx)}
 th{color:var(--tx2);font-weight:400;font-size:12px}
 .n0{color:#f87171;font-weight:700}
-.badge{display:inline-block;background:#233046;color:var(--ac);border-radius:5px;font-size:11.5px;padding:0 7px}
+.badge{display:inline-block;background:var(--accentsoft);color:var(--ac);border-radius:5px;font-size:11.5px;padding:0 7px}
 .stats{display:flex;gap:20px;margin-bottom:16px;color:var(--tx2);font-size:13px}
-.stats b{color:var(--tx);font-size:20px;display:block}
+.stats b{color:var(--tx);font-size:20px;display:block;font-family:var(--mono)}
 .empty{color:var(--tx2);padding:12px 0}
+.tb-icon{width:32px;height:32px;border-radius:8px;border:1px solid var(--line);background:var(--surface);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;font-size:15px;color:var(--tx2);vertical-align:middle;margin-left:10px}
+.tb-icon:hover{background:var(--surface2)}
 </style>
 </head>
 <body>
+<script>
+(function(){var t=localStorage.getItem('vai-theme');if(t==='dark')document.documentElement.setAttribute('data-theme','dark');})();
+function toggleTheme(){var d=document.documentElement,on=d.getAttribute('data-theme')==='dark';
+  if(on){d.removeAttribute('data-theme');localStorage.setItem('vai-theme','light');}
+  else{d.setAttribute('data-theme','dark');localStorage.setItem('vai-theme','dark');}}
+</script>
 <div class="wrap">
-  <h1>📈 查詢紀錄</h1>
+  <h1>📈 查詢紀錄 <span class="tb-icon" title="切換深/淺色" onclick="toggleTheme()">🌓</span></h1>
   <div class="sub"><a href="/">← 回搜尋</a>　「搜了沒中」清單會自動累積，是之後開視覺標註（M2）時決定標什麼的依據</div>
   <div class="stats" id="stats"></div>
   <div class="grid">
@@ -553,10 +569,35 @@ HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>影音語意搜尋 — VideoAI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+TC:wght@400;500;700;900&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0f1420;--card:#1a2332;--line:#2a3650;--tx:#e8edf6;--tx2:#8fa1bd;--ac:#4da3ff;--mk:#ffd54d}
+/* 統一設計系統：淺色預設＋深色切換（保留原有 --card/--line/--tx… 變數名，重新映射到設計 tokens） */
+:root{
+  --bg:#f4f5f7;--surface:#fff;--surface2:#f7f8fa;--border2:#eceef1;--accentsoft:#eaf0fc;
+  --card:#fff;--line:#e2e6eb;--tx:#1b2130;--tx2:#7a8494;--ac:#2b5cc9;--mk:#ffd54d;
+  --mono:'IBM Plex Mono',ui-monospace,monospace;
+}
+:root[data-theme="dark"]{
+  --bg:#0f131b;--surface:#1a2130;--surface2:#151b27;--border2:#232b3a;--accentsoft:#1b2740;
+  --card:#1a2130;--line:#2a3346;--tx:#e8edf6;--tx2:#8a94a6;--ac:#5b8bff;--mk:#ffd54d;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--tx);font:15px/1.65 "Microsoft JhengHei",system-ui,sans-serif}
+body{background:var(--bg);color:var(--tx);font:15px/1.65 'IBM Plex Sans','Noto Sans TC',"Microsoft JhengHei",system-ui,sans-serif;transition:background .2s,color .2s}
+::selection{background:#ffd24a;color:#111}
+/* 頂部工具列（設計版） */
+.topbar{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:20px;height:56px;
+  padding:0 20px;background:var(--surface);border-bottom:1px solid var(--line)}
+.tb-brand{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:700;color:var(--tx)}
+.tb-logo{width:26px;height:26px;border-radius:7px;background:var(--tx);color:var(--surface);display:flex;align-items:center;justify-content:center;font:700 14px/1 var(--mono)}
+.tb-nav{display:flex;gap:2px;margin-left:4px}
+.tb-nav a{font-size:.86rem;font-weight:600;color:var(--tx2);padding:8px 12px;border-bottom:2px solid transparent;text-decoration:none;white-space:nowrap}
+.tb-nav a:hover{color:var(--tx)}
+.tb-nav a.active{color:var(--ac);border-bottom-color:var(--ac)}
+.tb-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.tb-icon{width:32px;height:32px;border-radius:8px;border:1px solid var(--line);background:var(--surface);display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:15px;color:var(--tx2);text-decoration:none}
+.tb-icon:hover{background:var(--surface2)}
 .wrap{max-width:980px;margin:0 auto;padding:24px 16px 80px}
 h1{font-size:22px;margin-bottom:4px}
 .sub{color:var(--tx2);font-size:13px;margin-bottom:18px}
@@ -583,9 +624,9 @@ button.ghost{background:transparent;border:1px solid var(--line);color:var(--tx2
 .card img{width:170px;height:96px;object-fit:cover;border-radius:8px;background:#000;flex:none}
 .card .tt{font-weight:700;font-size:15px;margin-bottom:2px}
 .card .fn{color:var(--tx2);font-size:12px;margin-bottom:6px;word-break:break-all}
-.card .tm{display:inline-block;background:#233046;color:var(--ac);border-radius:6px;
+.card .tm{display:inline-block;background:var(--accentsoft);color:var(--ac);border-radius:6px;
   font-size:12.5px;padding:1px 8px;margin-bottom:6px}
-.card .tx{font-size:13.5px;color:#c6d2e6}
+.card .tx{font-size:13.5px;color:var(--tx2)}
 .card .tx mark{background:var(--mk);color:#1a1400;border-radius:3px;padding:0 2px}
 .badge{display:inline-block;font-size:11px;color:var(--tx2);border:1px solid var(--line);
   border-radius:5px;padding:0 6px;margin-left:6px}
@@ -599,9 +640,28 @@ button.ghost{background:transparent;border:1px solid var(--line);color:var(--tx2
 </style>
 </head>
 <body>
-<!-- 管理者入口（查詢紀錄）：比照產製站，低調齒輪、導覽不放明顯連結，一般編輯不需看到全體查詢字串 -->
-<a href="/insights" title="查詢紀錄" style="position:fixed;top:14px;right:16px;font-size:20px;color:#6b7280;opacity:.6;text-decoration:none;z-index:60"
-   onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=.6">⚙</a>
+<div class="topbar">
+  <div class="tb-brand"><span class="tb-logo">V</span>Video AI 工作台</div>
+  <div class="tb-nav">
+    <a id="nav-produce" href="/">產製</a>
+    <a id="nav-gallery" href="/">成片庫</a>
+    <a href="/" class="active">語意搜尋</a>
+  </div>
+  <div class="tb-right">
+    <span class="tb-icon" id="theme-btn" title="切換深/淺色" onclick="toggleTheme()">🌓</span>
+    <a class="tb-icon" href="/insights" title="查詢紀錄" aria-label="查詢紀錄">⚙</a>
+  </div>
+</div>
+<script>
+(function(){var t=localStorage.getItem('vai-theme');if(t==='dark')document.documentElement.setAttribute('data-theme','dark');})();
+function toggleTheme(){var d=document.documentElement,on=d.getAttribute('data-theme')==='dark';
+  if(on){d.removeAttribute('data-theme');localStorage.setItem('vai-theme','light');}
+  else{d.setAttribute('data-theme','dark');localStorage.setItem('vai-theme','dark');}}
+document.addEventListener('DOMContentLoaded',function(){
+  var base=location.protocol+'//'+location.hostname+':5000/';
+  var p=document.getElementById('nav-produce'),g=document.getElementById('nav-gallery');
+  if(p)p.href=base;if(g)g.href=base+'gallery';});
+</script>
 <div class="wrap">
   <h1>🔎 影音語意搜尋</h1>
   <div class="sub">來源：input/videos 素材庫（產製短影音下載的素材，每天自動進索引）。可搜：受訪原音逐字稿＋畫面內容（產製時智慧分析過的影片，🎬 標記）</div>
