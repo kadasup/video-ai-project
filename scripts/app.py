@@ -406,18 +406,20 @@ def _merge_tiny_plan_entries(plan: list) -> list:
 FACE_MODEL = BASE / "assets" / "face_detection_yunet.onnx"
 
 
-def _sot_face_factor(video_path, start, dur):
+def _face_factor(video_path, start, dur, require_dominant=False):
     """
-    SOT 臉部置中：抓受訪片段中點一格，用 YuNet 偵測最大的臉，算出讓臉落在
-    9:16 直式裁切正中的水平偏移 factor（0~1）。缺模型/抓不到臉→回 None，
-    呼叫端退回正中 0.5（比粗略的左/右裁切保險）。
+    臉部置中：抓片段中點一格，用 YuNet 偵測最大的臉，算出讓臉落在 9:16 直式裁切
+    正中的水平偏移 factor（0~1）。缺模型/抓不到臉→回 None。
+    require_dominant=True（給非受訪的一般畫面用）：只在「有一張明顯主臉」時才回值——
+    主臉要夠大（寬 ≥ 畫面 8%）且明顯大於第二張臉（面積 ≥ 1.6 倍），避免背景群眾的
+    小臉亂置中；不夠明顯就回 None，讓呼叫端沿用 GPT 的粗略左/中/右判斷。
     """
     if not FACE_MODEL.exists():
         return None
     try:
         import cv2
         from produce import ff
-        frame = TMP / f"_sot_face_{uuid.uuid4().hex[:8]}.jpg"
+        frame = TMP / f"_face_{uuid.uuid4().hex[:8]}.jpg"
         t = float(start or 0) + float(dur or 0) / 2
         ff("-ss", f"{t}", "-i", str(video_path), "-frames:v", "1", "-q:v", "3", frame)
         img = cv2.imread(str(frame))
@@ -433,7 +435,16 @@ def _sot_face_factor(video_path, start, dur):
         _n, faces = det.detect(img)
         if faces is None or len(faces) == 0:
             return None
-        f = max(faces, key=lambda b: float(b[2]) * float(b[3]))   # 面積最大的臉
+        ordered = sorted(faces, key=lambda b: float(b[2]) * float(b[3]), reverse=True)
+        f = ordered[0]
+        if require_dominant:
+            if float(f[2]) < 0.08 * w:            # 主臉太小（多半是背景路人）
+                return None
+            if len(ordered) > 1:
+                a1 = float(f[2]) * float(f[3])
+                a2 = float(ordered[1][2]) * float(ordered[1][3])
+                if a2 > 0 and a1 / a2 < 1.6:       # 有兩張差不多大的臉 → 不確定主體是誰
+                    return None
         face_cx = float(f[0]) + float(f[2]) / 2.0                 # 臉中心 x（像素）
         cw = h * 9.0 / 16.0                                       # 直式裁切窗寬（保留全高）
         if w <= cw:
@@ -457,9 +468,15 @@ def _enrich_subject_pos(plan: list, catalogs: list) -> None:
         if not e.get('path'):
             continue
         if str(e.get('why', '')).startswith('🎤'):
-            # SOT 受訪段：臉部置中優先，抓不到臉就正中（0.5）
-            f = _sot_face_factor(e['path'], e.get('start', 0), e.get('dur', 0))
+            # SOT 受訪段：臉部置中優先（任何臉），抓不到臉就正中（0.5）
+            f = _face_factor(e['path'], e.get('start', 0), e.get('dur', 0))
             e['crop_factor'] = f if f is not None else 0.5
+            continue
+        # 一般段：先試「明顯主臉」置中（官員/當事人常在畫面某一側，粗略左/中/右會裁掉），
+        # 有明顯主臉才用精算 factor，否則沿用 GPT 的 subject_pos（災害/車流等無臉場景照舊）
+        df = _face_factor(e['path'], e.get('start', 0), e.get('dur', 0), require_dominant=True)
+        if df is not None:
+            e['crop_factor'] = df
             continue
         segs = seg_map.get(str(e['path']))
         if not segs:
@@ -642,6 +659,15 @@ def _fallback_sot(transcripts: list, catalogs: list, narration: str, article: st
     if not after:
         after = max(1, round(len(sents) * 0.4))
     vi = best['vi']
+    st, en = best['st'], best['en']
+    # 逐字時間戳（相對音檔起點 st）→ 字幕逐字精算，跟 GPT 排的 SOT 同樣待遇
+    sot_words = [
+        {'start': round(max(0.0, w['start'] - st), 2),
+         'end': round(min(en - st, w['end'] - st), 2)}
+        for seg in (transcripts[vi].get('segments') or [])
+        for w in (seg.get('words') or [])
+        if st <= w['start'] < en and w['end'] > w['start']
+    ]
     # 校正字幕＋從原稿判斷發言者，補姓名字卡（失敗就用原始逐字稿、不掛名條）
     display, spk_name, spk_title = best['text'].strip(), '', ''
     try:
@@ -651,9 +677,9 @@ def _fallback_sot(transcripts: list, catalogs: list, narration: str, article: st
         spk_title = (ref.get('speaker_title') or '').strip()
     except Exception:
         pass
-    return {'path': catalogs[vi]['path'], 'start': round(best['st'], 2),
-            'dur': round(best['en'] - best['st'], 2),
-            'display': display, 'after_sentence': after,
+    return {'path': catalogs[vi]['path'], 'start': round(st, 2),
+            'dur': round(en - st, 2),
+            'display': display, 'words': sot_words, 'after_sentence': after,
             'label': f"V{vi + 1}", 'spk_name': spk_name, 'spk_title': spk_title,
             'speaker': ('｜'.join(x for x in (spk_name, spk_title) if x)),
             'auto': True}
@@ -867,8 +893,15 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                         _disp = _disp + _tail
                     else:
                         _disp = _disp + '，' + _tail
+                # 逐字時間戳（相對 SOT 音檔起點 st）：供字幕逐字精算，反映真實語速與停頓
+                sot_words = [
+                    {'start': round(max(0.0, w['start'] - st), 2),
+                     'end': round(min(dur_s, w['end'] - st), 2)}
+                    for seg in _spansegs for w in (seg.get('words') or [])
+                    if st <= w['start'] < en and w['end'] > w['start']
+                ]
                 cand = {'path': catalogs[vi]['path'], 'start': st, 'dur': dur_s,
-                        'display': _disp,
+                        'display': _disp, 'words': sot_words,
                         'after_sentence': int(s0.get('after_sentence', 0) or 0),
                         'label': f"V{vi+1}",
                         # 受訪者名條：GPT 只在能明確判斷發言者時才給（掛錯人是事故）
@@ -972,6 +1005,22 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                       + "，請在分鏡確認時核對旁白")
             _job['warning'] = ((_job.get('warning') + '\n' + fc_msg)
                                if _job.get('warning') else fc_msg)
+
+        # 資訊卡數字方向反查：數字卡（stat/chart）疊在畫面上是強視覺、講反就是螢幕上的
+        # 事實錯誤（回饋：0.5ppm 標成盧秀燕反對值，實為她主張維持值）。方向錯就撤卡不顯示。
+        _cardv = script.get('card')
+        if isinstance(_cardv, dict) and _cardv.get('type') in ('stat', 'chart'):
+            try:
+                from produce import verify_card
+                ok, why, cv_tok = verify_card(_cardv, article)
+                _add_tokens(cv_tok)
+                if not ok:
+                    script['card'] = None
+                    cw = f"⚠️ 資訊卡數字方向反查未過，已撤除該卡：{why or '與原稿方向不符'}"
+                    _job['warning'] = ((_job.get('warning') + '\n' + cw)
+                                       if _job.get('warning') else cw)
+            except Exception:
+                pass   # 反查失敗不擋產製，維持原卡
 
         # 譯名核實：旁白裡的外國譯名 vs 報社音譯總表（同事維護的 4600 筆 Google Sheet）
         translit_results = []
@@ -1148,7 +1197,8 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                 ni += 1
             else:
                 s = it['sot']
-                subtitles += build_sot_subtitles(s['display'], t_axis, s['dur'])
+                subtitles += build_sot_subtitles(s['display'], t_axis, s['dur'],
+                                                 words=s.get('words'))
                 if s.get('speaker'):   # 受訪者名條圖卡：原音開始 0.3 秒後進、最多掛 5 秒
                     try:
                         from produce import make_strap_png

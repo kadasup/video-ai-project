@@ -746,6 +746,50 @@ def extract_card(narration: str) -> tuple[dict | None, dict]:
     return None, usage
 
 
+def verify_card(card: dict, article: str) -> tuple[bool, str, dict]:
+    """資訊卡數字方向反查：把卡片的數字＋說明丟回原稿，確認沒有「把主張講反、
+    數字對應錯對象、單位/主體錯置」（回饋案例：卡片寫『0.5ppm 盧秀燕反對』，
+    但她其實是反對放寬到 3ppm、要維持 0.5ppm——方向整個相反）。
+    回 (ok, reason, tokens)；ok=False 代表卡片誤導，呼叫端應撤掉不顯示。
+    只驗有數字的卡（stat/chart）；timeline/alert 無此風險直接放行。"""
+    if card.get("type") not in ("stat", "chart"):
+        return True, "", {}
+    if card.get("type") == "stat":
+        desc = (f'數字={card.get("value","")}{card.get("unit","")}，'
+                f'標籤=「{card.get("label","")}」，備註=「{card.get("note","")}」')
+    else:
+        pts = "、".join(f'{p.get("label","")}={p.get("value","")}'
+                       for p in (card.get("points") or []))
+        desc = f'標題=「{card.get("title","")}」，單位={card.get("unit","")}，數據點：{pts}'
+    prompt = (
+        "你是新聞事實查核員。以下『數字資訊卡』會單獨放大疊在新聞影音上（觀眾只看到卡片、"
+        "看不到完整旁白）。請站在觀眾角度判斷：只看這張卡，會不會對事實方向產生**錯誤或相反**"
+        "的理解？只要「有可能讓觀眾誤會」就算不通過，標準從嚴。\n"
+        "常見誤導：①把當事人『反對/要求維持』的值，跟他『反對放寬到』的值搞混（是相反的兩個數字）"
+        "②數字配錯對象或主體 ③單位/正負/增減方向錯置。\n"
+        "範例：原稿是『盧秀燕反對放寬到3ppm、主張維持0.5ppm』，卡片若寫『0.5ppm｜盧秀燕反對』"
+        "→ 觀眾會誤以為她反對0.5ppm（其實相反）→ 不通過。應寫成她反對的目標值3ppm。\n\n"
+        f"資訊卡：{desc}\n\n原稿：{article}\n\n"
+        '只回 JSON：{"ok": true/false, "reason": "不通過時一句話說觀眾會怎麼誤解；通過就留空"}'
+    )
+    try:
+        resp = _client().chat.completions.create(
+            model=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2"),
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_completion_tokens=300,
+        )
+        d = json.loads(resp.choices[0].message.content)
+        usage = {}
+        if resp.usage:
+            usage = {"prompt_tokens": resp.usage.prompt_tokens,
+                     "completion_tokens": resp.usage.completion_tokens,
+                     "total_tokens": resp.usage.total_tokens}
+        return bool(d.get("ok", True)), str(d.get("reason", "")).strip(), usage
+    except Exception:
+        return True, "", {}   # 查核本身失敗不擋卡片（保守：維持原行為）
+
+
 def factcheck_narration(article: str, narration: str) -> tuple[list[dict], list[dict], dict]:
     """
     查核 Agent：把 AI 改寫的旁白逐項比對記者原稿，抓「改寫過程改錯的關鍵事實」。
@@ -961,20 +1005,49 @@ def shift_subtitles(subtitles: list, offset_sec: float) -> list:
             for s in subtitles]
 
 
-def build_sot_subtitles(display_text: str, start_sec: float, dur_sec: float) -> list:
+def build_sot_subtitles(display_text: str, start_sec: float, dur_sec: float,
+                        words: list | None = None) -> list:
     """
-    SOT（受訪原音）段的字幕：display_text 是 GPT 校正過的引句，
-    照標點切段後按字數比例分配到 [start_sec, start_sec+dur_sec] 區間。
-    （精度 ±0.5 秒等級，對受訪字幕夠用；旁白字幕仍走逐字精算不受影響）
+    SOT（受訪原音）段的字幕：display_text 是 GPT 校正過的引句，照標點切段。
+
+    words 有給（Whisper 逐字時間戳，相對 SOT 音檔起點的秒數）時走**逐字精算**：
+    依字數比例把 word 序列分配給各字幕塊，每塊的起訖用該段實際 word 時間——
+    自動反映真實語速與停頓（回饋：「字幕和說話語速沒有對上、有漏字幕」）。
+    沒給 words 才退回舊的等比分配（±0.5 秒）。
     """
     chunks = _chunk_narration(display_text)
     total_chars = sum(len(c) for c in chunks) or 1
+    end_cap = start_sec + dur_sec
+
+    if words and len(words) >= 2:
+        subs = []
+        nw = len(words)
+        wi = 0
+        chars_done = 0
+        for i, c in enumerate(chunks):
+            chars_done += len(c)
+            # 這塊對映到的 word 結束索引（依 display 字數比例），至少含一個 word
+            target = max(wi + 1, min(nw, round(chars_done / total_chars * nw)))
+            seg_w = words[wi:target] or [words[min(wi, nw - 1)]]
+            t0 = start_sec + float(seg_w[0]["start"])
+            t1 = start_sec + float(seg_w[-1]["end"])
+            # 保底：起訖夾在 SOT 區間內、且 end 不早於 start
+            t0 = min(max(t0, start_sec), end_cap)
+            t1 = min(max(t1, t0 + 0.2), end_cap)
+            subs.append({"index": i + 1, "start": _sec_to_ts(t0),
+                         "end": _sec_to_ts(t1), "text": c})
+            wi = target if target > wi else wi + 1
+            if wi >= nw:
+                wi = nw - 1
+        return subs
+
+    # 無逐字時間戳 → 等比分配（舊行為）
     subs, t = [], start_sec
     for i, c in enumerate(chunks):
         d = dur_sec * len(c) / total_chars
         subs.append({"index": i + 1,
                      "start": _sec_to_ts(t),
-                     "end": _sec_to_ts(min(t + d, start_sec + dur_sec)),
+                     "end": _sec_to_ts(min(t + d, end_cap)),
                      "text": c})
         t += d
     return subs
