@@ -2590,6 +2590,14 @@ textarea{resize:vertical;min-height:210px}
 }
 .btn:hover{filter:brightness(1.07)}
 .btn:disabled{opacity:.5;cursor:not-allowed;filter:none}
+/* 產製中：按鈕文字改「產製中，請稍後」＋轉圈小動畫，讓編輯一眼知道系統在忙 */
+.btn.busy{opacity:.75;cursor:wait}
+.btn .spin{
+  display:inline-block;width:14px;height:14px;margin-right:8px;vertical-align:-2px;
+  border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;
+  animation:btnspin .8s linear infinite
+}
+@keyframes btnspin{to{transform:rotate(360deg)}}
 
 /* 步驟列表 */
 .steps{list-style:none}
@@ -3046,13 +3054,21 @@ document.addEventListener('DOMContentLoaded',function(){
 <script>
 let timer = null;
 
+// 產製按鈕忙碌狀態：文字改「產製中，請稍後」＋轉圈動畫；結束還原「開始產製」
+function setBtnBusy(on) {
+  const b = document.getElementById('btn');
+  b.disabled = on;
+  b.classList.toggle('busy', on);
+  b.innerHTML = on ? '<span class="spin"></span>產製中，請稍後' : '開始產製';
+}
+
 async function startJob() {
   const art = document.getElementById('article').value.trim();
   if (!art) { toast('請填入新聞稿'); return; }
 
   saveLastSettings();
   resetUI();
-  document.getElementById('btn').disabled = true;
+  setBtnBusy(true);
 
   const videos = videoList.map(v => ({path: v.path, start: v.start}));
 
@@ -3069,13 +3085,13 @@ async function startJob() {
       })
     });
     const d = await r.json();
-    if (d.error) { showErr(d.error); document.getElementById('btn').disabled = false; return; }
+    if (d.error) { showErr(d.error); setBtnBusy(false); return; }
     timer = setInterval(poll, 1000);
     // 開始產製後自動捲到「產製進度」，讓編輯直接看到進度不用自己找
     document.getElementById('progress-card').scrollIntoView({behavior:'smooth', block:'start'});
   } catch(e) {
     showErr(e.message);
-    document.getElementById('btn').disabled = false;
+    setBtnBusy(false);
   }
 }
 
@@ -3130,7 +3146,7 @@ async function poll() {
     }
     if (d.done) {
       clearInterval(timer);
-      document.getElementById('btn').disabled = false;
+      setBtnBusy(false);
       handleJobDone(d);
     }
   } catch(_) {
@@ -3557,7 +3573,7 @@ async function resumeIfRunning() {
   try {
     const d = await (await fetch('/api/status')).json();
     if (!d.done) {
-      document.getElementById('btn').disabled = true;
+      setBtnBusy(true);   // 重整頁面回來、產製還在跑 → 按鈕同樣顯示產製中
       syncInputsFromJob(d);
       renderSteps(d);
       timer = setInterval(poll, 1000);
