@@ -509,6 +509,30 @@ def _absorb_slivers(plan: list, min_dur: float = 0.25) -> list:
     return out
 
 
+def _narr_for_plan(plan: list, subtitles: list) -> list:
+    """為每段 plan 算出它時間窗內出現的旁白/字幕文字（成片明細用，讓編輯對照
+    「這段畫面配的是哪句旁白」）。plan 依序累加時長得到各段時間窗，收集與其重疊的字幕。"""
+    from produce import _ts_to_sec
+    subs = []
+    for s in (subtitles or []):
+        try:
+            subs.append((_ts_to_sec(s['start']), _ts_to_sec(s['end']), (s.get('text') or '')))
+        except Exception:
+            continue
+    out, at = [], 0.0
+    for e in plan:
+        d = float(e.get('dur', 0) or 0)
+        a, b = at, at + d
+        at = b
+        seen, uniq = set(), []
+        for ss, se, t in subs:
+            if t.strip() and min(se, b) - max(ss, a) > 0.1 and t not in seen:
+                seen.add(t)
+                uniq.append(t)
+        out.append(''.join(uniq))
+    return out
+
+
 def _split_plan_at(plan: list, t: float) -> tuple[list, list]:
     """把配對時間軸在第 t 秒處切開（跨界的片段拆成兩半），供插入 SOT 段"""
     a, b, acc = [], [], 0.0
@@ -1351,12 +1375,13 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                 elif _job.get('stat'):   # 沒 SOT 但插了數據卡 → 一樣收掉切出的碎片
                     plan = _merge_tiny_plan_entries(plan)
 
+                _narrs = _narr_for_plan(plan, subtitles)
                 _job['plan'] = [
                     {'video': (Path(e['path']).name if e.get('path')
                                else (f"📷 {Path(e['photo']).name}" if e.get('photo') else '（黑幕）')),
                      'start': e.get('start', 0), 'dur': e['dur'],
-                     'why': e.get('why', '')}
-                    for e in plan
+                     'why': e.get('why', ''), 'narr': _narrs[i]}
+                    for i, e in enumerate(plan)
                 ]
                 # 涵蓋度警告：圖輯式模式（純照片）本來就是照片，不做「照片偏多」提醒；
                 # SOT 段是刻意安排的原音（有聲受訪），不算「閉麥講話臉」問題
@@ -1445,12 +1470,13 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                     _job['stat'] = None   # 卡移除了，紀錄同步清掉
             if edits or removals:
                 if applied:
+                    _narrs2 = _narr_for_plan(plan, subtitles)
                     _job['plan'] = [
                         {'video': (Path(e['path']).name if e.get('path')
                                    else (f"📷 {Path(e['photo']).name}" if e.get('photo') else '（黑幕）')),
                          'start': e.get('start', 0), 'dur': e['dur'],
-                         'why': e.get('why', '')}
-                        for e in plan
+                         'why': e.get('why', ''), 'narr': _narrs2[i]}
+                        for i, e in enumerate(plan)
                     ]
                     _job['msg'] = f'已套用 {applied} 處人工換片段，開始渲染'
 
@@ -2939,8 +2965,8 @@ document.addEventListener('DOMContentLoaded',function(){
       <p>✅ 產製完成！《<span id="titleText"></span>》</p>
       <video id="preview-video" controls style="width:100%;border-radius:8px;margin-bottom:10px;background:#000"></video>
       <div id="plan-box" style="display:none;margin-bottom:10px">
-        <p style="font-size:.8rem;color:#374151;font-weight:600;margin-bottom:6px">🎞 旁白配對畫面明細</p>
-        <div id="plan-rows" style="font-size:.76rem;color:#555;font-family:monospace;line-height:1.7"></div>
+        <p style="font-size:.9rem;color:var(--ink);font-weight:700;margin-bottom:8px">🎞 旁白配對畫面明細</p>
+        <div id="plan-rows" style="line-height:1.6"></div>
       </div>
       <div id="hashtag-box" style="display:none;margin-bottom:10px">
         <p style="font-size:.8rem;color:#374151;font-weight:600;margin-bottom:6px">🏷 上架標籤（點擊複製）</p>
@@ -3606,16 +3632,23 @@ function showResult(fname, title, warning, plan, hashtags) {
   const planRows = document.getElementById('plan-rows');
   if (plan && plan.length) {
     let at = 0;
+    const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
     planRows.innerHTML = plan.map(e => {
       const from = at.toFixed(0);
       at += e.dur;
       const to = at.toFixed(0);
-      const src = e.video === '（黑幕）'
-        ? '<span style="color:#999">（黑幕）</span>'
-        : `${e.video} ${e.start}s起`;
-      const why = e.why ? `<span style="color:#999"> — ${e.why}</span>` : '';
-      return `${from}-${to}s ← ${src}${why}`;
-    }).join('<br>');
+      const src = e.video === '（黑幕）' ? '（黑幕）' : esc(e.video) + ' ' + e.start + 's起';
+      // 🎙 旁白（放大、藍色強調）↔ 🎬 畫面描述（灰色次要），顏色區分方便對照
+      const narr = e.narr
+        ? `<div style="color:var(--accentink);font-weight:600;font-size:.94rem;line-height:1.65;margin:3px 0 2px">🎙 ${esc(e.narr)}</div>`
+        : '';
+      const why = e.why
+        ? `<div style="color:var(--ink3);font-size:.82rem;line-height:1.55">🎬 ${esc(e.why)}</div>`
+        : '';
+      return `<div style="padding:9px 0;border-bottom:1px solid var(--border2)">
+        <div style="color:var(--ink4);font-family:var(--mono);font-size:.74rem">${from}-${to}s · ${src}</div>
+        ${narr}${why}</div>`;
+    }).join('');
     planBox.style.display = 'block';
   } else {
     planBox.style.display = 'none';
