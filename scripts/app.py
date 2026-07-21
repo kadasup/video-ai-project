@@ -133,7 +133,7 @@ from produce import (
 from select_clip import (
     select_clip, catalog_video, match_narration_to_clips,
     video_fingerprint, near_duplicate, seg_line, describe_photo,
-    _cache_get as _photodesc_cache_get, _json_default,
+    _cache_get as _photodesc_cache_get, _json_default, _is_content_policy,
 )
 import ltn_api
 import speech
@@ -816,15 +816,23 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
             for i, v in enumerate(videos):
                 _job['msg'] = f"{STEPS[1]}（{i+1}/{len(videos)}）"
                 try:
-                    cat = catalog_video(Path(v['path']))
+                    # 帶新聞原文當 context：若有段落被內容安全過濾器擋下，catalog_video 會
+                    # 逐段重試隔離踩線段，並用新聞內容「文字推測」那幾段畫面（而非整支放棄）。
+                    cat = catalog_video(Path(v['path']), context_hint=article)
                     _add_tokens(cat.get('tokens', {}))
+                    n_blocked = sum(1 for s in cat.get('segments', []) if s.get('blocked'))
+                    if n_blocked:
+                        # 素材整體辨識成功，只是其中幾段被擋、已用新聞內容推測 → 提醒編輯確認
+                        _fb_fails.append({'name': Path(v['path']).name
+                                          + f'（{n_blocked} 段畫面被擋，已依新聞內容推測）',
+                                          'content': True, 'partial': True})
                 except Exception as e:
-                    # 自動辨識失敗（常見：內容安全過濾器誤擋災害/事故畫面 → 400 content_policy）。
+                    # 整支自動辨識失敗（非內容過濾的錯，或連逐段+文字推測都失敗）。
                     # 不要靜默丟掉整支！改用備援目錄讓素材仍可配對。
                     # 技術細節（原始錯誤）只印到後臺給開發看；編輯端等迴圈跑完再彙整成一句簡短提示。
                     cat = _fallback_catalog(Path(v['path']))
                     fname = Path(v['path']).name
-                    is_content = ('content_policy' in str(e) or 'content safety' in str(e))
+                    is_content = _is_content_policy(e)
                     print(f"[catalog] {fname} 自動辨識失敗"
                           f"（{'內容安全過濾器誤擋' if is_content else type(e).__name__}）：{e}")
                     _fb_fails.append({'name': fname, 'content': is_content})
@@ -841,13 +849,20 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
                 catalogs.append(cat)
                 transcripts.append(tr)
 
-        # 自動辨識失敗的素材：全部彙整成「一句」給編輯（不噴原始錯誤、不每支各噴一長串）
+        # 辨識受阻的素材：全部彙整成「一句」給編輯（不噴原始錯誤、不每支各噴一長串）。
+        # 兩種情況：①整支被擋（走通用備援）②只有幾段被擋（已依新聞內容推測，較準）。
         if _fb_fails:
             names = '、'.join(f['name'] for f in _fb_fails)
-            reason = ('畫面被安全系統誤判擋下、無法自動辨識'
-                      if all(f['content'] for f in _fb_fails) else '無法自動辨識畫面')
+            all_partial = all(f.get('partial') for f in _fb_fails)
+            all_content = all(f['content'] for f in _fb_fails)
+            if all_partial:
+                reason, how = '有部分畫面被安全系統誤判擋下', '已依新聞內容推測填補'
+            elif all_content:
+                reason, how = '畫面被安全系統誤判擋下、無法自動辨識', '已改用推測／通用畫面納入'
+            else:
+                reason, how = '無法自動辨識畫面', '已改用通用畫面納入'
             msg = (f"⚠️ 有 {len(_fb_fails)} 支素材{reason}（{names}），"
-                   "已改用通用畫面納入，請到分鏡站確認這幾支。")
+                   f"{how}，請到分鏡站確認這幾支。")
             _job['warning'] = ((_job.get('warning') + '\n' + msg)
                                if _job.get('warning') else msg)
 

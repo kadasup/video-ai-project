@@ -607,7 +607,57 @@ def _extract_frame_at(video: Path, t: float, tag: str) -> Path | None:
     return out if out.exists() else None
 
 
-def catalog_video(video: Path, max_segments: int = 16) -> dict:
+def _is_content_policy(e) -> bool:
+    """判斷例外是不是 Azure 內容安全過濾器誤擋（各種訊息／代碼變體都涵蓋）。
+       只有這一類才值得『逐段重試／文字推測』；網路、額度等其他錯不適用。"""
+    s = str(e).lower()
+    return any(k in s for k in (
+        'content_policy', 'content_filter', 'content management policy',
+        'responsibleai', 'content safety', 'jailbreak', 'contentpolicyviolation',
+    ))
+
+
+def _infer_blocked_segments(deployment, segments, blocked_idx, context_hint, tokens) -> dict:
+    """被內容安全過濾器擋下、看不到畫面的段落：純文字問 GPT，依新聞內容＋各段時間位置
+       『保守推測』該段最可能拍到的畫面，回 {1-based index: info}。比通用「現場實況畫面」
+       具體得多，配對更準。推測不虛構具體人名／車牌等看不到的細節。"""
+    seg_lines = "\n".join(
+        f"段{i+1}：影片第 {segments[i]['start']}s ~ {segments[i]['end']}s"
+        for i in blocked_idx)
+    prompt = (
+        "你在協助一則新聞短影音配對畫面。以下這支素材的部分段落，"
+        "因內容安全過濾器擋下而無法看圖辨識。請根據新聞內容與各段在影片中的時間位置，"
+        "『保守推測』每一段最可能拍到的畫面，給結構化描述。\n"
+        "規則：描述要合理但不要虛構具體人名、車牌等看不到的細節；"
+        "寧可寫得概括（如『海邊礁岩與海龜』『岸邊警方與民眾』）也不要編造。\n\n"
+        f"新聞內容：\n{(context_hint or '')[:1200]}\n\n"
+        f"要推測的段落：\n{seg_lines}\n\n"
+        "只回傳 JSON：{\"segments\": [{\"index\": 段號, "
+        "\"description\": \"推測畫面（15 字內）\", \"subject\": \"主要人事物（6 字內）\", "
+        "\"subject_pos\": \"左|中|右|滿版\", \"shot\": \"特寫|中景|遠景|空景\", "
+        "\"quality\": \"正常\", \"screen_text\": \"\"}]}"
+    )
+    resp = _azure_client().chat.completions.create(
+        model=deployment,
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        max_completion_tokens=800,
+    )
+    if resp.usage:
+        tokens["prompt_tokens"] = tokens.get("prompt_tokens", 0) + resp.usage.prompt_tokens
+        tokens["completion_tokens"] = tokens.get("completion_tokens", 0) + resp.usage.completion_tokens
+        tokens["total_tokens"] = tokens.get("total_tokens", 0) + resp.usage.total_tokens
+    data = json.loads(resp.choices[0].message.content)
+    out = {}
+    for d in data.get("segments", []):
+        try:
+            out[int(d.get("index"))] = d
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def catalog_video(video: Path, max_segments: int = 16, context_hint: str = "") -> dict:
     """
     幫一支影片建「內容目錄」：動態偵測切段，每段抽 2 張影格，
     一次 GPT 呼叫做結構化描述（描述/主體/鏡位/畫質/畫面文字），
@@ -674,57 +724,93 @@ def catalog_video(video: Path, max_segments: int = 16) -> dict:
                 "segments": [{**s, "description": "（無法抽取影格）"} for s in segments],
                 "tokens": {}}
 
-    content: list = []
-    seg_lines = "\n".join(
-        f"段{i+1}：{s['start']}s ~ {s['end']}s" for i, s in enumerate(segments)
-    )
-    content.append({"type": "text", "text": (
-        "以下是一支新聞素材影片各段落的影格（每段 2 張，依段落順序排列）。\n"
-        f"段落清單：\n{seg_lines}\n\n"
-        "請對每一段做結構化描述，只回傳 JSON（不含說明）：\n"
-        '{"segments": [{"index": 1,\n'
-        '  "description": "畫面拍到什麼（人事物與動作，具體、15 字內）",\n'
-        '  "subject": "主要人事物（6 字內，例：機車拖車/警員/傷者；沒有明確主體填空字串）",\n'
-        '  "subject_pos": "主體在畫面水平位置：左|中|右|滿版 擇一（滿版=主體佔滿畫面或無單一主體）",\n'
-        '  "shot": "特寫|中景|遠景|空景 擇一",\n'
-        '  "quality": "正常|晃動|模糊|逆光|過暗 擇一",\n'
-        '  "screen_text": "畫面上可辨識的文字（招牌/字卡/車牌等，無則空字串）"\n'
-        "}, ...]}\n"
-        "注意：遠景裡的小主體（畫面角落的車輛/人物）也要指出來，那常是新聞事件的主角；"
-        "subject_pos 要準——這決定直式裁切時要保留畫面的哪一側，抓錯主體會被裁掉。"
-    )})
+    # 依段落分組影格：整批送若被內容安全過濾器擋下（災害/事故/動物受傷等新聞畫面常被誤判），
+    # 改逐段送以隔離真正踩線的那幾段，其餘段落照常拿到描述——不再一格壞就整支素材沒描述。
+    frames_by_seg: dict[int, list[Path]] = {}
     for i, f in frames:
-        content.append({"type": "text", "text": f"（段{i+1} 的影格）"})
-        content.append({"type": "image_url", "image_url": {
-            "url": f"data:image/jpeg;base64,{_b64(f)}", "detail": "low"}})
+        frames_by_seg.setdefault(i, []).append(f)
 
     deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2")
-    resp = _azure_client().chat.completions.create(
-        model=deployment,
-        messages=[{"role": "user", "content": content}],
-        response_format={"type": "json_object"},
-        max_completion_tokens=2000,
-    )
-    result = json.loads(resp.choices[0].message.content)
+    tokens: dict = {}
 
-    tokens = {}
-    if resp.usage:
-        tokens = {
-            "prompt_tokens":     resp.usage.prompt_tokens,
-            "completion_tokens": resp.usage.completion_tokens,
-            "total_tokens":      resp.usage.total_tokens,
-            "frames_sent":       len(frames),
-        }
+    def _accum(usage, nf):
+        if not usage:
+            return
+        tokens["prompt_tokens"]     = tokens.get("prompt_tokens", 0) + usage.prompt_tokens
+        tokens["completion_tokens"] = tokens.get("completion_tokens", 0) + usage.completion_tokens
+        tokens["total_tokens"]      = tokens.get("total_tokens", 0) + usage.total_tokens
+        tokens["frames_sent"]       = tokens.get("frames_sent", 0) + nf
 
-    info_map = {d.get("index"): d for d in result.get("segments", [])}
+    def _describe(idxs: list[int]) -> dict:
+        """對指定段落（0-based）送影格做結構化描述，回 {1-based index: info}。
+           被內容安全過濾器擋下會往上 raise，交呼叫端決定退避策略。"""
+        seg_lines = "\n".join(
+            f"段{j+1}：{segments[j]['start']}s ~ {segments[j]['end']}s" for j in idxs)
+        c: list = [{"type": "text", "text": (
+            "以下是一支新聞素材影片各段落的影格（每段 2 張，依段落順序排列）。\n"
+            f"段落清單：\n{seg_lines}\n\n"
+            "請對每一段做結構化描述，只回傳 JSON（不含說明）：\n"
+            '{"segments": [{"index": 1,\n'
+            '  "description": "畫面拍到什麼（人事物與動作，具體、15 字內）",\n'
+            '  "subject": "主要人事物（6 字內，例：機車拖車/警員/傷者；沒有明確主體填空字串）",\n'
+            '  "subject_pos": "主體在畫面水平位置：左|中|右|滿版 擇一（滿版=主體佔滿畫面或無單一主體）",\n'
+            '  "shot": "特寫|中景|遠景|空景 擇一",\n'
+            '  "quality": "正常|晃動|模糊|逆光|過暗 擇一",\n'
+            '  "screen_text": "畫面上可辨識的文字（招牌/字卡/車牌等，無則空字串）"\n'
+            "}, ...]}\n"
+            "注意：遠景裡的小主體（畫面角落的車輛/人物）也要指出來，那常是新聞事件的主角；"
+            "subject_pos 要準——這決定直式裁切時要保留畫面的哪一側，抓錯主體會被裁掉。"
+        )}]
+        nf = 0
+        for j in idxs:
+            for f in frames_by_seg.get(j, []):
+                c.append({"type": "text", "text": f"（段{j+1} 的影格）"})
+                c.append({"type": "image_url", "image_url": {
+                    "url": f"data:image/jpeg;base64,{_b64(f)}", "detail": "low"}})
+                nf += 1
+        resp = _azure_client().chat.completions.create(
+            model=deployment,
+            messages=[{"role": "user", "content": c}],
+            response_format={"type": "json_object"},
+            max_completion_tokens=2000,
+        )
+        _accum(resp.usage, nf)
+        data = json.loads(resp.choices[0].message.content)
+        return {d.get("index"): d for d in data.get("segments", [])}
+
+    info_map: dict = {}
+    blocked_segs: list[int] = []          # 逐段送仍失敗的段落（0-based）→ 走文字推測／通用備援
+    all_idx = list(range(len(segments)))
+    try:
+        info_map = _describe(all_idx)      # 先整批送（省 token、描述更連貫）
+    except Exception as e:
+        if not _is_content_policy(e):
+            raise                          # 非內容過濾錯誤（網路/額度）→ 交外層走整支備援
+        for i in all_idx:                  # 智慧重試：整批被擋 → 逐段送隔離踩線段
+            try:
+                info_map.update(_describe([i]))
+            except Exception:
+                blocked_segs.append(i)
+
+    # 仍被擋的段落：用新聞內容做「純文字」推測，比通用「現場實況畫面」具體得多、配對更準
+    if blocked_segs and context_hint:
+        try:
+            info_map.update(_infer_blocked_segments(
+                deployment, segments, blocked_segs, context_hint, tokens))
+        except Exception:
+            pass   # 連文字推測都被擋／失敗 → 退回下方通用備援描述
+
     for i, seg in enumerate(segments):
         d = info_map.get(i + 1, {})
-        seg["description"] = d.get("description", "（未取得描述）")
+        seg["description"] = (d.get("description")
+                              or "現場實況畫面（自動辨識被內容安全系統擋下，請於分鏡站確認）")
         seg["subject"]     = (d.get("subject") or "").strip()
         seg["subject_pos"] = (d.get("subject_pos") or "滿版").strip()
         seg["shot"]        = (d.get("shot") or "").strip()
         seg["quality"]     = (d.get("quality") or "正常").strip()
         seg["screen_text"] = (d.get("screen_text") or "").strip()
+        if i in blocked_segs:
+            seg["blocked"] = True          # 供成片流程提醒編輯「這段畫面被擋、請確認」
 
     for _, f in frames:
         try:
@@ -735,8 +821,9 @@ def catalog_video(video: Path, max_segments: int = 16) -> dict:
     # 空泛段補拍：描述含糊（空景/不明/沒有主體）的段落，改用 high detail 影格
     # 重描述一次——遠景小主體（角落的機車/人物）在 low detail 下常被看漏
     vague_idx = [i for i, s in enumerate(segments)
-                 if (not s["subject"]) or
-                    any(k in s["description"] for k in ("空曠", "不明", "無法辨識", "空景"))][:4]
+                 if i not in blocked_segs and (   # 被內容過濾擋下的段落別再送高解析，只會又被擋
+                    (not s["subject"]) or
+                    any(k in s["description"] for k in ("空曠", "不明", "無法辨識", "空景")))][:4]
     if vague_idx:
         content2: list = [{"type": "text", "text": (
             "以下段落先前用低解析影格描述得太空泛，請用這批高解析影格重新仔細看：\n"
