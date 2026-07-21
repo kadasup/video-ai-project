@@ -2934,6 +2934,17 @@ document.addEventListener('DOMContentLoaded',function(){
       </label>
       <p class="hint" id="ckmode-hint" style="margin:6px 0 0;color:#6b7280"></p>
     </div>
+    <div style="margin-top:12px;font-weight:400">
+      <label style="display:flex;align-items:center;gap:8px">
+        <span style="white-space:nowrap">🎙 旁白聲音：</span>
+        <select id="voice" onchange="saveLastSettings()"
+                style="flex:1;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:.9rem">
+          <option value="hsiaochen">曉臻（女聲，預設）</option>
+          <option value="hsiaoyu">曉雨（女聲）</option>
+          <option value="yunjhe">雲哲（男聲，穩重）</option>
+        </select>
+      </label>
+    </div>
     <label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-weight:400;color:#6b7280">
       <input type="checkbox" id="lowq" checked disabled style="width:16px;height:16px">
       <span>🔒 <b>POC 低畫質模式</b>（測試期鎖定啟用，不可關）——成片庫存 480p、渲染快；正式上線再由開發端解鎖切回 1080p</span>
@@ -3087,6 +3098,7 @@ async function startJob() {
         article: art,
         videos:  videos,
         photos:  importedPhotos,
+        voice:   document.getElementById('voice').value,
         checkpoint_mode: document.getElementById('checkpoint_mode').value,
         low_quality: document.getElementById('lowq').checked,
       })
@@ -4011,6 +4023,8 @@ function saveLastSettings() {
   // 鍵名 v3：確認站升級為三態（smart/always/off），舊布林偏好作廢
   localStorage.setItem('videoai_ckmode', document.getElementById('checkpoint_mode').value);
   localStorage.setItem('videoai_lowq', document.getElementById('lowq').checked ? '1' : '0');
+  // 旁白聲音：偏好持久保留（總編偏好男聲，記住免每次重選）；鍵名 v2 避開舊清理名單
+  localStorage.setItem('videoai_voice2', document.getElementById('voice').value);
 }
 
 // 停站模式說明文字（依選擇即時更新）
@@ -4044,6 +4058,9 @@ function restoreLastSettings() {
   if (ckPref && ['smart','always','off'].includes(ckPref))
     document.getElementById('checkpoint_mode').value = ckPref;
   onCkModeChange();   // 帶出對應說明文字
+  const vPref = localStorage.getItem('videoai_voice2');
+  if (vPref && ['hsiaochen','hsiaoyu','yunjhe'].includes(vPref))
+    document.getElementById('voice').value = vPref;
   // POC 低畫質為鎖定狀態：強制啟用、忽略任何舊偏好；上線解鎖時改這裡
   document.getElementById('lowq').checked = true;
   onLowqChange();   // 隱藏快速預覽按鈕（POC 直接渲染就是低畫質）
