@@ -712,6 +712,8 @@ def _fallback_sot(transcripts: list, catalogs: list, narration: str, article: st
 # ── 智慧分析工作狀態 ───────────────────────────────────────────────────────────
 _alock = threading.Lock()
 _abusy = False
+_abusy_since = 0.0           # 目前分析開始時間（秒）；用來偵測卡死並自動釋放名額
+_ANALYZE_STALE_SEC = 300     # 分析逾 5 分鐘視為卡死（正常單支 10~40 秒），放行接手避免永久卡住
 _analysis: dict = {
     'done': True, 'error': None,
     'layer': 0, 'msg': '',
@@ -1635,7 +1637,7 @@ def run_job(article: str, videos: list[dict], fname: str | None, voice_key: str 
         })
 
 
-def run_analysis(video_path: str, use_vision: bool):
+def run_analysis(video_path: str, use_vision: bool, owner: float = 0.0):
     global _abusy, _analysis
 
     t0 = time.time()
@@ -1690,7 +1692,10 @@ def run_analysis(video_path: str, use_vision: bool):
         })
     finally:
         with _alock:
-            _abusy = False
+            # 只有仍是名額擁有者才釋放：若本工作已被判定卡死、名額被新分析接手
+            # （_abusy_since 已被改寫），這裡就不要誤把新分析的名額關掉
+            if _abusy_since == owner:
+                _abusy = False
 
 
 # ── 使用記錄頁面 HTML ────────────────────────────────────────────────────────
@@ -2682,6 +2687,8 @@ textarea{resize:vertical;min-height:210px}
 .video-item .vanalysis{margin-top:6px;padding-left:28px;font-size:.78rem}
 .ana-loading{color:var(--accentink)}
 .ana-err{color:var(--redink)}
+.ana-retry{color:var(--accent);font-weight:600;text-decoration:none;margin-left:2px}
+.ana-retry:hover{text-decoration:underline}
 .ana-desc-inline{color:var(--ink3)}
 .ana-dur{color:var(--ink2);font-weight:600;font-family:var(--mono);font-size:.76rem}
 
@@ -3888,7 +3895,10 @@ function renderVideoList() {
     if (v.analyzing) {
       sub.innerHTML = '<span class="ana-loading">🔄 智慧分析中…</span>';
     } else if (v.analysis && v.analysis.error) {
-      sub.innerHTML = '<span class="ana-err">⚠ 分析失敗：' + escapeHtml(v.analysis.error) + '</span>';
+      sub.innerHTML = '<span class="ana-err">⚠ 分析失敗：' + escapeHtml(v.analysis.error) + '</span>'
+        + ' <a href="#" class="ana-retry" data-path="' + escapeHtml(v.path) + '">重新分析</a>';
+      const rt = sub.querySelector('.ana-retry');
+      if (rt) rt.onclick = (e) => { e.preventDefault(); retryAnalyze(rt.dataset.path); };
     } else if (v.analysis) {
       const cat = v.analysis.category || '其他';
       const catClass = cat === '車禍或槍戰' ? '車禍' : cat;
@@ -3915,27 +3925,56 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
-// 依序（後端一次只能跑一個分析工作）對清單裡的影片跑智慧分析
+// 依序（後端一次只能跑一個分析工作）對清單裡的影片跑智慧分析。
+// 分析佇列「世代」：重新匯入/換素材會 ++_anaGen，讓仍在跑的舊佇列自己停下，
+// 避免兩條佇列同時搶單一分析名額、互相被後端擋成「分析中」而全部誤標失敗。
+let _anaGen = 0;
 async function analyzeQueued(items) {
+  const myGen = ++_anaGen;
   for (const item of items) {
+    if (myGen !== _anaGen) return;   // 已被更新的匯入取代 → 放棄這條舊佇列
     item.analyzing = true;
+    item.analysis = null;
     renderVideoList();
     try {
-      const r = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({video: item.path})
-      });
-      const d = await r.json();
-      if (d.error) {
-        item.analyzing = false;
-        item.analysis = {error: d.error};
-        renderVideoList();
-        saveLastSettings();
+      // 送出分析。後端一次只跑一支，若正忙會回 429「分析中」——這不是失敗，
+      // 稍候重試即可（保持轉圈），前一支跑完釋放名額後就會輪到這支。
+      let started = false;
+      for (let attempt = 0; attempt < 80 && myGen === _anaGen; attempt++) {
+        const r = await fetch('/api/analyze', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({video: item.path})
+        });
+        if (r.status === 429) {          // 另一支還在分析 → 等 1.5 秒重試，不當失敗
+          await new Promise(res => setTimeout(res, 1500));
+          continue;
+        }
+        const d = await r.json();
+        if (d.error) {                   // 真正的錯誤（路徑無效等）→ 顯示失敗
+          item.analyzing = false;
+          item.analysis = {error: d.error};
+          renderVideoList();
+          saveLastSettings();
+          break;
+        }
+        started = true;
+        break;
+      }
+      if (myGen !== _anaGen) return;
+      if (!started) {
+        // 等太久還排不進（前一支疑似卡住）→ 給明確訊息、附重試入口，別無限轉圈
+        if (item.analyzing) {
+          item.analyzing = false;
+          item.analysis = {error: '前一支分析尚未結束，請點「重新分析」再試'};
+          renderVideoList();
+          saveLastSettings();
+        }
         continue;
       }
       await new Promise(resolve => {
         const timer = setInterval(async () => {
+          if (myGen !== _anaGen) { clearInterval(timer); resolve(); return; }
           try {
             const sd = await (await fetch('/api/analyze_status')).json();
             if (sd.done) {
@@ -3956,6 +3995,12 @@ async function analyzeQueued(items) {
       saveLastSettings();
     }
   }
+}
+
+// 單支重新分析（分析失敗時的手動重試入口，不用整組重匯）
+function retryAnalyze(path) {
+  const item = videoList.find(v => v.path === path);
+  if (item && !item.analyzing) analyzeQueued([item]);
 }
 
 // ─── 記住上次設定 ──────────────────────────────────────────────────────────
@@ -4601,7 +4646,7 @@ def api_confirm():
 
 @app.route('/api/analyze', methods=['POST'])
 def api_analyze():
-    global _abusy, _analysis
+    global _abusy, _abusy_since, _analysis
     data = request.json or {}
     video = (data.get('video') or '').strip()
     if not video:
@@ -4611,13 +4656,19 @@ def api_analyze():
         return jsonify({'error': err}), 400
 
     with _alock:
-        if _abusy:
-            return jsonify({'error': '分析中，請稍候再試'}), 429
+        # 名額被占用時，若前一支已跑超過門檻（疑似卡死/執行緒已死），視為過期直接接手，
+        # 否則回 429 讓前端稍候重試（前端會保持轉圈、不當成失敗）
+        if _abusy and (time.time() - _abusy_since) < _ANALYZE_STALE_SEC:
+            return jsonify({'error': '分析中，請稍候再試', 'busy': True}), 429
         _abusy = True
+        _abusy_since = time.time()
         _analysis = {'done': False, 'error': None, 'layer': 1, 'msg': '初始化…', 'result': None}
 
     use_vision = data.get('use_vision', True)
-    t = threading.Thread(target=run_analysis, args=(video, use_vision), daemon=True)
+    # 用開始時間當「擁有權 token」：卡死接手後，舊執行緒即使晚點才跑完，
+    # 也只有 token 相符（仍是它占著名額）時才會釋放，不會誤放掉新分析的名額
+    owner = _abusy_since
+    t = threading.Thread(target=run_analysis, args=(video, use_vision, owner), daemon=True)
     t.start()
     return jsonify({'ok': True})
 
